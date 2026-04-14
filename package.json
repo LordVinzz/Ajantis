@@ -1,0 +1,17 @@
+{
+  "name": "ajantis",
+  "version": "1.0.0",
+  "description": "LM Studio Tool App - Tauri",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.10.1"
+  }
+}

@@ -1,0 +1,1688 @@
+{
+  
+  "tools": [
+    {
+      "function": {
+        "description": "Execute a shell command in the current workspace.",
+        "name": "bash",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "allowedMounts": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "command": {
+              "type": "string"
+            },
+            "dangerouslyDisableSandbox": {
+              "type": "boolean"
+            },
+            "description": {
+              "type": "string"
+            },
+            "filesystemMode": {
+              "enum": [
+                "off",
+                "workspace-only",
+                "allow-list"
+              ],
+              "type": "string"
+            },
+            "isolateNetwork": {
+              "type": "boolean"
+            },
+            "namespaceRestrictions": {
+              "type": "boolean"
+            },
+            "run_in_background": {
+              "type": "boolean"
+            },
+            "timeout": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Read a text file from the workspace.",
+        "name": "read_file",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "limit": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "offset": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Write a text file in the workspace.",
+        "name": "write_file",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "content": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "content"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Replace text in a workspace file.",
+        "name": "edit_file",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "new_string": {
+              "type": "string"
+            },
+            "old_string": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "replace_all": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "path",
+            "old_string",
+            "new_string"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Find files by glob pattern.",
+        "name": "glob_search",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "pattern": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pattern"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Search file contents with a regex pattern.",
+        "name": "grep_search",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "-A": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "-B": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "-C": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "-i": {
+              "type": "boolean"
+            },
+            "-n": {
+              "type": "boolean"
+            },
+            "context": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "glob": {
+              "type": "string"
+            },
+            "head_limit": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "multiline": {
+              "type": "boolean"
+            },
+            "offset": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "output_mode": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "pattern": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pattern"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Fetch a URL, convert it into readable text, and answer a prompt about it.",
+        "name": "WebFetch",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "prompt": {
+              "type": "string"
+            },
+            "url": {
+              "format": "uri",
+              "type": "string"
+            }
+          },
+          "required": [
+            "url",
+            "prompt"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Search the web for current information and return cited results.",
+        "name": "WebSearch",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "allowed_domains": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "blocked_domains": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "query": {
+              "minLength": 2,
+              "type": "string"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Update the structured task list for the current session.",
+        "name": "TodoWrite",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "todos": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "activeForm": {
+                    "type": "string"
+                  },
+                  "content": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "enum": [
+                      "pending",
+                      "in_progress",
+                      "completed"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "content",
+                  "activeForm",
+                  "status"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "todos"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Load a local skill definition and its instructions.",
+        "name": "Skill",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "args": {
+              "type": "string"
+            },
+            "skill": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "skill"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Launch a specialized agent task and persist its handoff metadata.",
+        "name": "Agent",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "description": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "prompt": {
+              "type": "string"
+            },
+            "subagent_type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "description",
+            "prompt"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Search for deferred or specialized tools by exact name or keywords.",
+        "name": "ToolSearch",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "max_results": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "query": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Replace, insert, or delete a cell in a Jupyter notebook.",
+        "name": "NotebookEdit",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "cell_id": {
+              "type": "string"
+            },
+            "cell_type": {
+              "enum": [
+                "code",
+                "markdown"
+              ],
+              "type": "string"
+            },
+            "edit_mode": {
+              "enum": [
+                "replace",
+                "insert",
+                "delete"
+              ],
+              "type": "string"
+            },
+            "new_source": {
+              "type": "string"
+            },
+            "notebook_path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "notebook_path"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Wait for a specified duration without holding a shell process.",
+        "name": "Sleep",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "duration_ms": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "duration_ms"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Send a message to the user.",
+        "name": "SendUserMessage",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "attachments": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "message": {
+              "type": "string"
+            },
+            "status": {
+              "enum": [
+                "normal",
+                "proactive"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "message",
+            "status"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Get or set Claude Code settings.",
+        "name": "Config",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "setting": {
+              "type": "string"
+            },
+            "value": {
+              "type": [
+                "string",
+                "boolean",
+                "number"
+              ]
+            }
+          },
+          "required": [
+            "setting"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Enable a worktree-local planning mode override and remember the previous local setting for ExitPlanMode.",
+        "name": "EnterPlanMode",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {},
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Restore or clear the worktree-local planning mode override created by EnterPlanMode.",
+        "name": "ExitPlanMode",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {},
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Return structured output in the requested format.",
+        "name": "StructuredOutput",
+        "parameters": {
+          "additionalProperties": true,
+          "properties": {},
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Execute code in a REPL-like subprocess.",
+        "name": "REPL",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "language": {
+              "type": "string"
+            },
+            "timeout_ms": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "code",
+            "language"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Execute a PowerShell command with optional timeout.",
+        "name": "PowerShell",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "description": {
+              "type": "string"
+            },
+            "run_in_background": {
+              "type": "boolean"
+            },
+            "timeout": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Ask the user a question and wait for their response.",
+        "name": "AskUserQuestion",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "options": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "question": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "question"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Create a background task that runs in a separate subprocess.",
+        "name": "TaskCreate",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "description": {
+              "type": "string"
+            },
+            "prompt": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "prompt"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Create a background task from a structured task packet.",
+        "name": "RunTaskPacket",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "acceptance_tests": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "branch_policy": {
+              "type": "string"
+            },
+            "commit_policy": {
+              "type": "string"
+            },
+            "escalation_policy": {
+              "type": "string"
+            },
+            "objective": {
+              "type": "string"
+            },
+            "repo": {
+              "type": "string"
+            },
+            "reporting_contract": {
+              "type": "string"
+            },
+            "scope": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "objective",
+            "scope",
+            "repo",
+            "branch_policy",
+            "acceptance_tests",
+            "commit_policy",
+            "reporting_contract",
+            "escalation_policy"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Get the status and details of a background task by ID.",
+        "name": "TaskGet",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "task_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "task_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "List all background tasks and their current status.",
+        "name": "TaskList",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {},
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Stop a running background task by ID.",
+        "name": "TaskStop",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "task_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "task_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Send a message or update to a running background task.",
+        "name": "TaskUpdate",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "task_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "task_id",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Retrieve the output produced by a background task.",
+        "name": "TaskOutput",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "task_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "task_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Create a coding worker boot session with trust-gate and prompt-delivery guards.",
+        "name": "WorkerCreate",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "auto_recover_prompt_misdelivery": {
+              "type": "boolean"
+            },
+            "cwd": {
+              "type": "string"
+            },
+            "trusted_roots": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "cwd"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Fetch the current worker boot state, last error, and event history.",
+        "name": "WorkerGet",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "worker_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "worker_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Feed a terminal snapshot into worker boot detection to resolve trust gates, ready handshakes, and prompt misdelivery.",
+        "name": "WorkerObserve",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "screen_text": {
+              "type": "string"
+            },
+            "worker_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "worker_id",
+            "screen_text"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Resolve a detected trust prompt so worker boot can continue.",
+        "name": "WorkerResolveTrust",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "worker_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "worker_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Return the current ready-handshake verdict for a coding worker.",
+        "name": "WorkerAwaitReady",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "worker_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "worker_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Send a task prompt only after the worker reaches ready_for_prompt; can replay a recovered prompt.",
+        "name": "WorkerSendPrompt",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "prompt": {
+              "type": "string"
+            },
+            "worker_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "worker_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Restart worker boot state after a failed or stale startup.",
+        "name": "WorkerRestart",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "worker_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "worker_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Terminate a worker and mark the lane finished from the control plane.",
+        "name": "WorkerTerminate",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "worker_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "worker_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Report session completion to the worker, classifyi... <Truncated in logs> ...letes to advance the worker to its terminal state.",
+        "name": "WorkerObserveCompletion",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "finish_reason": {
+              "type": "string"
+            },
+            "tokens_output": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "worker_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "worker_id",
+            "finish_reason",
+            "tokens_output"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Create a team of sub-agents for parallel task execution.",
+        "name": "TeamCreate",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "tasks": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "description": {
+                    "type": "string"
+                  },
+                  "prompt": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "prompt"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "name",
+            "tasks"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Delete a team and stop all its running tasks.",
+        "name": "TeamDelete",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "team_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "team_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Create a scheduled recurring task.",
+        "name": "CronCreate",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "description": {
+              "type": "string"
+            },
+            "prompt": {
+              "type": "string"
+            },
+            "schedule": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "schedule",
+            "prompt"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Delete a scheduled recurring task by ID.",
+        "name": "CronDelete",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "cron_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "cron_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "List all scheduled recurring tasks.",
+        "name": "CronList",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {},
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Query Language Server Protocol for code intelligence (symbols, references, diagnostics).",
+        "name": "LSP",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "enum": [
+                "symbols",
+                "references",
+                "diagnostics",
+                "definition",
+                "hover"
+              ],
+              "type": "string"
+            },
+            "character": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "path": {
+              "type": "string"
+            },
+            "query": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "List available resources from connected MCP servers.",
+        "name": "ListMcpResources",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "server": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Read a specific resource from an MCP server by URI.",
+        "name": "ReadMcpResource",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "server": {
+              "type": "string"
+            },
+            "uri": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Authenticate with an MCP server that requires OAuth or credentials.",
+        "name": "McpAuth",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "server": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "server"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Trigger a remote action or webhook endpoint.",
+        "name": "RemoteTrigger",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "body": {
+              "type": "string"
+            },
+            "headers": {
+              "additionalProperties": false,
+              "properties": {},
+              "type": "object"
+            },
+            "method": {
+              "enum": [
+                "GET",
+                "POST",
+                "PUT",
+                "DELETE"
+              ],
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "url"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Execute a tool provided by a connected MCP server.",
+        "name": "MCP",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "arguments": {
+              "additionalProperties": false,
+              "properties": {},
+              "type": "object"
+            },
+            "server": {
+              "type": "string"
+            },
+            "tool": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "server",
+            "tool"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Access the memory pool which stores all user messages and LLM outputs from the current session. Use action 'list' to retrieve recent entries (with optional limit), 'search' to find entries matching a query string, or 'count' to get the total number of entries.",
+        "name": "memory_pool",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "description": "The action to perform: 'list' (recent entries), 'search' (find by query), or 'count' (total entries).",
+              "enum": ["list", "search", "count"],
+              "type": "string"
+            },
+            "query": {
+              "description": "Search query string. Required when action is 'search'.",
+              "type": "string"
+            },
+            "limit": {
+              "description": "Maximum number of entries to return for 'list' action. Defaults to 50.",
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": ["action"],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Test-only tool for verifying permission enforcement behavior.",
+        "name": "TestingPermission",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Spawn a new LLM subagent with a defined role, model, and system prompt. Returns a unique agent_id used to address this agent in subsequent calls. The manager uses this to dynamically instantiate specialized workers (e.g. a coder agent, a critic agent, a researcher agent).",
+        "name": "spawn_agent",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "role": {
+              "description": "Short label for this agent's responsibility (e.g. 'coder', 'critic', 'planner').",
+              "type": "string"
+            },
+            "system_prompt": {
+              "description": "Full system-level instruction that defines the agent's persona, constraints, and objectives.",
+              "type": "string"
+            },
+            "model": {
+              "description": "Model ID to use for this agent (e.g. 'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'). Defaults to the manager's own model if omitted.",
+              "type": "string"
+            },
+            "context_limit": {
+              "description": "Maximum token budget for this agent's context window. Omit to use the model default.",
+              "minimum": 1024,
+              "type": "integer"
+            },
+            "tools": {
+              "description": "List of tool names the agent is allowed to call. Omit to inherit the full tool set.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "metadata": {
+              "description": "Arbitrary key-value pairs to attach to the agent for routing or bookkeeping.",
+              "type": "object"
+            }
+          },
+          "required": [
+            "role",
+            "system_prompt"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Send a user-role message to a specific agent and optionally wait for its response. This is the primary mechanism for the manager to drive an agent's inference loop one turn at a time.",
+        "name": "send_message",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "agent_id": {
+              "description": "ID of the target agent returned by spawn_agent.",
+              "type": "string"
+            },
+            "content": {
+              "description": "Text content of the message to inject as a user turn.",
+              "type": "string"
+            },
+            "attachments": {
+              "description": "Optional file paths or data blobs to include alongside the message.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "await_reply": {
+              "description": "If true, block until the agent produces a response and return it inline. If false, return immediately and poll with get_agent_state. Defaults to true.",
+              "type": "boolean"
+            },
+            "timeout_ms": {
+              "description": "Maximum milliseconds to wait when await_reply is true before returning a timeout error.",
+              "minimum": 100,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "agent_id",
+            "content"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Read the full conversation history of a specific agent — every user turn, assistant turn, and tool call/result. Allows the manager to inspect what an agent has seen and produced without interrupting it.",
+        "name": "read_agent_messages",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "agent_id": {
+              "description": "ID of the agent whose messages to read.",
+              "type": "string"
+            },
+            "roles": {
+              "description": "Filter by message role(s). Options: 'user', 'assistant', 'tool'. Omit to return all roles.",
+              "items": {
+                "enum": ["user", "assistant", "tool"],
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "limit": {
+              "description": "Return only the most recent N messages. Omit to return the full history.",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "offset": {
+              "description": "Skip the first N messages (for pagination).",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "agent_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "List all active and recently terminated agents managed by this session, with their current status, role, model, and token usage. Use this to get a global view of the multi-agent system before deciding how to route work.",
+        "name": "list_agents",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "status_filter": {
+              "description": "Only return agents in these states. Options: 'running', 'idle', 'paused', 'done', 'error'. Omit for all.",
+              "items": {
+                "enum": ["running", "idle", "paused", "done", "error"],
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "role_filter": {
+              "description": "Only return agents whose role matches this string.",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Retrieve the detailed runtime state of a single agent: status, current inference step, tokens consumed, tokens remaining, last assistant output, and any pending tool calls.",
+        "name": "get_agent_state",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "agent_id": {
+              "description": "ID of the agent to inspect.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "agent_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Terminate a running agent immediately and release its resources. The agent's conversation history is preserved for read_agent_messages until the session ends.",
+        "name": "kill_agent",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "agent_id": {
+              "description": "ID of the agent to terminate.",
+              "type": "string"
+            },
+            "reason": {
+              "description": "Human-readable reason for termination, stored in the agent's final state.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "agent_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Pause the inference loop of an agent after its current generation step completes. The agent will not process further messages until resume_agent is called. Useful for checkpointing or waiting for external conditions.",
+        "name": "pause_agent",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "agent_id": {
+              "description": "ID of the agent to pause.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "agent_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Resume the inference loop of a previously paused agent. Any messages sent while the agent was paused are delivered in order.",
+        "name": "resume_agent",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "agent_id": {
+              "description": "ID of the agent to resume.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "agent_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Send the same message to multiple agents simultaneously, triggering parallel inference. Returns a map of agent_id -> reply (or status if await_reply is false). Use this to fan out a question or task to a panel of specialists.",
+        "name": "broadcast_message",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "agent_ids": {
+              "description": "List of agent IDs to receive the message. Pass ['*'] to target every active agent.",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "content": {
+              "description": "Text content of the message to send to all targets.",
+              "type": "string"
+            },
+            "await_reply": {
+              "description": "If true, wait for all agents to respond before returning. Defaults to false for large broadcasts.",
+              "type": "boolean"
+            },
+            "timeout_ms": {
+              "description": "Maximum milliseconds to wait per agent when await_reply is true.",
+              "minimum": 100,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "agent_ids",
+            "content"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Fork an existing agent by duplicating its conversation history and system prompt into a new agent. The fork starts from the same context state but runs independently. Useful for exploring divergent reasoning paths or A/B testing prompting strategies.",
+        "name": "fork_agent",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "source_agent_id": {
+              "description": "ID of the agent to fork from.",
+              "type": "string"
+            },
+            "role": {
+              "description": "Role label for the new forked agent. Defaults to the source agent's role with a '-fork' suffix.",
+              "type": "string"
+            },
+            "system_prompt_override": {
+              "description": "If provided, replace the forked agent's system prompt instead of inheriting the source agent's.",
+              "type": "string"
+            },
+            "truncate_at": {
+              "description": "Fork from this message index in the conversation history, discarding later messages. Omit to fork from the latest state.",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "source_agent_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Collect the last assistant output from a set of agents and merge them into a single structured result. Optionally ask a synthesis prompt to a designated aggregator model that combines the outputs. Use this at the end of a parallel fan-out to consolidate findings.",
+        "name": "aggregate_results",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "agent_ids": {
+              "description": "Agents whose last output to collect. Pass ['*'] for all active agents.",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "synthesis_prompt": {
+              "description": "Optional prompt sent to a synthesis model to merge the collected outputs into a unified answer. If omitted, the raw per-agent outputs are returned as-is.",
+              "type": "string"
+            },
+            "synthesis_model": {
+              "description": "Model to use for synthesis. Defaults to the manager's own model.",
+              "type": "string"
+            },
+            "format": {
+              "description": "Output format for the aggregated result: 'raw' (list of outputs), 'summary' (prose), or 'structured' (JSON object keyed by agent_id).",
+              "enum": ["raw", "summary", "structured"],
+              "type": "string"
+            }
+          },
+          "required": [
+            "agent_ids"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "pipe_message",
+        "description": "Forward a specific message to an agent. Use this to chain agents: after receiving a response from agent A via send_message, explicitly pass that content (or any excerpt of it) to agent B. The manager selects exactly what to forward.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "content": {
+              "type": "string",
+              "description": "The exact content to send to the target agent. Typically the response you received from a previous send_message call."
+            },
+            "to_agent_id": {
+              "type": "string",
+              "description": "ID of the agent that will receive the content."
+            },
+            "prefix": {
+              "type": "string",
+              "description": "Optional instruction to prepend before the content (e.g. 'Review this code:')."
+            },
+            "suffix": {
+              "type": "string",
+              "description": "Optional instruction to append after the content (e.g. 'Be concise.')."
+            }
+          },
+          "required": ["content", "to_agent_id"]
+        }
+      }
+    }
+  ]
+}
