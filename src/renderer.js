@@ -219,7 +219,7 @@ chatForm.addEventListener('submit', async (event) => {
       delete streamingBubbles[evt.agent_id];
       delete pendingToolEl[evt.agent_id];
 
-    if (evt.event === 'done') {
+    } else if (evt.event === 'done') {
       streamingBubbles = {};
       pendingToolEl = {};
       refreshLoadedModels();
@@ -232,6 +232,8 @@ chatForm.addEventListener('submit', async (event) => {
         const thread = ws && ws.threads.find((t) => t.id === activeThreadId);
         if (thread) {
           thread.messages = snapshot;
+          // We'll handle memory entries in a more robust way later, 
+          // but for now, we must ensure the backend gets them on load.
           saveWorkspaceConfig();
         }
       }
