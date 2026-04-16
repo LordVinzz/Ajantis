@@ -9,8 +9,111 @@
       body {
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
         margin: 0; padding: 0;
-        display: flex; flex-direction: column;
+        display: flex; flex-direction: row;
         height: 100vh; background-color: #f9f9f9;
+        overflow: hidden;
+      }
+
+      /* ── Sidebar ── */
+      #sidebar {
+        width: 220px; min-width: 220px;
+        background: #1e1e2e; color: #cdd6f4;
+        display: flex; flex-direction: column;
+        transition: width 0.2s ease, min-width 0.2s ease;
+        overflow: hidden; border-right: 1px solid #11111b;
+        user-select: none;
+      }
+      #sidebar.collapsed { width: 36px; min-width: 36px; }
+
+      #sidebar-header {
+        display: flex; align-items: center; gap: 6px;
+        padding: 10px 8px; border-bottom: 1px solid #313244;
+        white-space: nowrap; min-height: 40px;
+      }
+      #sidebar-toggle {
+        background: none; border: none; color: #cdd6f4;
+        font-size: 1rem; cursor: pointer; padding: 2px 4px;
+        flex-shrink: 0; line-height: 1;
+      }
+      #sidebar-toggle:hover { color: #fff; }
+      #sidebar-title {
+        font-size: 0.78rem; font-weight: 700; letter-spacing: 0.06em;
+        text-transform: uppercase; opacity: 0.7; white-space: nowrap;
+      }
+      #sidebar.collapsed #sidebar-title { display: none; }
+      #sidebar.collapsed #add-workspace-btn { display: none; }
+
+      #sidebar-body {
+        flex: 1; overflow-y: auto; padding: 6px 0;
+      }
+      #sidebar.collapsed #sidebar-body { display: none; }
+
+      /* Workspace item */
+      .ws-item { margin-bottom: 2px; }
+      .ws-header {
+        display: flex; align-items: center; gap: 5px;
+        padding: 5px 10px; cursor: pointer;
+        font-size: 0.82rem; white-space: nowrap;
+        border-radius: 4px; margin: 0 4px;
+      }
+      .ws-header:hover { background: rgba(255,255,255,0.06); }
+      .ws-header.active { background: #313244; }
+      .ws-header.active .ws-name { color: #cba6f7; font-weight: 600; }
+      .ws-header.active .ws-icon { filter: sepia(1) saturate(5) hue-rotate(240deg); }
+      .ws-chevron { font-size: 0.65rem; opacity: 0.5; flex-shrink: 0; transition: transform 0.15s; }
+      .ws-item.open .ws-chevron { transform: rotate(90deg); }
+      .ws-icon { flex-shrink: 0; }
+      .ws-name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+      .ws-del {
+        background: none; border: none; color: #f38ba8;
+        font-size: 0.75rem; cursor: pointer; padding: 1px 4px;
+        opacity: 0; flex-shrink: 0;
+      }
+      .ws-header:hover .ws-del { opacity: 1; }
+      .ws-path {
+        font-size: 0.68rem; color: #6c7086; padding: 0 10px 4px 28px;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      .ws-item:not(.open) .ws-path { display: none; }
+
+      /* Threads */
+      .ws-threads { padding: 0 0 4px 0; }
+      .ws-item:not(.open) .ws-threads { display: none; }
+      .thread-item {
+        display: flex; align-items: center; gap: 4px;
+        padding: 4px 10px 4px 30px; cursor: pointer;
+        font-size: 0.8rem; border-radius: 4px; margin: 0 4px;
+        white-space: nowrap;
+      }
+      .thread-item:hover { background: rgba(255,255,255,0.06); }
+      .thread-item.active { background: #313244; color: #cba6f7; }
+      .thread-name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+      .thread-del {
+        background: none; border: none; color: #f38ba8;
+        font-size: 0.7rem; cursor: pointer; padding: 1px 3px;
+        opacity: 0; flex-shrink: 0;
+      }
+      .thread-item:hover .thread-del { opacity: 1; }
+      .thread-add {
+        display: flex; align-items: center; gap: 4px;
+        padding: 4px 10px 4px 30px; font-size: 0.78rem;
+        color: #6c7086; cursor: pointer; border-radius: 4px; margin: 0 4px;
+      }
+      .thread-add:hover { color: #cdd6f4; background: rgba(255,255,255,0.04); }
+
+      #add-workspace-btn {
+        margin: 8px; padding: 7px 10px; border-radius: 6px;
+        background: #313244; border: none; color: #cdd6f4;
+        font-size: 0.8rem; cursor: pointer; text-align: left;
+        display: flex; align-items: center; gap: 6px;
+      }
+      #add-workspace-btn:hover { background: #45475a; }
+
+      /* ── Main area ── */
+      #main {
+        flex: 1; min-width: 0;
+        display: flex; flex-direction: column;
+        overflow: hidden;
       }
 
       /* ── Tabs ── */
@@ -172,41 +275,56 @@
     </style>
   </head>
   <body>
-    <div id="tabs">
-      <button class="tab-btn active" data-tab="chat">Chat</button>
-      <button class="tab-btn" data-tab="agents">Agents</button>
-      <button class="tab-btn" data-tab="routing">Routing</button>
-    </div>
-
-    <div id="loaded-bar"></div>
-
-    <!-- Chat Tab -->
-    <div id="tab-chat" class="tab-content active">
-      <div id="messages"></div>
-      <form id="chat-form">
-        <input id="chat-input" type="text" autocomplete="off" placeholder="Type a message..." />
-        <button type="submit" class="btn-primary">Send</button>
-      </form>
-    </div>
-
-    <!-- Agents Tab -->
-    <div id="tab-agents" class="tab-content">
-      <div id="agents-panel">
-        <div id="agents-toolbar">
-          <button id="addAgentBtn">+ Add Agent</button>
-          <button id="saveConfigBtn" style="background:#34c759;">Save Config</button>
-          <button id="reloadConfigBtn" style="background:#ff9500;">Reload Config</button>
-        </div>
-        <div id="agents-list"></div>
+    <!-- ── Sidebar ── -->
+    <div id="sidebar">
+      <div id="sidebar-header">
+        <button id="sidebar-toggle" title="Toggle sidebar">&#9776;</button>
+        <span id="sidebar-title">Workspaces</span>
       </div>
+      <div id="sidebar-body">
+        <div id="workspace-list"></div>
+      </div>
+      <button id="add-workspace-btn">&#43; Add Workspace</button>
     </div>
 
-    <!-- Routing Tab -->
-    <div id="tab-routing" class="tab-content">
-      <div id="routing-panel">
-        <p style="font-size:0.85rem;color:#666;margin-top:0;">Rows = sender, Columns = receiver. Check a cell to route messages from sender to receiver.</p>
-        <table id="routing-matrix"></table>
-        <div id="connection-rules"></div>
+    <!-- ── Main ── -->
+    <div id="main">
+      <div id="tabs">
+        <button class="tab-btn active" data-tab="chat">Chat</button>
+        <button class="tab-btn" data-tab="agents">Agents</button>
+        <button class="tab-btn" data-tab="routing">Routing</button>
+      </div>
+
+      <div id="loaded-bar"></div>
+
+      <!-- Chat Tab -->
+      <div id="tab-chat" class="tab-content active">
+        <div id="messages"></div>
+        <form id="chat-form">
+          <input id="chat-input" type="text" autocomplete="off" placeholder="Type a message..." />
+          <button type="submit" class="btn-primary">Send</button>
+        </form>
+      </div>
+
+      <!-- Agents Tab -->
+      <div id="tab-agents" class="tab-content">
+        <div id="agents-panel">
+          <div id="agents-toolbar">
+            <button id="addAgentBtn">+ Add Agent</button>
+            <button id="saveConfigBtn" style="background:#34c759;">Save Config</button>
+            <button id="reloadConfigBtn" style="background:#ff9500;">Reload Config</button>
+          </div>
+          <div id="agents-list"></div>
+        </div>
+      </div>
+
+      <!-- Routing Tab -->
+      <div id="tab-routing" class="tab-content">
+        <div id="routing-panel">
+          <p style="font-size:0.85rem;color:#666;margin-top:0;">Rows = sender, Columns = receiver. Check a cell to route messages from sender to receiver.</p>
+          <table id="routing-matrix"></table>
+          <div id="connection-rules"></div>
+        </div>
       </div>
     </div>
 

@@ -113,6 +113,64 @@ impl Default for AgentConfig {
     }
 }
 
+// ── Workspace config ───────────────────────────────────────────────
+
+#[derive(Clone, Serialize, Deserialize)]
+struct WorkspaceThread {
+    id: String,
+    name: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Workspace {
+    id: String,
+    name: String,
+    path: String,
+    #[serde(default)]
+    threads: Vec<WorkspaceThread>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+struct WorkspaceConfig {
+    workspaces: Vec<Workspace>,
+}
+
+fn workspace_config_path(workspace: &PathBuf) -> PathBuf {
+    workspace.join("workspace_config.json")
+}
+
+#[tauri::command]
+async fn pick_folder() -> Result<Option<String>, String> {
+    let handle = rfd::AsyncFileDialog::new()
+        .set_title("Choose a workspace folder")
+        .pick_folder()
+        .await;
+    Ok(handle.map(|f| f.path().to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+async fn load_workspace_config(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<WorkspaceConfig, String> {
+    let path = workspace_config_path(&state.workspace_root);
+    if !path.exists() { return Ok(WorkspaceConfig::default()); }
+    let content = fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read workspace config: {}", e))?;
+    serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse workspace config: {}", e))
+}
+
+#[tauri::command]
+async fn save_workspace_config(
+    state: tauri::State<'_, Arc<AppState>>,
+    config: WorkspaceConfig,
+) -> Result<(), String> {
+    let path = workspace_config_path(&state.workspace_root);
+    let json = serde_json::to_string_pretty(&config)
+        .map_err(|e| format!("Serialization failed: {}", e))?;
+    fs::write(&path, json).map_err(|e| format!("Failed to write workspace config: {}", e))
+}
+
 // ── Memory pool ────────────────────────────────────────────────────
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1737,6 +1795,9 @@ pub fn run() {
             search_memory_pool,
             clear_memory_pool,
             route_message,
+            pick_folder,
+            load_workspace_config,
+            save_workspace_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

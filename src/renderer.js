@@ -608,10 +608,153 @@ function escHtml(str) {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+// ── Sidebar / Workspaces ───────────────────────────────────────────
+
+let workspaceConfig = { workspaces: [] };
+let activeWorkspaceId = null;
+let activeThreadId = null;
+
+function generateWsId() {
+  return 'ws-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+}
+function generateThreadId() {
+  return 'thread-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+}
+
+async function loadWorkspaceConfig() {
+  try {
+    workspaceConfig = await invoke('load_workspace_config');
+    renderWorkspaceList();
+  } catch (e) {
+    console.error('Failed to load workspace config:', e);
+  }
+}
+
+async function saveWorkspaceConfig() {
+  try {
+    await invoke('save_workspace_config', { config: workspaceConfig });
+  } catch (e) {
+    console.error('Failed to save workspace config:', e);
+  }
+}
+
+function renderWorkspaceList() {
+  const list = document.getElementById('workspace-list');
+  list.innerHTML = '';
+
+  workspaceConfig.workspaces.forEach((ws) => {
+    const item = document.createElement('div');
+    item.className = 'ws-item' + (ws._open ? ' open' : '');
+    item.dataset.id = ws.id;
+
+    // Header row
+    const header = document.createElement('div');
+    header.className = 'ws-header' + (ws.id === activeWorkspaceId ? ' active' : '');
+    header.innerHTML =
+      '<span class="ws-chevron">&#9658;</span>' +
+      '<span class="ws-icon">&#128193;</span>' +
+      '<span class="ws-name" title="' + escHtml(ws.path) + '">' + escHtml(ws.name) + '</span>' +
+      '<button class="ws-del" title="Remove workspace">&#10005;</button>';
+
+    header.addEventListener('click', (e) => {
+      if (e.target.classList.contains('ws-del')) return;
+      // Select this workspace
+      activeWorkspaceId = ws.id;
+      activeThreadId = null;
+      // Toggle open/close
+      ws._open = !ws._open;
+      item.classList.toggle('open', ws._open);
+      renderWorkspaceList();
+    });
+    header.querySelector('.ws-del').addEventListener('click', () => {
+      workspaceConfig.workspaces = workspaceConfig.workspaces.filter((w) => w.id !== ws.id);
+      saveWorkspaceConfig();
+      renderWorkspaceList();
+    });
+
+    // Path subtitle
+    const pathEl = document.createElement('div');
+    pathEl.className = 'ws-path';
+    pathEl.textContent = ws.path;
+
+    // Threads
+    const threadsEl = document.createElement('div');
+    threadsEl.className = 'ws-threads';
+
+    ws.threads.forEach((thread) => {
+      const isActiveThread = thread.id === activeThreadId && ws.id === activeWorkspaceId;
+      const tEl = document.createElement('div');
+      tEl.className = 'thread-item' + (isActiveThread ? ' active' : '');
+      tEl.innerHTML =
+        '<span style="opacity:0.4;font-size:0.7rem;">&#9135;</span>' +
+        '<span class="thread-name">' + escHtml(thread.name) + '</span>' +
+        '<button class="thread-del" title="Delete thread">&#10005;</button>';
+      tEl.addEventListener('click', (e) => {
+        if (e.target.classList.contains('thread-del')) return;
+        activeWorkspaceId = ws.id;
+        activeThreadId = thread.id;
+        renderWorkspaceList();
+      });
+      tEl.querySelector('.thread-del').addEventListener('click', (e) => {
+        e.stopPropagation();
+        ws.threads = ws.threads.filter((t) => t.id !== thread.id);
+        if (activeThreadId === thread.id) activeThreadId = null;
+        saveWorkspaceConfig();
+        renderWorkspaceList();
+      });
+      threadsEl.appendChild(tEl);
+    });
+
+    // Add thread button
+    const addThread = document.createElement('div');
+    addThread.className = 'thread-add';
+    addThread.innerHTML = '<span>&#43;</span> New thread';
+    addThread.addEventListener('click', () => {
+      const n = ws.threads.length + 1;
+      ws.threads.push({ id: generateThreadId(), name: 'Thread ' + n });
+      saveWorkspaceConfig();
+      ws._open = true;
+      renderWorkspaceList();
+    });
+    threadsEl.appendChild(addThread);
+
+    item.appendChild(header);
+    item.appendChild(pathEl);
+    item.appendChild(threadsEl);
+    list.appendChild(item);
+  });
+}
+
+document.getElementById('add-workspace-btn').addEventListener('click', async () => {
+  try {
+    const path = await invoke('pick_folder');
+    if (!path) return;
+    const name = path.split('/').filter(Boolean).pop() || path;
+    workspaceConfig.workspaces.push({
+      id: generateWsId(),
+      name,
+      path,
+      threads: [{ id: generateThreadId(), name: 'Thread 1' }],
+      _open: true,
+    });
+    await saveWorkspaceConfig();
+    renderWorkspaceList();
+  } catch (e) {
+    appendMessage('System', 'Failed to pick folder: ' + e, false, true);
+  }
+});
+
+// Sidebar collapse toggle
+const sidebar = document.getElementById('sidebar');
+document.getElementById('sidebar-toggle').addEventListener('click', () => {
+  sidebar.classList.toggle('collapsed');
+});
+
 // ── Init ───────────────────────────────────────────────────────────
 
 (async function init() {
   await fetchAvailableModels();
   await loadConfig();
   await refreshLoadedModels();
+  await loadWorkspaceConfig();
 })();

@@ -1,0 +1,19 @@
+{
+  "workspaces": [
+    {
+      "id": "ws-mo1hq845jpq",
+      "name": "AlKanzar",
+      "path": "/Users/vincentdominguez/Projects/AlKanzar",
+      "threads": [
+        {
+          "id": "thread-mo1hump0pd7",
+          "name": "Thread 1"
+        },
+        {
+          "id": "thread-mo1huq1vhg0",
+          "name": "Thread 2"
+        }
+      ]
+    }
+  ]
+}

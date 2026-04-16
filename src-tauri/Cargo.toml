@@ -28,3 +28,4 @@ tower-http = { version = "0.6", features = ["cors"] }
 glob = "0.3"
 async-recursion = "1"
 chrono = { version = "0.4", features = ["serde"] }
+rfd = "0.15"
