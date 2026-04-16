@@ -219,7 +219,7 @@ chatForm.addEventListener('submit', async (event) => {
       delete streamingBubbles[evt.agent_id];
       delete pendingToolEl[evt.agent_id];
 
-    } else if (evt.event === 'done') {
+    if (evt.event === 'done') {
       streamingBubbles = {};
       pendingToolEl = {};
       refreshLoadedModels();

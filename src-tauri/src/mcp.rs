@@ -1220,6 +1220,25 @@ pub(crate) async fn start_mcp_server(port: u16, mcp_state: McpState) {
     axum::serve(listener, app).await.ok();
 }
 
+/// Load tools from the `tools.json` embedded at compile time.
+/// The path is relative to `src-tauri/` (where Cargo.toml lives).
+pub(crate) fn load_tools_embedded() -> Vec<McpTool> {
+    const TOOLS_JSON: &str = include_str!("../../tools.json");
+    let parsed: serde_json::Value = serde_json::from_str(TOOLS_JSON)
+        .expect("tools.json is not valid JSON");
+    parsed.get("tools").and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|entry| {
+            let func = entry.get("function")?;
+            Some(McpTool {
+                name: func["name"].as_str().unwrap_or("").to_string(),
+                description: func["description"].as_str().unwrap_or("").to_string(),
+                input_schema: func.get("parameters").cloned()
+                    .unwrap_or(serde_json::json!({"type": "object"})),
+            })
+        }).collect())
+        .unwrap_or_default()
+}
+
 pub(crate) fn load_tools(tools_path: &PathBuf) -> Vec<McpTool> {
     match fs::read_to_string(tools_path) {
         Ok(content) => {

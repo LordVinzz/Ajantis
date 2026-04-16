@@ -149,7 +149,7 @@ pub(crate) async fn call_chat_with_tools(
         .timeout(std::time::Duration::from_secs(60))
         .build().unwrap_or_default();
 
-    for _ in 0u8..16 {
+    for _ in 0u8..64 {
         let body = json!({
             "model": model_key,
             "messages": messages,

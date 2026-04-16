@@ -18,7 +18,7 @@ use tauri::ipc::Channel;
 use crate::agent_config::AgentConfig;
 use crate::chat::{send_message, StreamEvent};
 use crate::config_persistence::{config_path, load_agent_config, save_agent_config};
-use crate::mcp::{load_tools, start_mcp_server, McpState};
+use crate::mcp::{load_tools_embedded, start_mcp_server, McpState};
 use crate::memory::{clear_memory_pool, get_memory_pool, search_memory_pool, MemoryPool};
 use crate::models::{download_model, fetch_loaded_models, fetch_models, load_model, set_model, unload_model};
 use crate::routing::route_message;
@@ -29,16 +29,8 @@ use crate::workspace::{load_workspace_config, pick_folder, save_workspace_config
 pub fn run() {
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    // tools.json lives at the project root; when running from src-tauri/ look one level up
-    let tools_path = {
-        let in_cwd = workspace_root.join("tools.json");
-        let in_parent = workspace_root.parent().map(|p| p.join("tools.json"));
-        match in_parent.filter(|p| p.exists()) {
-            Some(p) if !in_cwd.exists() => p,
-            _ => in_cwd,
-        }
-    };
-    let mcp_tools = load_tools(&tools_path);
+    // tools.json is embedded at compile time — no need to ship it alongside the binary.
+    let mcp_tools = load_tools_embedded();
     let mcp_port: u16 = 4785;
 
     let agent_config: AgentConfig = {
