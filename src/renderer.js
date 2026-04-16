@@ -15,7 +15,7 @@ const routingTable = document.getElementById('routing-matrix');
 
 // ── State ──────────────────────────────────────────────────────────
 
-let agentConfig = { agents: [], connections: [] };
+let agentConfig = { agents: [], connections: [], command_policy: { allowlist: [], denylist: [] } };
 let availableModels = []; // ModelInfo[] from backend
 let modelDetails = {};    // key -> ModelInfo
 
@@ -28,7 +28,7 @@ document.querySelectorAll('.tab-btn').forEach((btn) => {
     btn.classList.add('active');
     document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
     if (btn.dataset.tab === 'routing') { renderRoutingMatrix(); renderConnectionRules(); }
-    if (btn.dataset.tab === 'agents') renderAgentsList();
+    if (btn.dataset.tab === 'agents') { renderAgentsList(); renderCommandPolicy(); }
   });
 });
 
@@ -127,6 +127,26 @@ chatForm.addEventListener('submit', async (event) => {
   const message = chatInput.value.trim();
   if (!message) return;
 
+  // ── Workspace guard ──────────────────────────────────────────────
+  if (!activeWorkspaceId) {
+    appendMessage('System', 'Sélectionne un workspace dans la barre latérale avant d\'envoyer un message.', false, true);
+    return;
+  }
+
+  // ── Auto-create thread if none selected ─────────────────────────
+  if (!activeThreadId) {
+    const ws = workspaceConfig.workspaces.find((w) => w.id === activeWorkspaceId);
+    if (ws) {
+      const threadName = message.slice(0, 20) + (message.length > 20 ? '…' : '');
+      const newThread = { id: generateThreadId(), name: threadName };
+      ws.threads.push(newThread);
+      activeThreadId = newThread.id;
+      ws._open = true;
+      await saveWorkspaceConfig();
+      renderWorkspaceList();
+    }
+  }
+
   appendMessage('You', message, true, false);
   chatInput.value = '';
   streamingBubbles = {};
@@ -203,6 +223,18 @@ chatForm.addEventListener('submit', async (event) => {
       streamingBubbles = {};
       pendingToolEl = {};
       refreshLoadedModels();
+      // Snapshot + persist the conversation for the current thread
+      if (activeThreadId) {
+        const snapshot = messagesDiv.innerHTML;
+        threadMessages[activeThreadId] = snapshot;
+        // Persist into workspaceConfig so it survives restarts
+        const ws = workspaceConfig.workspaces.find((w) => w.id === activeWorkspaceId);
+        const thread = ws && ws.threads.find((t) => t.id === activeThreadId);
+        if (thread) {
+          thread.messages = snapshot;
+          saveWorkspaceConfig();
+        }
+      }
     }
   };
 
@@ -274,7 +306,9 @@ async function fetchAvailableModels() {
 async function loadConfig() {
   try {
     agentConfig = await invoke('load_agent_config');
+    if (!agentConfig.command_policy) agentConfig.command_policy = { allowlist: [], denylist: [] };
     renderAgentsList();
+    renderCommandPolicy();
     renderRoutingMatrix();
   } catch (err) {
     appendMessage('System', 'Failed to load config: ' + err, false, true);
@@ -498,6 +532,45 @@ function renderAgentsList() {
   });
 }
 
+// ── Command sandbox policy ─────────────────────────────────────────
+
+function renderCommandPolicy() {
+  const container = document.getElementById('command-policy-section');
+  if (!container) return;
+
+  if (!agentConfig.command_policy) {
+    agentConfig.command_policy = { allowlist: [], denylist: [] };
+  }
+  const policy = agentConfig.command_policy;
+
+  container.innerHTML = `
+    <h3 style="margin:0 0 8px;">Command Sandbox Policy</h3>
+    <p style="font-size:0.8rem;color:#888;margin:0 0 10px;">
+      Controls which shell commands agents may execute (bash, REPL, PowerShell, TaskCreate).<br>
+      Path traversal (<code>..</code>) and absolute paths outside the workspace are always blocked.<br>
+      <strong>Denylist</strong> takes priority over allowlist. Leave allowlist empty to allow all (except denylisted).
+    </p>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+      <div>
+        <label style="font-weight:600;color:#f38ba8;">Denylist (always blocked)</label>
+        <textarea id="policy-denylist" style="width:100%;height:90px;margin-top:4px;font-family:monospace;font-size:0.8rem;" placeholder="rm -rf&#10;sudo&#10;curl">${escHtml(policy.denylist.join('\n'))}</textarea>
+        <div style="font-size:0.75rem;color:#888;">One prefix per line. Matching commands are always rejected.</div>
+      </div>
+      <div>
+        <label style="font-weight:600;color:#a6e3a1;">Allowlist (whitelist)</label>
+        <textarea id="policy-allowlist" style="width:100%;height:90px;margin-top:4px;font-family:monospace;font-size:0.8rem;" placeholder="ls&#10;cat&#10;python3">${escHtml(policy.allowlist.join('\n'))}</textarea>
+        <div style="font-size:0.75rem;color:#888;">One prefix per line. If non-empty, only matching commands are allowed.</div>
+      </div>
+    </div>`;
+
+  container.querySelector('#policy-denylist').addEventListener('input', (e) => {
+    policy.denylist = e.target.value.split('\n').map((s) => s.trim()).filter(Boolean);
+  });
+  container.querySelector('#policy-allowlist').addEventListener('input', (e) => {
+    policy.allowlist = e.target.value.split('\n').map((s) => s.trim()).filter(Boolean);
+  });
+}
+
 // ── Routing matrix ─────────────────────────────────────────────────
 
 function renderRoutingMatrix() {
@@ -601,6 +674,23 @@ function renderConnectionRules() {
   });
 }
 
+// ── Chat input state ───────────────────────────────────────────────
+
+function updateChatInputState() {
+  if (!activeWorkspaceId) {
+    chatInput.placeholder = 'Sélectionne un workspace pour commencer…';
+    chatInput.disabled = true;
+  } else if (!activeThreadId) {
+    chatInput.placeholder = 'Envoyer un message créera un nouveau thread…';
+    chatInput.disabled = false;
+  } else {
+    const ws = workspaceConfig.workspaces.find((w) => w.id === activeWorkspaceId);
+    const thread = ws && ws.threads.find((t) => t.id === activeThreadId);
+    chatInput.placeholder = thread ? 'Message — ' + thread.name : 'Message…';
+    chatInput.disabled = false;
+  }
+}
+
 // ── Util ───────────────────────────────────────────────────────────
 
 function escHtml(str) {
@@ -613,6 +703,8 @@ function escHtml(str) {
 let workspaceConfig = { workspaces: [] };
 let activeWorkspaceId = null;
 let activeThreadId = null;
+// Per-thread conversation snapshots: threadId → messagesDiv.innerHTML
+let threadMessages = {};
 
 function generateWsId() {
   return 'ws-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
@@ -624,6 +716,15 @@ function generateThreadId() {
 async function loadWorkspaceConfig() {
   try {
     workspaceConfig = await invoke('load_workspace_config');
+    // Restore in-memory snapshots from persisted thread data
+    threadMessages = {};
+    workspaceConfig.workspaces.forEach((ws) => {
+      ws.threads.forEach((thread) => {
+        if (thread.messages) {
+          threadMessages[thread.id] = thread.messages;
+        }
+      });
+    });
     renderWorkspaceList();
   } catch (e) {
     console.error('Failed to load workspace config:', e);
@@ -658,12 +759,19 @@ function renderWorkspaceList() {
 
     header.addEventListener('click', (e) => {
       if (e.target.classList.contains('ws-del')) return;
-      // Select this workspace
+      // Select this workspace, deselect thread
       activeWorkspaceId = ws.id;
       activeThreadId = null;
+      // Notify backend of active sandbox path
+      invoke('set_active_workspace', { path: ws.path }).catch(() => {});
+      // Clear chat — no thread selected yet
+      messagesDiv.innerHTML = '';
+      streamingBubbles = {};
+      pendingToolEl = {};
       // Toggle open/close
       ws._open = !ws._open;
       item.classList.toggle('open', ws._open);
+      updateChatInputState();
       renderWorkspaceList();
     });
     header.querySelector('.ws-del').addEventListener('click', () => {
@@ -693,12 +801,25 @@ function renderWorkspaceList() {
         if (e.target.classList.contains('thread-del')) return;
         activeWorkspaceId = ws.id;
         activeThreadId = thread.id;
+        // Notify backend of active sandbox path
+        invoke('set_active_workspace', { path: ws.path }).catch(() => {});
+        // Restore this thread's conversation
+        messagesDiv.innerHTML = threadMessages[thread.id] || '';
+        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        streamingBubbles = {};
+        pendingToolEl = {};
+        updateChatInputState();
         renderWorkspaceList();
       });
       tEl.querySelector('.thread-del').addEventListener('click', (e) => {
         e.stopPropagation();
         ws.threads = ws.threads.filter((t) => t.id !== thread.id);
-        if (activeThreadId === thread.id) activeThreadId = null;
+        if (activeThreadId === thread.id) {
+          activeThreadId = null;
+          delete threadMessages[thread.id];
+          messagesDiv.innerHTML = '';
+          updateChatInputState();
+        }
         saveWorkspaceConfig();
         renderWorkspaceList();
       });
@@ -757,4 +878,5 @@ document.getElementById('sidebar-toggle').addEventListener('click', () => {
   await loadConfig();
   await refreshLoadedModels();
   await loadWorkspaceConfig();
+  updateChatInputState();
 })();

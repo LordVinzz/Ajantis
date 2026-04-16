@@ -161,6 +161,9 @@
         flex: 1; padding: 10px; border-radius: 25px; border: 1px solid #ccc;
         font-size: 1rem; outline: none;
       }
+      #chat-input:disabled {
+        background: #f0f0f0; color: #aaa; cursor: not-allowed; border-color: #ddd;
+      }
 
       /* ── Agents tab ── */
       #agents-panel { padding: 12px; }
@@ -301,7 +304,7 @@
       <div id="tab-chat" class="tab-content active">
         <div id="messages"></div>
         <form id="chat-form">
-          <input id="chat-input" type="text" autocomplete="off" placeholder="Type a message..." />
+          <input id="chat-input" type="text" autocomplete="off" placeholder="Sélectionne un workspace pour commencer…" disabled />
           <button type="submit" class="btn-primary">Send</button>
         </form>
       </div>
@@ -315,6 +318,7 @@
             <button id="reloadConfigBtn" style="background:#ff9500;">Reload Config</button>
           </div>
           <div id="agents-list"></div>
+          <div id="command-policy-section" style="margin-top:20px;padding:14px 16px;background:#f0f4ff;border:1px solid #c8d8ff;border-radius:8px;"></div>
         </div>
       </div>
 
