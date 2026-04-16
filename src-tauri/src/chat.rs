@@ -141,7 +141,13 @@ pub(crate) async fn call_chat_with_tools(
         })
     }).collect();
 
-    let client = reqwest::Client::new();
+    // Separate clients: LLM calls can take minutes, MCP tool calls should be fast.
+    let llm_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build().unwrap_or_default();
+    let mcp_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build().unwrap_or_default();
 
     for _ in 0u8..16 {
         let body = json!({
@@ -151,7 +157,7 @@ pub(crate) async fn call_chat_with_tools(
             "stream": false,
         });
 
-        let resp = client.post(&url).json(&body).send().await
+        let resp = llm_client.post(&url).json(&body).send().await
             .map_err(|e| format!("Request failed: {}", e))?;
         if !resp.status().is_success() {
             return Err(format!("LLM error: {}", resp.text().await.unwrap_or_default()));
@@ -191,7 +197,7 @@ pub(crate) async fn call_chat_with_tools(
                     "params": { "name": fn_name, "arguments": fn_args }
                 });
 
-                let tool_result = match client
+                let tool_result = match mcp_client
                     .post(format!("http://localhost:{}", mcp_port))
                     .json(&mcp_req).send().await
                 {
@@ -205,8 +211,10 @@ pub(crate) async fn call_chat_with_tools(
                 };
 
                 // Notify frontend: tool result received (truncate very long results)
-                let preview = if tool_result.len() > 2000 {
-                    format!("{}…[truncated, {} chars total]", &tool_result[..2000], tool_result.len())
+                let char_count = tool_result.chars().count();
+                let preview = if char_count > 2000 {
+                    let head: String = tool_result.chars().take(2000).collect();
+                    format!("{}…[truncated, {} chars total]", head, char_count)
                 } else {
                     tool_result.clone()
                 };
@@ -223,14 +231,48 @@ pub(crate) async fn call_chat_with_tools(
                 }));
             }
         } else {
-            let content = assistant_msg["content"].as_str().unwrap_or("").to_string();
-            if !content.is_empty() {
-                let _ = on_event.send(StreamEvent::Token {
-                    agent_id: agent_id.to_string(),
-                    content: content.clone(),
-                });
+            // No more tool calls — stream the final answer so it appears progressively.
+            let stream_body = json!({
+                "model": model_key,
+                "messages": messages,
+                "tools": tool_defs,
+                "stream": true,
+            });
+            let stream_resp = llm_client.post(&url).json(&stream_body).send().await
+                .map_err(|e| format!("Stream request failed: {}", e))?;
+            if !stream_resp.status().is_success() {
+                return Err(format!("LLM stream error: {}", stream_resp.text().await.unwrap_or_default()));
             }
-            return Ok(content);
+            let mut full_content = String::new();
+            let mut buffer = String::new();
+            let mut stream_resp = stream_resp;
+            while let Some(chunk) = stream_resp.chunk().await.map_err(|e| format!("Stream read: {}", e))? {
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(pos) = buffer.find('\n') {
+                    let line = buffer[..pos].trim_end().to_string();
+                    buffer = buffer[pos + 1..].to_string();
+                    if line.is_empty() || line.starts_with(':') { continue; }
+                    if let Some(data) = line.strip_prefix("data: ") {
+                        if data.trim() == "[DONE]" { return Ok(full_content); }
+                        if let Ok(parsed) = serde_json::from_str::<Value>(data) {
+                            // If the model decided to call a tool after all, fall back to non-streaming.
+                            if parsed["choices"][0]["delta"]["tool_calls"].is_array() {
+                                return Ok(full_content);
+                            }
+                            if let Some(delta) = parsed["choices"][0]["delta"]["content"].as_str() {
+                                if !delta.is_empty() {
+                                    full_content.push_str(delta);
+                                    let _ = on_event.send(StreamEvent::Token {
+                                        agent_id: agent_id.to_string(),
+                                        content: delta.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(full_content);
         }
     }
     Err("Max tool-call iterations (16) reached.".to_string())

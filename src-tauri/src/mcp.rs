@@ -165,12 +165,13 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
             match fs::read_to_string(&abs) {
                 Ok(data) => {
                     let offset = args["offset"].as_u64().unwrap_or(0) as usize;
-                    let limit = args["limit"].as_u64().map(|l| l as usize);
-                    let slice = match limit {
-                        Some(l) => &data[offset.min(data.len())..(offset + l).min(data.len())],
-                        None => &data[offset.min(data.len())..],
-                    };
-                    mcp_ok(slice)
+                    let limit  = args["limit"].as_u64().map(|l| l as usize);
+                    // Slice by chars to avoid panicking on multi-byte UTF-8 boundaries.
+                    let slice: String = data.chars()
+                        .skip(offset)
+                        .take(limit.unwrap_or(usize::MAX))
+                        .collect();
+                    mcp_ok(&slice)
                 }
                 Err(e) => mcp_error(&format!("Error reading file: {}", e)),
             }
@@ -767,8 +768,10 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
                     }
                     let body = resp.text().await.unwrap_or_default();
                     let text = strip_html(&body);
-                    let out = if text.len() > 8000 {
-                        format!("{}…[truncated, {} chars total]", &text[..8000], text.len())
+                    let char_count = text.chars().count();
+                    let out = if char_count > 8000 {
+                        let head: String = text.chars().take(8000).collect();
+                        format!("{}…[truncated, {} chars total]", head, char_count)
                     } else { text };
                     mcp_ok(&format!("URL: {}\n\n{}", url, out))
                 }

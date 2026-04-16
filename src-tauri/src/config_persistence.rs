@@ -5,8 +5,17 @@ use std::sync::Arc;
 use crate::agent_config::AgentConfig;
 use crate::state::AppState;
 
-pub(crate) fn config_path(workspace: &PathBuf) -> PathBuf {
-    workspace.join("ajantis-config.json")
+/// Returns `~/.ajantis/`, creating it if needed.
+pub(crate) fn ajantis_dir() -> PathBuf {
+    let dir = dirs_next::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".ajantis");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+pub(crate) fn config_path(_workspace: &PathBuf) -> PathBuf {
+    ajantis_dir().join("ajantis-config.json")
 }
 
 #[tauri::command]

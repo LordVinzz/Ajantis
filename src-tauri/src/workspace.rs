@@ -29,8 +29,8 @@ pub(crate) struct WorkspaceConfig {
     workspaces: Vec<Workspace>,
 }
 
-pub(crate) fn workspace_config_path(workspace: &PathBuf) -> PathBuf {
-    workspace.join("workspace_config.json")
+pub(crate) fn workspace_config_path(_workspace: &PathBuf) -> PathBuf {
+    crate::config_persistence::ajantis_dir().join("workspace_config.json")
 }
 
 /// Called by the frontend when the user selects a workspace.
