@@ -23,9 +23,10 @@ pub(crate) async fn route_message(
     let mcp_port = state.mcp_port;
     let mut visited: HashSet<String> = HashSet::new();
 
-    let model_type_map: HashMap<String, String> = match fetch_models().await {
-        Ok(models) => models.into_iter()
-            .filter_map(|m| m.model_type.map(|t| (m.key, t)))
+    let model_info_map: HashMap<String, (String, Option<u64>)> = match fetch_models().await {
+        Ok(models) => models
+            .into_iter()
+            .filter_map(|m| m.model_type.map(|t| (m.key, (t, m.max_context_length))))
             .collect(),
         Err(_) => HashMap::new(),
     };
@@ -34,9 +35,17 @@ pub(crate) async fn route_message(
     *state.event_channel.lock().unwrap() = Some(on_event.clone());
 
     route_recursive(
-        &config, &from_agent_id, &message, &on_event,
-        &mut visited, &memory, &model_type_map, tools_arc, mcp_port,
-    ).await;
+        &config,
+        &from_agent_id,
+        &message,
+        &on_event,
+        &mut visited,
+        &memory,
+        &model_info_map,
+        tools_arc,
+        mcp_port,
+    )
+    .await;
 
     *state.event_channel.lock().unwrap() = None;
     let _ = on_event.send(StreamEvent::Done);
@@ -51,16 +60,17 @@ pub(crate) async fn route_recursive(
     on_event: &Channel<StreamEvent>,
     visited: &mut HashSet<String>,
     memory: &Arc<Mutex<MemoryPool>>,
-    model_type_map: &HashMap<String, String>,
+    model_info_map: &HashMap<String, (String, Option<u64>)>,
     tools: Arc<Vec<McpTool>>,
     mcp_port: u16,
 ) {
     // Collect enabled targets sorted by priority (lower = first)
-    let mut targets: Vec<(String, u8)> = config.connections.iter()
+    let mut targets: Vec<(String, u8)> = config
+        .connections
+        .iter()
         .filter(|c| c.from == from_id && c.enabled)
         .filter(|c| match &c.condition {
-            Some(cond) if !cond.is_empty() =>
-                message.to_lowercase().contains(&cond.to_lowercase()),
+            Some(cond) if !cond.is_empty() => message.to_lowercase().contains(&cond.to_lowercase()),
             _ => true,
         })
         .map(|c| (c.to.clone(), c.priority))
@@ -69,15 +79,28 @@ pub(crate) async fn route_recursive(
 
     for (target_id, _) in targets {
         let visit_key = format!("{}→{}", from_id, target_id);
-        if visited.contains(&visit_key) { continue; }
+        if visited.contains(&visit_key) {
+            continue;
+        }
         visited.insert(visit_key);
 
         // Extract all agent fields before any await to release the borrow cleanly
-        let (agent_name, model_key, mode, role, load_cfg, is_manager, model_type_resolved) = {
+        let (
+            agent_name,
+            model_key,
+            mode,
+            role,
+            load_cfg,
+            is_manager,
+            model_type_resolved,
+            context_limit,
+        ) = {
             match config.agents.iter().find(|a| a.id == target_id) {
                 None => continue,
                 Some(agent) => {
-                    if agent.agent_type == "user" || !agent.armed { continue; }
+                    if agent.agent_type == "user" || !agent.armed {
+                        continue;
+                    }
                     if agent.paused {
                         let _ = on_event.send(StreamEvent::Error {
                             agent_id: target_id.clone(),
@@ -86,21 +109,36 @@ pub(crate) async fn route_recursive(
                         });
                         continue;
                     }
-                    let resolved = agent.model_type.clone()
-                        .or_else(|| agent.model_key.as_deref()
-                            .and_then(|k| model_type_map.get(k).cloned()));
+                    let resolved = agent.model_type.clone().or_else(|| {
+                        agent.model_key.as_deref().and_then(|k| {
+                            model_info_map
+                                .get(k)
+                                .map(|(model_type, _)| model_type.clone())
+                        })
+                    });
+                    let max_context = agent
+                        .model_key
+                        .as_deref()
+                        .and_then(|k| model_info_map.get(k).and_then(|(_, max_ctx)| *max_ctx));
                     (
                         agent.name.clone(),
                         agent.model_key.clone().unwrap_or_default(),
                         agent.mode.as_deref().unwrap_or("stay_awake").to_string(),
                         agent.role.clone().unwrap_or_default(),
                         agent.load_config.clone().unwrap_or(AgentLoadConfig {
-                            context_length: None, eval_batch_size: None,
-                            flash_attention: None, num_experts: None,
+                            context_length: None,
+                            eval_batch_size: None,
+                            flash_attention: None,
+                            num_experts: None,
                             offload_kv_cache_to_gpu: None,
                         }),
                         agent.is_manager,
                         resolved,
+                        agent
+                            .load_config
+                            .as_ref()
+                            .and_then(|cfg| cfg.context_length)
+                            .or(max_context),
                     )
                 }
             }
@@ -108,15 +146,20 @@ pub(crate) async fn route_recursive(
 
         if model_type_resolved.as_deref() == Some("embedding") {
             let _ = on_event.send(StreamEvent::Error {
-                agent_id: target_id.clone(), agent_name: agent_name.clone(),
-                message: format!("Agent '{}' uses an embedding model — not usable for chat.", agent_name),
+                agent_id: target_id.clone(),
+                agent_name: agent_name.clone(),
+                message: format!(
+                    "Agent '{}' uses an embedding model — not usable for chat.",
+                    agent_name
+                ),
             });
             continue;
         }
 
         if model_key.is_empty() {
             let _ = on_event.send(StreamEvent::Error {
-                agent_id: target_id.clone(), agent_name: agent_name.clone(),
+                agent_id: target_id.clone(),
+                agent_name: agent_name.clone(),
                 message: format!("Agent '{}' has no model configured.", agent_name),
             });
             continue;
@@ -125,7 +168,8 @@ pub(crate) async fn route_recursive(
         if mode == "on_the_fly" {
             if let Err(e) = load_model_internal(&load_cfg, &model_key).await {
                 let _ = on_event.send(StreamEvent::Error {
-                    agent_id: target_id.clone(), agent_name: agent_name.clone(),
+                    agent_id: target_id.clone(),
+                    agent_name: agent_name.clone(),
                     message: format!("Failed to load model: {}", e),
                 });
                 continue;
@@ -140,35 +184,73 @@ pub(crate) async fn route_recursive(
         // Reconstruct conversation history for this agent (all previous user/assistant turns)
         let history: Vec<Value> = {
             let pool = memory.lock().unwrap();
-            pool.entries.iter()
+            pool.entries
+                .iter()
                 .filter(|e| e.agent_id == target_id && (e.role == "user" || e.role == "assistant"))
                 .map(|e| json!({"role": e.role, "content": e.content}))
                 .collect()
         };
 
         let result = if is_manager {
-            call_chat_with_tools(&model_key, &role, message, &target_id, &tools, mcp_port, on_event, &history).await
+            call_chat_with_tools(
+                &model_key,
+                &role,
+                message,
+                &target_id,
+                &tools,
+                None,
+                true,
+                true,
+                context_limit,
+                mcp_port,
+                on_event,
+                &history,
+            )
+            .await
         } else {
-            send_chat_completion_streaming(&model_key, &role, message, &target_id, on_event, &history).await
+            send_chat_completion_streaming(
+                &model_key,
+                &role,
+                message,
+                &target_id,
+                on_event,
+                &history,
+                context_limit,
+            )
+            .await
         };
 
         match result {
             Ok(full_response) => {
-                let _ = on_event.send(StreamEvent::AgentEnd { agent_id: target_id.clone() });
+                let _ = on_event.send(StreamEvent::AgentEnd {
+                    agent_id: target_id.clone(),
+                });
                 // Store both sides of this turn so history is complete for the next message
                 {
                     let mut pool = memory.lock().unwrap();
                     pool.push(&target_id, &agent_name, "user", message);
                     pool.push(&target_id, &agent_name, "assistant", &full_response);
                 }
-                if mode == "on_the_fly" { let _ = unload_model_internal(&model_key).await; }
+                if mode == "on_the_fly" {
+                    let _ = unload_model_internal(&model_key).await;
+                }
                 route_recursive(
-                    config, &target_id, &full_response, on_event,
-                    visited, memory, model_type_map, tools.clone(), mcp_port,
-                ).await;
+                    config,
+                    &target_id,
+                    &full_response,
+                    on_event,
+                    visited,
+                    memory,
+                    model_info_map,
+                    tools.clone(),
+                    mcp_port,
+                )
+                .await;
             }
             Err(e) => {
-                if mode == "on_the_fly" { let _ = unload_model_internal(&model_key).await; }
+                if mode == "on_the_fly" {
+                    let _ = unload_model_internal(&model_key).await;
+                }
                 let _ = on_event.send(StreamEvent::Error {
                     agent_id: target_id.clone(),
                     agent_name: agent_name.clone(),

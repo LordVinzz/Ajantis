@@ -3,7 +3,10 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tauri::ipc::Channel;
 
-use crate::helpers::lm_base_url;
+use crate::helpers::{
+    compute_context_budget, is_manager_blocked_tool, is_manager_only_tool, lm_base_url,
+    with_context_budget,
+};
 use crate::state::{AppState, McpTool};
 
 #[derive(Serialize)]
@@ -58,7 +61,8 @@ pub(crate) async fn send_message(
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
                 return Ok(SendMessageResponse {
-                    ok: false, data: None,
+                    ok: false,
+                    data: None,
                     error: Some(format!("LM Studio API error: {} {}", status, text)),
                 });
             }
@@ -67,16 +71,22 @@ pub(crate) async fn send_message(
                     if let Some(rid) = data.get("response_id").and_then(|v| v.as_str()) {
                         *state.last_response_id.lock().unwrap() = Some(rid.to_string());
                     }
-                    Ok(SendMessageResponse { ok: true, data: Some(data), error: None })
+                    Ok(SendMessageResponse {
+                        ok: true,
+                        data: Some(data),
+                        error: None,
+                    })
                 }
                 Err(e) => Ok(SendMessageResponse {
-                    ok: false, data: None,
+                    ok: false,
+                    data: None,
                     error: Some(format!("Failed to parse response: {}", e)),
                 }),
             }
         }
         Err(e) => Ok(SendMessageResponse {
-            ok: false, data: None,
+            ok: false,
+            data: None,
             error: Some(format!("Request failed: {}", e)),
         }),
     }
@@ -85,25 +95,44 @@ pub(crate) async fn send_message(
 /// Non-streaming single-turn call. Used by manager MCP tools.
 /// `history` contains previous [user / assistant] turns for this agent.
 pub(crate) async fn call_chat_blocking(
-    model_key: &str, system_prompt: &str, message: &str, history: &[Value],
+    model_key: &str,
+    system_prompt: &str,
+    message: &str,
+    history: &[Value],
+    context_limit: Option<u64>,
 ) -> Result<String, String> {
     let url = format!("{}/v1/chat/completions", lm_base_url());
+    let budget = compute_context_budget(system_prompt, history, message, context_limit, 0);
+    let effective_system_prompt = with_context_budget(system_prompt, budget);
     let mut messages = vec![];
-    if !system_prompt.is_empty() {
-        messages.push(json!({"role": "system", "content": system_prompt}));
+    if !effective_system_prompt.is_empty() {
+        messages.push(json!({"role": "system", "content": effective_system_prompt}));
     }
-    for h in history { messages.push(h.clone()); }
+    for h in history {
+        messages.push(h.clone());
+    }
     messages.push(json!({"role": "user", "content": message}));
     let client = reqwest::Client::new();
-    let resp = client.post(&url)
+    let resp = client
+        .post(&url)
         .json(&json!({ "model": model_key, "messages": messages, "stream": false }))
-        .send().await
+        .send()
+        .await
         .map_err(|e| format!("Request failed: {}", e))?;
     if !resp.status().is_success() {
-        return Err(format!("LLM error: {}", resp.text().await.unwrap_or_default()));
+        return Err(format!(
+            "LLM error: {}",
+            resp.text().await.unwrap_or_default()
+        ));
     }
-    let data: Value = resp.json().await.map_err(|e| format!("Parse error: {}", e))?;
-    Ok(data["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string())
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Parse error: {}", e))?;
+    Ok(data["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string())
 }
 
 /// Manager agent path: iterates the tool-call loop until the LLM returns a text response.
@@ -115,19 +144,18 @@ pub(crate) async fn call_chat_with_tools(
     message: &str,
     agent_id: &str,
     tools: &[McpTool],
+    allowed_tools: Option<&[String]>,
+    allow_manager_tools: bool,
+    require_delegation: bool,
+    context_limit: Option<u64>,
     mcp_port: u16,
     on_event: &Channel<StreamEvent>,
     history: &[Value],
 ) -> Result<String, String> {
     let url = format!("{}/v1/chat/completions", lm_base_url());
+    let visible_tools = visible_tools_for_agent(tools, allowed_tools, allow_manager_tools);
     let mut messages = vec![];
-    if !system_prompt.is_empty() {
-        messages.push(json!({"role": "system", "content": system_prompt}));
-    }
-    for h in history { messages.push(h.clone()); }
-    messages.push(json!({"role": "user", "content": message}));
-
-    let tool_defs: Vec<Value> = tools.iter().map(|t| {
+    let tool_defs: Vec<Value> = visible_tools.iter().map(|t| {
         // Compress parameter schemas: keep name/type/required but strip verbose descriptions
         // and nested details. This cuts token usage ~10x while keeping full tool coverage.
         let compressed_params = compress_schema(&t.input_schema);
@@ -140,14 +168,38 @@ pub(crate) async fn call_chat_with_tools(
             "function": { "name": t.name, "description": short_desc, "parameters": compressed_params }
         })
     }).collect();
+    let tool_overhead = serde_json::to_string(&tool_defs)
+        .ok()
+        .map(|text| text.chars().count() as u64)
+        .unwrap_or(0)
+        .div_ceil(4);
+    let budget = compute_context_budget(
+        system_prompt,
+        history,
+        message,
+        context_limit,
+        tool_overhead,
+    );
+    let effective_system_prompt = with_context_budget(system_prompt, budget);
+    if !effective_system_prompt.is_empty() {
+        messages.push(json!({"role": "system", "content": effective_system_prompt}));
+    }
+    for h in history {
+        messages.push(h.clone());
+    }
+    messages.push(json!({"role": "user", "content": message}));
 
     // Separate clients: LLM calls can take minutes, MCP tool calls should be fast.
     let llm_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
-        .build().unwrap_or_default();
+        .build()
+        .unwrap_or_default();
     let mcp_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
-        .build().unwrap_or_default();
+        .build()
+        .unwrap_or_default();
+    let mut delegated = false;
+    let mut tool_burst = 0usize;
 
     for _ in 0u8..64 {
         let body = json!({
@@ -157,12 +209,22 @@ pub(crate) async fn call_chat_with_tools(
             "stream": false,
         });
 
-        let resp = llm_client.post(&url).json(&body).send().await
+        let resp = llm_client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
             .map_err(|e| format!("Request failed: {}", e))?;
         if !resp.status().is_success() {
-            return Err(format!("LLM error: {}", resp.text().await.unwrap_or_default()));
+            return Err(format!(
+                "LLM error: {}",
+                resp.text().await.unwrap_or_default()
+            ));
         }
-        let data: Value = resp.json().await.map_err(|e| format!("Parse error: {}", e))?;
+        let data: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Parse error: {}", e))?;
 
         let choice = &data["choices"][0];
         let _finish_reason = choice["finish_reason"].as_str().unwrap_or("");
@@ -178,11 +240,15 @@ pub(crate) async fn call_chat_with_tools(
         if has_tool_calls {
             messages.push(assistant_msg.clone());
             for tc in tool_calls_arr {
-                let call_id  = tc["id"].as_str().unwrap_or("").to_string();
-                let fn_name  = tc["function"]["name"].as_str().unwrap_or("").to_string();
-                let fn_args: Value = serde_json::from_str(
-                    tc["function"]["arguments"].as_str().unwrap_or("{}")
-                ).unwrap_or(json!({}));
+                let call_id = tc["id"].as_str().unwrap_or("").to_string();
+                let fn_name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+                let fn_args: Value =
+                    serde_json::from_str(tc["function"]["arguments"].as_str().unwrap_or("{}"))
+                        .unwrap_or(json!({}));
+                if is_delegation_tool(&fn_name) {
+                    delegated = true;
+                }
+                tool_burst += 1;
 
                 // Notify frontend: tool about to be called
                 let _ = on_event.send(StreamEvent::ToolCall {
@@ -194,16 +260,26 @@ pub(crate) async fn call_chat_with_tools(
                 let mcp_req = json!({
                     "jsonrpc": "2.0", "id": 1,
                     "method": "tools/call",
-                    "params": { "name": fn_name, "arguments": fn_args }
+                    "params": {
+                        "name": fn_name,
+                        "arguments": fn_args,
+                        "caller_agent_id": agent_id,
+                    }
                 });
 
                 let tool_result = match mcp_client
                     .post(format!("http://localhost:{}", mcp_port))
-                    .json(&mcp_req).send().await
+                    .json(&mcp_req)
+                    .send()
+                    .await
                 {
-                    Ok(r) => r.json::<Value>().await.ok()
+                    Ok(r) => r
+                        .json::<Value>()
+                        .await
+                        .ok()
                         .and_then(|v| {
-                            v["result"]["content"][0]["text"].as_str()
+                            v["result"]["content"][0]["text"]
+                                .as_str()
                                 .map(|s| s.to_string())
                         })
                         .unwrap_or_else(|| "[tool returned no text]".to_string()),
@@ -229,8 +305,24 @@ pub(crate) async fn call_chat_with_tools(
                     "tool_call_id": call_id,
                     "content": tool_result,
                 }));
+
+                if tool_burst >= 3 {
+                    let reflection =
+                        force_tool_free_reflection(&llm_client, &url, model_key, &messages).await?;
+                    if !reflection.is_empty() {
+                        messages.push(json!({"role": "assistant", "content": reflection}));
+                    }
+                    tool_burst = 0;
+                }
             }
         } else {
+            if require_delegation && !delegated {
+                messages.push(json!({
+                    "role": "user",
+                    "content": "You are the manager. You must delegate at least one concrete sub-task before giving a final answer. Use agent-management tools first, then synthesize."
+                }));
+                continue;
+            }
             // No more tool calls — stream the final answer so it appears progressively.
             let stream_body = json!({
                 "model": model_key,
@@ -238,22 +330,37 @@ pub(crate) async fn call_chat_with_tools(
                 "tools": tool_defs,
                 "stream": true,
             });
-            let stream_resp = llm_client.post(&url).json(&stream_body).send().await
+            let stream_resp = llm_client
+                .post(&url)
+                .json(&stream_body)
+                .send()
+                .await
                 .map_err(|e| format!("Stream request failed: {}", e))?;
             if !stream_resp.status().is_success() {
-                return Err(format!("LLM stream error: {}", stream_resp.text().await.unwrap_or_default()));
+                return Err(format!(
+                    "LLM stream error: {}",
+                    stream_resp.text().await.unwrap_or_default()
+                ));
             }
             let mut full_content = String::new();
             let mut buffer = String::new();
             let mut stream_resp = stream_resp;
-            while let Some(chunk) = stream_resp.chunk().await.map_err(|e| format!("Stream read: {}", e))? {
+            while let Some(chunk) = stream_resp
+                .chunk()
+                .await
+                .map_err(|e| format!("Stream read: {}", e))?
+            {
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
                 while let Some(pos) = buffer.find('\n') {
                     let line = buffer[..pos].trim_end().to_string();
                     buffer = buffer[pos + 1..].to_string();
-                    if line.is_empty() || line.starts_with(':') { continue; }
+                    if line.is_empty() || line.starts_with(':') {
+                        continue;
+                    }
                     if let Some(data) = line.strip_prefix("data: ") {
-                        if data.trim() == "[DONE]" { return Ok(full_content); }
+                        if data.trim() == "[DONE]" {
+                            return Ok(full_content);
+                        }
                         if let Ok(parsed) = serde_json::from_str::<Value>(data) {
                             // If the model decided to call a tool after all, fall back to non-streaming.
                             if parsed["choices"][0]["delta"]["tool_calls"].is_array() {
@@ -275,26 +382,41 @@ pub(crate) async fn call_chat_with_tools(
             return Ok(full_content);
         }
     }
-    Err("Max tool-call iterations (16) reached.".to_string())
+    Err("Max tool-call iterations (64) reached.".to_string())
 }
 
 #[derive(Clone, Serialize)]
 #[serde(tag = "event")]
 pub(crate) enum StreamEvent {
     #[serde(rename = "agent_start")]
-    AgentStart { agent_id: String, agent_name: String },
+    AgentStart {
+        agent_id: String,
+        agent_name: String,
+    },
     #[serde(rename = "token")]
     Token { agent_id: String, content: String },
     #[serde(rename = "agent_end")]
     AgentEnd { agent_id: String },
     #[serde(rename = "error")]
-    Error { agent_id: String, agent_name: String, message: String },
+    Error {
+        agent_id: String,
+        agent_name: String,
+        message: String,
+    },
     /// Emitted just before a manager tool call is dispatched.
     #[serde(rename = "tool_call")]
-    ToolCall { agent_id: String, tool_name: String, args: String },
+    ToolCall {
+        agent_id: String,
+        tool_name: String,
+        args: String,
+    },
     /// Emitted after the tool returns its result.
     #[serde(rename = "tool_result")]
-    ToolResult { agent_id: String, tool_name: String, result: String },
+    ToolResult {
+        agent_id: String,
+        tool_name: String,
+        result: String,
+    },
     #[serde(rename = "done")]
     Done,
 }
@@ -313,21 +435,24 @@ fn compress_schema(schema: &Value) -> Value {
         .get("properties")
         .and_then(|p| p.as_object())
         .map(|props| {
-            props.iter().map(|(k, v)| {
-                let prop_type = v.get("type").cloned().unwrap_or(json!("string"));
-                // Keep enum values — they're load-bearing for the LLM.
-                let mut compressed = json!({ "type": prop_type });
-                if let Some(en) = v.get("enum") {
-                    compressed["enum"] = en.clone();
-                }
-                // Keep nested object structure one level deep (e.g. task params).
-                if prop_type == "object" {
-                    if let Some(nested) = v.get("properties") {
-                        compressed["properties"] = nested.clone();
+            props
+                .iter()
+                .map(|(k, v)| {
+                    let prop_type = v.get("type").cloned().unwrap_or(json!("string"));
+                    // Keep enum values — they're load-bearing for the LLM.
+                    let mut compressed = json!({ "type": prop_type });
+                    if let Some(en) = v.get("enum") {
+                        compressed["enum"] = en.clone();
                     }
-                }
-                (k.clone(), compressed)
-            }).collect()
+                    // Keep nested object structure one level deep (e.g. task params).
+                    if prop_type == "object" {
+                        if let Some(nested) = v.get("properties") {
+                            compressed["properties"] = nested.clone();
+                        }
+                    }
+                    (k.clone(), compressed)
+                })
+                .collect()
         })
         .unwrap_or_default();
 
@@ -341,6 +466,76 @@ fn compress_schema(schema: &Value) -> Value {
     out
 }
 
+fn visible_tools_for_agent(
+    tools: &[McpTool],
+    allowed_tools: Option<&[String]>,
+    allow_manager_tools: bool,
+) -> Vec<McpTool> {
+    tools
+        .iter()
+        .filter(|tool| {
+            allowed_tools
+                .map(|names| names.iter().any(|name| name == &tool.name))
+                .unwrap_or(true)
+        })
+        .filter(|tool| {
+            if allow_manager_tools {
+                !is_manager_blocked_tool(&tool.name)
+            } else {
+                !is_manager_only_tool(&tool.name)
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+fn is_delegation_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "spawn_agent" | "send_message" | "broadcast_message" | "fork_agent" | "pipe_message"
+    )
+}
+
+async fn force_tool_free_reflection(
+    client: &reqwest::Client,
+    url: &str,
+    model_key: &str,
+    messages: &[Value],
+) -> Result<String, String> {
+    let reflection_messages = {
+        let mut copy = messages.to_vec();
+        copy.push(json!({
+            "role": "user",
+            "content": "Pause tool use. Briefly summarize what you learned, what is still uncertain, and the smallest next step. Do not call any tools in this response."
+        }));
+        copy
+    };
+    let resp = client
+        .post(url)
+        .json(&json!({
+            "model": model_key,
+            "messages": reflection_messages,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Reflection request failed: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "Reflection failed: {}",
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Reflection parse error: {}", e))?;
+    Ok(data["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string())
+}
+
 pub(crate) async fn send_chat_completion_streaming(
     model_key: &str,
     system_prompt: &str,
@@ -348,35 +543,55 @@ pub(crate) async fn send_chat_completion_streaming(
     agent_id: &str,
     on_event: &Channel<StreamEvent>,
     history: &[Value],
+    context_limit: Option<u64>,
 ) -> Result<String, String> {
     let url = format!("{}/v1/chat/completions", lm_base_url());
+    let budget = compute_context_budget(system_prompt, history, message, context_limit, 0);
+    let effective_system_prompt = with_context_budget(system_prompt, budget);
     let mut messages = vec![];
-    if !system_prompt.is_empty() {
-        messages.push(json!({"role": "system", "content": system_prompt}));
+    if !effective_system_prompt.is_empty() {
+        messages.push(json!({"role": "system", "content": effective_system_prompt}));
     }
-    for h in history { messages.push(h.clone()); }
+    for h in history {
+        messages.push(h.clone());
+    }
     messages.push(json!({"role": "user", "content": message}));
 
     let body = json!({ "model": model_key, "messages": messages, "stream": true });
     let client = reqwest::Client::new();
-    let mut resp = client.post(&url).json(&body).send().await
+    let mut resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
         .map_err(|e| format!("Chat request failed: {}", e))?;
 
     if !resp.status().is_success() {
-        return Err(format!("Chat failed: {}", resp.text().await.unwrap_or_default()));
+        return Err(format!(
+            "Chat failed: {}",
+            resp.text().await.unwrap_or_default()
+        ));
     }
 
     let mut full_content = String::new();
     let mut buffer = String::new();
 
-    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("Stream read error: {}", e))? {
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("Stream read error: {}", e))?
+    {
         buffer.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(pos) = buffer.find('\n') {
             let line = buffer[..pos].trim_end().to_string();
             buffer = buffer[pos + 1..].to_string();
-            if line.is_empty() || line.starts_with(':') { continue; }
+            if line.is_empty() || line.starts_with(':') {
+                continue;
+            }
             if let Some(data) = line.strip_prefix("data: ") {
-                if data.trim() == "[DONE]" { return Ok(full_content); }
+                if data.trim() == "[DONE]" {
+                    return Ok(full_content);
+                }
                 if let Ok(parsed) = serde_json::from_str::<Value>(data) {
                     if let Some(delta_content) = parsed["choices"][0]["delta"]["content"].as_str() {
                         if !delta_content.is_empty() {

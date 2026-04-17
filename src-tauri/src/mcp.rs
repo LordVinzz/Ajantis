@@ -6,9 +6,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tauri::ipc::Channel;
@@ -16,7 +16,10 @@ use tower_http::cors::CorsLayer;
 
 use crate::agent_config::{Agent, AgentConfig, AgentLoadConfig};
 use crate::chat::{call_chat_blocking, StreamEvent};
+use crate::config_persistence::ajantis_dir;
+use crate::helpers::{compute_context_budget, is_manager_blocked_tool, is_manager_only_tool};
 use crate::memory::{MemoryEntry, MemoryPool};
+use crate::models::fetch_models;
 use crate::state::McpTool;
 
 // ── Background task tracking ───────────────────────────────────────
@@ -24,7 +27,7 @@ use crate::state::McpTool;
 pub(crate) struct AjantisTask {
     pub id: String,
     pub description: String,
-    pub status: Arc<Mutex<String>>,  // "running" | "completed" | "failed: …" | "stopped"
+    pub status: Arc<Mutex<String>>, // "running" | "completed" | "failed: …" | "stopped"
     pub output: Arc<Mutex<String>>,
     pub abort_handle: Option<tokio::task::AbortHandle>,
     pub started_at: String,
@@ -50,6 +53,10 @@ pub(crate) struct McpState {
     pub(crate) event_channel: Arc<Mutex<Option<Channel<StreamEvent>>>>,
     /// Background tasks spawned via TaskCreate.
     pub(crate) tasks: Arc<Mutex<HashMap<String, AjantisTask>>>,
+    /// Per-agent cache of file slices already returned to the model.
+    pub(crate) read_cache: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    /// Per-agent cache of files discovered by glob_search.
+    pub(crate) glob_cache: Arc<Mutex<HashMap<String, HashSet<String>>>>,
 }
 
 #[derive(Deserialize)]
@@ -78,19 +85,25 @@ pub(crate) async fn handle_jsonrpc(
 ) -> Json<JsonRpcResponse> {
     if req.jsonrpc != "2.0" {
         return Json(JsonRpcResponse {
-            jsonrpc: "2.0".to_string(), id: req.id, result: None,
+            jsonrpc: "2.0".to_string(),
+            id: req.id,
+            result: None,
             error: Some(json!({"code": -32600, "message": "Invalid JSON-RPC version"})),
         });
     }
     if req.id.is_none() {
         return Json(JsonRpcResponse {
-            jsonrpc: "2.0".to_string(), id: None, result: Some(Value::Null), error: None,
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            result: Some(Value::Null),
+            error: None,
         });
     }
     let id = req.id.clone();
     match req.method.as_str() {
         "initialize" => Json(JsonRpcResponse {
-            jsonrpc: "2.0".to_string(), id,
+            jsonrpc: "2.0".to_string(),
+            id,
             result: Some(json!({
                 "protocolVersion": "2025-06-18",
                 "capabilities": { "tools": { "listChanged": false } },
@@ -99,13 +112,20 @@ pub(crate) async fn handle_jsonrpc(
             error: None,
         }),
         "tools/list" => {
-            let tools: Vec<Value> = state.tools.iter().map(|t| json!({
-                "name": t.name,
-                "description": t.description,
-                "inputSchema": t.input_schema,
-            })).collect();
+            let tools: Vec<Value> = state
+                .tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "inputSchema": t.input_schema,
+                    })
+                })
+                .collect();
             Json(JsonRpcResponse {
-                jsonrpc: "2.0".to_string(), id,
+                jsonrpc: "2.0".to_string(),
+                id,
                 result: Some(json!({ "tools": tools })),
                 error: None,
             })
@@ -114,26 +134,46 @@ pub(crate) async fn handle_jsonrpc(
             let params = req.params.unwrap_or(Value::Null);
             let name = params["name"].as_str().unwrap_or("").to_string();
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let result = handle_tool_call(&name, &args, &state).await;
+            let caller_agent_id = params
+                .get("caller_agent_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let result = handle_tool_call(&name, &args, &state, caller_agent_id.as_deref()).await;
             Json(JsonRpcResponse {
-                jsonrpc: "2.0".to_string(), id,
-                result: Some(result), error: None,
+                jsonrpc: "2.0".to_string(),
+                id,
+                result: Some(result),
+                error: None,
             })
         }
         "resources/list" => Json(JsonRpcResponse {
-            jsonrpc: "2.0".to_string(), id,
-            result: Some(json!({ "resources": [] })), error: None,
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: Some(json!({ "resources": [] })),
+            error: None,
         }),
         _ => Json(JsonRpcResponse {
-            jsonrpc: "2.0".to_string(), id, result: None,
-            error: Some(json!({"code": -32601, "message": format!("Unknown method: {}", req.method)})),
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: None,
+            error: Some(
+                json!({"code": -32601, "message": format!("Unknown method: {}", req.method)}),
+            ),
         }),
     }
 }
 
-pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState) -> Value {
+pub(crate) async fn handle_tool_call(
+    name: &str,
+    args: &Value,
+    state: &McpState,
+    caller_agent_id: Option<&str>,
+) -> Value {
     // Resolve the active sandbox root: selected workspace if set, fallback to workspace_root.
     let sandbox: PathBuf = state.active_workspace.lock().unwrap().clone();
+    if let Err(reason) = enforce_tool_policy(name, caller_agent_id, state) {
+        return mcp_error(&reason);
+    }
 
     match name {
         // ── File system ───────────────────────────────────────────
@@ -158,20 +198,40 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
         "read_file" => {
             let file_path = args["path"].as_str().unwrap_or("");
             if file_path.is_empty() { return mcp_error("Error: path is required."); }
-            let abs = sandbox.join(file_path);
-            if !abs.starts_with(&sandbox) {
-                return mcp_error("Error: access outside workspace is not allowed.");
+            let abs = match resolve_allowed_path(file_path, &sandbox) {
+                Ok(path) => path,
+                Err(reason) => return mcp_error(&reason),
+            };
+            if let Err(reason) = enforce_glob_match(&abs, caller_agent_id, state) {
+                return mcp_error(&reason);
             }
             match fs::read_to_string(&abs) {
                 Ok(data) => {
+                    let scope = args["scope"].as_str();
                     let offset = args["offset"].as_u64().unwrap_or(0) as usize;
-                    let limit  = args["limit"].as_u64().map(|l| l as usize);
-                    // Slice by chars to avoid panicking on multi-byte UTF-8 boundaries.
-                    let slice: String = data.chars()
-                        .skip(offset)
-                        .take(limit.unwrap_or(usize::MAX))
-                        .collect();
-                    mcp_ok(&slice)
+                    let requested_limit = args["limit"].as_u64().map(|l| l as usize).unwrap_or(4_000);
+                    let hard_limit = requested_limit.min(4_000);
+                    let (slice, scope_label) = match extract_file_scope(&data, scope, offset, hard_limit) {
+                        Ok(result) => result,
+                        Err(reason) => return mcp_error(&reason),
+                    };
+                    let cache_key = format!("{}::{}", abs.to_string_lossy(), scope_label);
+                    if let Some(agent_id) = caller_agent_id {
+                        let mut cache = state.read_cache.lock().unwrap();
+                        let seen = cache.entry(agent_id.to_string()).or_default();
+                        if !seen.insert(cache_key.clone()) {
+                            return mcp_ok("Already in context: this exact file slice was returned earlier. Reuse it unless you need a different scope.");
+                        }
+                    }
+                    let char_count = slice.chars().count();
+                    let payload = format!(
+                        "[path: {} | scope: {} | chars: {}]\n{}",
+                        abs.to_string_lossy(),
+                        scope_label,
+                        char_count,
+                        slice,
+                    );
+                    mcp_ok(&payload)
                 }
                 Err(e) => mcp_error(&format!("Error reading file: {}", e)),
             }
@@ -180,10 +240,10 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
             let file_path = args["path"].as_str().unwrap_or("");
             let content = args["content"].as_str().unwrap_or("");
             if file_path.is_empty() { return mcp_error("Error: path is required."); }
-            let abs = sandbox.join(file_path);
-            if !abs.starts_with(&sandbox) {
-                return mcp_error("Error: access outside workspace is not allowed.");
-            }
+            let abs = match resolve_allowed_path(file_path, &sandbox) {
+                Ok(path) => path,
+                Err(reason) => return mcp_error(&reason),
+            };
             if let Some(parent) = abs.parent() { let _ = fs::create_dir_all(parent); }
             match fs::write(&abs, content) {
                 Ok(_) => mcp_ok("File written successfully."),
@@ -196,10 +256,10 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
             let new_str = args["new_string"].as_str().unwrap_or("");
             let replace_all = args["replace_all"].as_bool().unwrap_or(false);
             if file_path.is_empty() { return mcp_error("Error: path is required."); }
-            let abs = sandbox.join(file_path);
-            if !abs.starts_with(&sandbox) {
-                return mcp_error("Error: access outside workspace is not allowed.");
-            }
+            let abs = match resolve_allowed_path(file_path, &sandbox) {
+                Ok(path) => path,
+                Err(reason) => return mcp_error(&reason),
+            };
             match fs::read_to_string(&abs) {
                 Ok(data) => {
                     let result = if replace_all { data.replace(old_str, new_str) }
@@ -215,21 +275,42 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
         "glob_search" => {
             let pattern = args["pattern"].as_str().unwrap_or("");
             if pattern.is_empty() { return mcp_error("Error: pattern is required."); }
-            let base = args["path"].as_str()
-                .map(|p| sandbox.join(p))
-                .unwrap_or_else(|| sandbox.clone());
+            let base = match args["path"].as_str() {
+                Some(path) => match resolve_allowed_path(path, &sandbox) {
+                    Ok(base) => base,
+                    Err(reason) => return mcp_error(&reason),
+                },
+                None => sandbox.clone(),
+            };
             let full_pattern = base.join(pattern).to_string_lossy().to_string();
             match glob::glob(&full_pattern) {
                 Ok(paths) => {
                     let results: Vec<String> = paths
                         .filter_map(|r| r.ok())
-                        .filter(|p| p.starts_with(&sandbox))
+                        .map(|p| normalize_path(&p))
+                        .filter(|p| is_allowed_path(p, &sandbox))
                         .map(|p| p.to_string_lossy().to_string())
                         .collect();
+                    if let Some(agent_id) = caller_agent_id {
+                        let mut cache = state.glob_cache.lock().unwrap();
+                        let seen = cache.entry(agent_id.to_string()).or_default();
+                        seen.clear();
+                        seen.extend(results.iter().cloned());
+                    }
                     if results.is_empty() {
                         mcp_ok("No files matched.")
                     } else {
-                        mcp_ok(&results.join("\n"))
+                        let truncated: Vec<String> = results.iter().take(200).cloned().collect();
+                        let body = if results.len() > 200 {
+                            format!(
+                                "{}\n…[truncated, {} matches total]",
+                                truncated.join("\n"),
+                                results.len()
+                            )
+                        } else {
+                            truncated.join("\n")
+                        };
+                        mcp_ok(&body)
                     }
                 }
                 Err(e) => mcp_error(&format!("Invalid glob pattern: {}", e)),
@@ -238,15 +319,47 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
         "grep_search" => {
             let pattern = args["pattern"].as_str().unwrap_or("");
             if pattern.is_empty() { return mcp_error("Error: pattern is required."); }
-            let search_path = args["path"].as_str()
-                .map(|p| sandbox.join(p))
-                .unwrap_or_else(|| sandbox.clone());
+            let search_path = match args["path"].as_str() {
+                Some(path) => match resolve_allowed_path(path, &sandbox) {
+                    Ok(path) => path,
+                    Err(reason) => return mcp_error(&reason),
+                },
+                None => sandbox.clone(),
+            };
+            let glob_pat = args["glob"].as_str();
+            if search_path.is_dir() && glob_pat.is_none() {
+                return mcp_error("Error: grep_search on a directory requires a glob filter. Use glob_search first, then grep within that scope.");
+            }
+            if search_path.is_file() {
+                if let Err(reason) = enforce_glob_match(&search_path, caller_agent_id, state) {
+                    return mcp_error(&reason);
+                }
+            }
             let case_flag = args["-i"].as_bool().unwrap_or(false);
             let mut cmd = Command::new("rg");
             cmd.arg("--no-heading").arg("-n");
             if case_flag { cmd.arg("-i"); }
-            if let Some(glob_pat) = args["glob"].as_str() {
+            if let Some(glob_pat) = glob_pat {
                 cmd.arg("--glob").arg(glob_pat);
+            }
+            let context = args["context"].as_u64();
+            if let Some(c) = args["-C"].as_u64().or(context) {
+                cmd.arg("-C").arg(c.to_string());
+            } else {
+                if let Some(before) = args["-B"].as_u64() {
+                    cmd.arg("-B").arg(before.to_string());
+                }
+                if let Some(after) = args["-A"].as_u64() {
+                    cmd.arg("-A").arg(after.to_string());
+                }
+            }
+            if args["multiline"].as_bool().unwrap_or(false) {
+                cmd.arg("--multiline");
+            }
+            if let Some(file_type) = args["type"].as_str() {
+                if !file_type.is_empty() {
+                    cmd.arg("--type").arg(file_type);
+                }
             }
             cmd.arg(pattern).arg(&search_path).current_dir(&sandbox);
             match cmd.output().or_else(|_| {
@@ -258,7 +371,20 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
             }) {
                 Ok(out) => {
                     let text = String::from_utf8_lossy(&out.stdout).to_string();
-                    mcp_ok(if text.trim().is_empty() { "No matches found." } else { text.trim() })
+                    if text.trim().is_empty() {
+                        mcp_ok("No matches found.")
+                    } else {
+                        let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+                        let head_limit = args["head_limit"].as_u64().unwrap_or(50) as usize;
+                        let lines: Vec<&str> = text.lines().skip(offset).take(head_limit).collect();
+                        let truncated = text.lines().count() > offset + head_limit;
+                        let body = if truncated {
+                            format!("{}\n…[truncated]", lines.join("\n"))
+                        } else {
+                            lines.join("\n")
+                        };
+                        mcp_ok(&body)
+                    }
                 }
                 Err(e) => mcp_error(&format!("Search failed: {}", e)),
             }
@@ -297,10 +423,50 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
         }
         // ── Manager tools ─────────────────────────────────────────
         "spawn_agent" => {
-            let role     = args["role"].as_str().unwrap_or("worker");
+            let role = args["role"].as_str().unwrap_or("worker");
             let sys_prompt = args["system_prompt"].as_str().unwrap_or("");
-            let model    = args["model"].as_str().map(|s| s.to_string());
+            let requested_model = args["model"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
             let ctx_limit = args["context_limit"].as_u64();
+            let allowed_tools = args["tools"].as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect::<Vec<_>>())
+                .unwrap_or_else(|| default_worker_tools(&state.tools));
+            let inherited_model = caller_agent_id.and_then(|agent_id| {
+                let config = state.agent_config.lock().unwrap();
+                config.agents.iter()
+                    .find(|agent| agent.id == agent_id)
+                    .and_then(|agent| agent.model_key.clone())
+            });
+            let available_models = match fetch_models().await {
+                Ok(models) => models,
+                Err(e) => return mcp_error(&format!("Error fetching local models: {}", e)),
+            };
+            let selected_model = requested_model.or(inherited_model);
+            let Some(model_key) = selected_model else {
+                return mcp_error("Error: spawn_agent requires a model, or the caller must already have one to inherit.");
+            };
+            let Some(model_info) = available_models.iter().find(|model| model.key == model_key) else {
+                let available = available_models.iter()
+                    .take(20)
+                    .map(|model| model.key.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return mcp_error(&format!(
+                    "Error: model '{}' is not available on this computer. Choose one of the locally available models{}{}",
+                    model_key,
+                    if available.is_empty() { "" } else { ": " },
+                    available,
+                ));
+            };
+            if model_info.model_type.as_deref() == Some("embedding") {
+                return mcp_error(&format!(
+                    "Error: model '{}' is an embedding model and cannot be used for spawn_agent chat workers.",
+                    model_key
+                ));
+            }
 
             let ts = chrono::Utc::now().timestamp_millis();
             let agent_id = format!("agent-{}-{}", role, ts);
@@ -309,8 +475,8 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
                 id: agent_id.clone(),
                 name: role.to_string(),
                 agent_type: "model".to_string(),
-                model_key: model,
-                model_type: Some("llm".to_string()),
+                model_key: Some(model_key),
+                model_type: model_info.model_type.clone().or_else(|| Some("llm".to_string())),
                 role: Some(sys_prompt.to_string()),
                 load_config: ctx_limit.map(|cl| AgentLoadConfig {
                     context_length: Some(cl),
@@ -318,6 +484,7 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
                     num_experts: None, offload_kv_cache_to_gpu: None,
                 }),
                 mode: Some("stay_awake".to_string()),
+                allowed_tools: Some(allowed_tools),
                 armed: true,
                 is_manager: false,
                 paused: false,
@@ -332,8 +499,11 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
             if agent_id.is_empty() { return mcp_error("Error: agent_id is required."); }
             if content.is_empty()  { return mcp_error("Error: content is required."); }
             let await_reply = args["await_reply"].as_bool().unwrap_or(true);
+            if let Err(reason) = enforce_send_message_target(caller_agent_id, agent_id, state) {
+                return mcp_error(&reason);
+            }
 
-            let (model_key, sys_prompt, agent_name) = {
+            let (model_key, sys_prompt, agent_name, is_manager, allowed_tools, context_limit) = {
                 let config = state.agent_config.lock().unwrap();
                 match config.agents.iter().find(|a| a.id == agent_id) {
                     None => return mcp_error(&format!("Error: agent '{}' not found.", agent_id)),
@@ -344,6 +514,9 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
                             a.model_key.clone().unwrap_or_default(),
                             a.role.clone().unwrap_or_default(),
                             a.name.clone(),
+                            a.is_manager,
+                            a.allowed_tools.clone().unwrap_or_default(),
+                            a.load_config.as_ref().and_then(|cfg| cfg.context_length),
                         )
                     }
                 }
@@ -373,8 +546,31 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
                     agent_name: agent_name.clone(),
                 });
             }
+            if (is_manager || !allowed_tools.is_empty()) && maybe_ch.is_none() {
+                return mcp_error("Error: tool-enabled agents require an active routed session.");
+            }
 
-            match call_chat_blocking(&model_key, &sys_prompt, content, &history).await {
+            let response_result = if is_manager || !allowed_tools.is_empty() {
+                let allowed = if is_manager { None } else { Some(allowed_tools.as_slice()) };
+                crate::chat::call_chat_with_tools(
+                    &model_key,
+                    &sys_prompt,
+                    content,
+                    agent_id,
+                    &state.tools,
+                    allowed,
+                    is_manager,
+                    is_manager,
+                    context_limit,
+                    state.mcp_port,
+                    maybe_ch.as_ref().unwrap_or_else(|| unreachable!()),
+                    &history,
+                ).await
+            } else {
+                call_chat_blocking(&model_key, &sys_prompt, content, &history, context_limit).await
+            };
+
+            match response_result {
                 Ok(response) => {
                     // Store both sides of this turn in memory
                     {
@@ -410,6 +606,9 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
         "read_agent_messages" => {
             let agent_id = args["agent_id"].as_str().unwrap_or("");
             if agent_id.is_empty() { return mcp_error("Error: agent_id is required."); }
+            if let Err(reason) = enforce_agent_introspection(caller_agent_id, agent_id, state) {
+                return mcp_error(&reason);
+            }
 
             let roles_filter: Option<Vec<String>> = args["roles"].as_array().map(|arr| {
                 arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
@@ -424,6 +623,9 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
                     .map(|rf| rf.iter().any(|r| r == &e.role))
                     .unwrap_or(true))
                 .collect();
+            let history_json: Vec<Value> = filtered.iter()
+                .map(|e| json!({"role": e.role, "content": e.content}))
+                .collect();
 
             let total = filtered.len();
             let page: Vec<&MemoryEntry> = filtered.into_iter()
@@ -431,8 +633,18 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
                 .take(limit.unwrap_or(usize::MAX))
                 .collect();
 
-            let j = serde_json::to_string_pretty(&page).unwrap_or_default();
-            mcp_ok(&format!("Agent '{}' — {} total messages, showing {}:\n{}", agent_id, total, page.len(), j))
+            let context_limit = agent_context_limit(agent_id, state);
+            let budget = compute_context_budget("", &history_json, "", context_limit, 0);
+            let payload = json!({
+                "agent_id": agent_id,
+                "total_messages": total,
+                "returned_messages": page.len(),
+                "context_limit": budget.limit,
+                "estimated_used_tokens": budget.estimated_used,
+                "estimated_remaining_tokens": budget.remaining,
+                "messages": page,
+            });
+            mcp_ok(&serde_json::to_string_pretty(&payload).unwrap_or_default())
         }
         "list_agents" => {
             let status_filter: Option<Vec<String>> = args["status_filter"].as_array().map(|arr| {
@@ -459,6 +671,17 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
                     let last_preview = pool.entries.iter().rev()
                         .find(|e| e.agent_id == a.id && e.role == "assistant")
                         .map(|e| e.content.chars().take(120).collect::<String>());
+                    let history_json: Vec<Value> = pool.entries.iter()
+                        .filter(|e| e.agent_id == a.id && (e.role == "user" || e.role == "assistant"))
+                        .map(|e| json!({"role": e.role, "content": e.content}))
+                        .collect();
+                    let budget = compute_context_budget(
+                        "",
+                        &history_json,
+                        "",
+                        a.load_config.as_ref().and_then(|cfg| cfg.context_length),
+                        0,
+                    );
                     Some(json!({
                         "agent_id": a.id,
                         "name": a.name,
@@ -467,6 +690,9 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
                         "is_manager": a.is_manager,
                         "message_count": msg_count,
                         "last_output_preview": last_preview,
+                        "context_limit": budget.limit,
+                        "estimated_used_tokens": budget.estimated_used,
+                        "estimated_remaining_tokens": budget.remaining,
                     }))
                 })
                 .collect();
@@ -477,6 +703,9 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
         "get_agent_state" => {
             let agent_id = args["agent_id"].as_str().unwrap_or("");
             if agent_id.is_empty() { return mcp_error("Error: agent_id is required."); }
+            if let Err(reason) = enforce_agent_introspection(caller_agent_id, agent_id, state) {
+                return mcp_error(&reason);
+            }
 
             let config = state.agent_config.lock().unwrap();
             match config.agents.iter().find(|a| a.id == agent_id) {
@@ -488,11 +717,25 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
                     let last_output = messages.iter().rev()
                         .find(|e| e.role == "assistant").map(|e| e.content.clone());
                     let status = if !a.armed { "done" } else if a.paused { "paused" } else { "idle" };
+                    let history_json: Vec<Value> = messages.iter()
+                        .filter(|e| e.role == "user" || e.role == "assistant")
+                        .map(|e| json!({"role": e.role, "content": e.content}))
+                        .collect();
+                    let budget = compute_context_budget(
+                        "",
+                        &history_json,
+                        "",
+                        a.load_config.as_ref().and_then(|cfg| cfg.context_length),
+                        0,
+                    );
                     let result = json!({
                         "agent_id": a.id, "name": a.name, "model": a.model_key,
                         "status": status, "is_manager": a.is_manager,
                         "paused": a.paused, "armed": a.armed,
                         "message_count": messages.len(), "last_output": last_output,
+                        "context_limit": budget.limit,
+                        "estimated_used_tokens": budget.estimated_used,
+                        "estimated_remaining_tokens": budget.remaining,
                     });
                     mcp_ok(&serde_json::to_string_pretty(&result).unwrap_or_default())
                 }
@@ -537,7 +780,7 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
             };
 
             // Resolve targets (extract data while holding lock, then release)
-            let targets: Vec<(String, String, String)> = {
+            let targets: Vec<(String, String, String, Option<u64>)> = {
                 let config = state.agent_config.lock().unwrap();
                 let ids: Vec<String> = if raw_ids.len() == 1 && raw_ids[0] == "*" {
                     config.agents.iter()
@@ -547,21 +790,24 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
                 ids.into_iter().filter_map(|id| {
                     config.agents.iter().find(|a| a.id == id && a.armed && !a.paused)
                         .and_then(|a| a.model_key.as_ref().map(|m| (
-                            id, m.clone(), a.role.clone().unwrap_or_default()
+                            id,
+                            m.clone(),
+                            a.role.clone().unwrap_or_default(),
+                            a.load_config.as_ref().and_then(|cfg| cfg.context_length),
                         )))
                 }).collect()
             };
 
             if !await_reply {
                 let mut pool = state.memory_pool.lock().unwrap();
-                for (id, _, _) in &targets { pool.push(id, id, "user", content); }
-                let ids: Vec<&str> = targets.iter().map(|(id, _, _)| id.as_str()).collect();
+                for (id, _, _, _) in &targets { pool.push(id, id, "user", content); }
+                let ids: Vec<&str> = targets.iter().map(|(id, _, _, _)| id.as_str()).collect();
                 return mcp_ok(&format!(r#"{{"queued":{},"agent_ids":{}}}"#,
                     targets.len(), serde_json::to_string(&ids).unwrap_or_default()));
             }
 
             let mut results = serde_json::Map::new();
-            for (agent_id, model_key, sys_prompt) in &targets {
+            for (agent_id, model_key, sys_prompt, context_limit) in &targets {
                 let history: Vec<Value> = {
                     let pool = state.memory_pool.lock().unwrap();
                     pool.entries.iter()
@@ -570,7 +816,7 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
                         .collect()
                 };
                 state.memory_pool.lock().unwrap().push(agent_id, agent_id, "user", content);
-                match call_chat_blocking(model_key, sys_prompt, content, &history).await {
+                match call_chat_blocking(model_key, sys_prompt, content, &history, *context_limit).await {
                     Ok(resp) => {
                         state.memory_pool.lock().unwrap().push(agent_id, agent_id, "assistant", &resp);
                         results.insert(agent_id.clone(), json!({"status":"ok","response":resp}));
@@ -653,7 +899,7 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
                         .and_then(|a| a.model_key.clone()).unwrap_or_default()
                 });
                 if !model_to_use.is_empty() {
-                    return match call_chat_blocking(&model_to_use, "", &full_prompt, &[]).await {
+                    return match call_chat_blocking(&model_to_use, "", &full_prompt, &[], None).await {
                         Ok(synthesis) => mcp_ok(&synthesis),
                         Err(e) => mcp_error(&format!("Synthesis failed: {}", e)),
                     };
@@ -686,7 +932,7 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
             }
 
             // Resolve target agent
-            let (model_key, sys_prompt, agent_name) = {
+            let (model_key, sys_prompt, agent_name, context_limit) = {
                 let config = state.agent_config.lock().unwrap();
                 match config.agents.iter().find(|a| a.id == to_id) {
                     None => return mcp_error(&format!("Error: agent '{}' not found.", to_id)),
@@ -697,6 +943,7 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
                             a.model_key.clone().unwrap_or_default(),
                             a.role.clone().unwrap_or_default(),
                             a.name.clone(),
+                            a.load_config.as_ref().and_then(|cfg| cfg.context_length),
                         )
                     }
                 }
@@ -722,7 +969,7 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
                 });
             }
 
-            match call_chat_blocking(&model_key, &sys_prompt, &content, &history).await {
+            match call_chat_blocking(&model_key, &sys_prompt, &content, &history, context_limit).await {
                 Ok(response) => {
                     {
                         let mut pool = state.memory_pool.lock().unwrap();
@@ -1072,6 +1319,241 @@ pub(crate) async fn handle_tool_call(name: &str, args: &Value, state: &McpState)
     }
 }
 
+fn default_worker_tools(tools: &[McpTool]) -> Vec<String> {
+    tools
+        .iter()
+        .filter(|tool| !is_manager_only_tool(&tool.name))
+        .map(|tool| tool.name.clone())
+        .collect()
+}
+
+fn enforce_tool_policy(
+    name: &str,
+    caller_agent_id: Option<&str>,
+    state: &McpState,
+) -> Result<(), String> {
+    let Some(caller_id) = caller_agent_id.filter(|id| !id.is_empty()) else {
+        return Ok(());
+    };
+    let config = state.agent_config.lock().unwrap();
+    let Some(caller) = config.agents.iter().find(|agent| agent.id == caller_id) else {
+        return Ok(());
+    };
+    if caller.is_manager && is_manager_blocked_tool(name) {
+        return Err(format!(
+            "Managers cannot call '{}' directly. Delegate this work to a sub-agent instead.",
+            name
+        ));
+    }
+    if !caller.is_manager && is_manager_only_tool(name) {
+        return Err(format!(
+            "Tool '{}' is manager-only. Non-manager agents can only use worker tools plus self-introspection.",
+            name
+        ));
+    }
+    Ok(())
+}
+
+fn enforce_send_message_target(
+    caller_agent_id: Option<&str>,
+    target_agent_id: &str,
+    state: &McpState,
+) -> Result<(), String> {
+    let Some(caller_id) = caller_agent_id.filter(|id| !id.is_empty()) else {
+        return Ok(());
+    };
+    let config = state.agent_config.lock().unwrap();
+    let Some(caller) = config.agents.iter().find(|agent| agent.id == caller_id) else {
+        return Ok(());
+    };
+    if caller.is_manager || caller.id == target_agent_id {
+        Ok(())
+    } else {
+        Err("Non-manager agents may only send messages to themselves. Cross-agent delegation is manager-only.".to_string())
+    }
+}
+
+fn enforce_agent_introspection(
+    caller_agent_id: Option<&str>,
+    target_agent_id: &str,
+    state: &McpState,
+) -> Result<(), String> {
+    let Some(caller_id) = caller_agent_id.filter(|id| !id.is_empty()) else {
+        return Ok(());
+    };
+    let config = state.agent_config.lock().unwrap();
+    let Some(caller) = config.agents.iter().find(|agent| agent.id == caller_id) else {
+        return Ok(());
+    };
+    if caller.is_manager || caller.id == target_agent_id {
+        Ok(())
+    } else {
+        Err(
+            "Non-manager agents may only inspect their own runtime state and message history."
+                .to_string(),
+        )
+    }
+}
+
+fn agent_context_limit(agent_id: &str, state: &McpState) -> Option<u64> {
+    let config = state.agent_config.lock().unwrap();
+    config
+        .agents
+        .iter()
+        .find(|agent| agent.id == agent_id)
+        .and_then(|agent| {
+            agent
+                .load_config
+                .as_ref()
+                .and_then(|cfg| cfg.context_length)
+        })
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        dirs_next::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/"))
+            .join(rest)
+    } else {
+        PathBuf::from(path)
+    }
+}
+
+fn allowed_roots(sandbox: &PathBuf) -> Vec<PathBuf> {
+    vec![normalize_path(sandbox), normalize_path(&ajantis_dir())]
+}
+
+fn is_allowed_path(path: &Path, sandbox: &PathBuf) -> bool {
+    let normalized = normalize_path(path);
+    allowed_roots(sandbox)
+        .iter()
+        .any(|root| normalized.starts_with(root))
+}
+
+fn resolve_allowed_path(raw_path: &str, sandbox: &PathBuf) -> Result<PathBuf, String> {
+    let raw = raw_path.trim();
+    let candidate = if raw.starts_with("~/") {
+        expand_tilde(raw)
+    } else {
+        let path = PathBuf::from(raw);
+        if path.is_absolute() {
+            path
+        } else {
+            sandbox.join(path)
+        }
+    };
+    let normalized = normalize_path(&candidate);
+    if is_allowed_path(&normalized, sandbox) {
+        Ok(normalized)
+    } else {
+        Err("Error: access outside the workspace or ~/.ajantis is not allowed.".to_string())
+    }
+}
+
+fn enforce_glob_match(
+    path: &Path,
+    caller_agent_id: Option<&str>,
+    state: &McpState,
+) -> Result<(), String> {
+    let Some(agent_id) = caller_agent_id.filter(|id| !id.is_empty()) else {
+        return Ok(());
+    };
+    let cache = state.glob_cache.lock().unwrap();
+    let Some(matches) = cache.get(agent_id) else {
+        return Err(
+            "Error: use glob_search first, then read or grep only files returned by that glob."
+                .to_string(),
+        );
+    };
+    let target = path.to_string_lossy().to_string();
+    if matches.contains(&target) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Error: '{}' was not returned by your latest glob_search. Narrow the scope with glob_search first.",
+            target
+        ))
+    }
+}
+
+fn extract_file_scope(
+    data: &str,
+    scope: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> Result<(String, String), String> {
+    match scope.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(scope_spec) if scope_spec.starts_with("line:") || scope_spec.starts_with("lines:") => {
+            let range = scope_spec
+                .split_once(':')
+                .map(|(_, rest)| rest)
+                .ok_or_else(|| "Invalid line scope. Use 'line:start-end'.".to_string())?;
+            let (start, end) = parse_inclusive_range(range)?;
+            let start_index = start.saturating_sub(1);
+            let line_count = end.saturating_sub(start_index);
+            let scoped = data
+                .lines()
+                .skip(start_index)
+                .take(line_count)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let slice: String = scoped.chars().skip(offset).take(limit).collect();
+            Ok((slice, format!("lines:{}-{}", start, end)))
+        }
+        Some(scope_spec) if scope_spec.starts_with("char:") || scope_spec.starts_with("chars:") => {
+            let range = scope_spec
+                .split_once(':')
+                .map(|(_, rest)| rest)
+                .ok_or_else(|| "Invalid char scope. Use 'char:start-end'.".to_string())?;
+            let (start, end) = parse_inclusive_range(range)?;
+            let slice: String = data
+                .chars()
+                .skip(start.saturating_sub(1) + offset)
+                .take(end.saturating_sub(start.saturating_sub(1)).min(limit))
+                .collect();
+            Ok((slice, format!("chars:{}-{}", start, end)))
+        }
+        Some(_) => Err("Invalid scope. Use 'line:start-end' or 'char:start-end'.".to_string()),
+        None => {
+            let slice: String = data.chars().skip(offset).take(limit).collect();
+            let end = offset + slice.chars().count();
+            Ok((slice, format!("chars:{}-{}", offset + 1, end)))
+        }
+    }
+}
+
+fn parse_inclusive_range(raw: &str) -> Result<(usize, usize), String> {
+    let (start, end) = raw
+        .split_once('-')
+        .ok_or_else(|| "Invalid range. Use 'start-end'.".to_string())?;
+    let start = start
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| "Invalid range start.".to_string())?;
+    let end = end
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| "Invalid range end.".to_string())?;
+    if start == 0 || end < start {
+        return Err("Invalid range bounds.".to_string());
+    }
+    Ok((start, end))
+}
+
 // ── Sandbox helpers ────────────────────────────────────────────────
 
 /// Returns `Err(reason)` if the command is blocked by the sandbox policy or
@@ -1083,13 +1565,32 @@ fn check_command_sandbox(command: &str, sandbox: &PathBuf, state: &McpState) -> 
         return Err("Blocked: path traversal ('..') is not allowed.".into());
     }
 
-    // Reject absolute paths that are NOT under the active sandbox.
-    let ws = sandbox.to_string_lossy();
+    let roots = allowed_roots(sandbox);
     for token in command.split_whitespace() {
-        if token.starts_with('/') && !token.starts_with(ws.as_ref()) {
+        let candidate = token.trim_matches(|c| matches!(c, '"' | '\'' | ',' | ';' | ')'));
+        if candidate.starts_with('/') || candidate.starts_with("~/") {
+            let expanded = if candidate.starts_with("~/") {
+                expand_tilde(candidate)
+            } else {
+                PathBuf::from(candidate)
+            };
+            let normalized = normalize_path(&expanded);
+            let allowed = roots.iter().any(|root| normalized.starts_with(root));
+            if !allowed {
+                let roots_text = roots
+                    .iter()
+                    .map(|root| root.to_string_lossy().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "Blocked: absolute path '{}' is outside the allowed roots: {}.",
+                    candidate, roots_text
+                ));
+            }
+        } else if candidate.contains("/..") || candidate.starts_with("../") {
             return Err(format!(
-                "Blocked: absolute path '{}' is outside the workspace '{}'.",
-                token, ws
+                "Blocked: path '{}' escapes the allowed roots.",
+                candidate
             ));
         }
     }
@@ -1102,13 +1603,18 @@ fn check_command_sandbox(command: &str, sandbox: &PathBuf, state: &McpState) -> 
     // Denylist has highest priority.
     for denied in &policy.denylist {
         if cmd_lower.starts_with(&denied.to_lowercase()) {
-            return Err(format!("Blocked by denylist: command matches '{}'.", denied));
+            return Err(format!(
+                "Blocked by denylist: command matches '{}'.",
+                denied
+            ));
         }
     }
 
     // Allowlist: if non-empty the command must match at least one entry.
     if !policy.allowlist.is_empty() {
-        let allowed = policy.allowlist.iter()
+        let allowed = policy
+            .allowlist
+            .iter()
             .any(|a| cmd_lower.starts_with(&a.to_lowercase()));
         if !allowed {
             return Err(format!(
@@ -1149,12 +1655,12 @@ async fn create_task_internal(
         return mcp_error(&reason);
     }
     let id = format!("task-{}", chrono::Utc::now().timestamp_millis());
-    let output  = Arc::new(Mutex::new(String::new()));
-    let status  = Arc::new(Mutex::new("running".to_string()));
-    let out_c   = output.clone();
-    let stat_c  = status.clone();
+    let output = Arc::new(Mutex::new(String::new()));
+    let status = Arc::new(Mutex::new("running".to_string()));
+    let out_c = output.clone();
+    let stat_c = status.clone();
     let cmd_str = command.to_string();
-    let ws      = sandbox.clone();
+    let ws = sandbox.clone();
 
     let join = tokio::task::spawn(async move {
         match tokio::process::Command::new("bash")
@@ -1167,15 +1673,24 @@ async fn create_task_internal(
             Ok(o) => {
                 let stdout = String::from_utf8_lossy(&o.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-                *out_c.lock().unwrap() =
-                    format!("{}{}", stdout, if stderr.is_empty() { String::new() } else { format!("\nstderr:\n{}", stderr) });
+                *out_c.lock().unwrap() = format!(
+                    "{}{}",
+                    stdout,
+                    if stderr.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\nstderr:\n{}", stderr)
+                    }
+                );
                 *stat_c.lock().unwrap() = if o.status.success() {
                     "completed".to_string()
                 } else {
                     format!("failed (exit {:?})", o.status.code())
                 };
             }
-            Err(e) => { *stat_c.lock().unwrap() = format!("failed: {}", e); }
+            Err(e) => {
+                *stat_c.lock().unwrap() = format!("failed: {}", e);
+            }
         }
     });
 
@@ -1207,15 +1722,19 @@ pub(crate) async fn start_mcp_server(port: u16, mcp_state: McpState) {
 
     let app = Router::new()
         .route("/", post(handle_jsonrpc))
-        .route("/list_tools", get({
-            let tools = mcp_state.tools.clone();
-            move || async move { Json(json!({ "tools": tools })) }
-        }))
+        .route(
+            "/list_tools",
+            get({
+                let tools = mcp_state.tools.clone();
+                move || async move { Json(json!({ "tools": tools })) }
+            }),
+        )
         .layer(cors)
         .with_state(mcp_state);
 
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
-        .await.expect("Failed to bind MCP server port");
+        .await
+        .expect("Failed to bind MCP server port");
     log::info!("MCP server listening on http://localhost:{}", port);
     axum::serve(listener, app).await.ok();
 }
@@ -1224,18 +1743,26 @@ pub(crate) async fn start_mcp_server(port: u16, mcp_state: McpState) {
 /// The path is relative to `src-tauri/` (where Cargo.toml lives).
 pub(crate) fn load_tools_embedded() -> Vec<McpTool> {
     const TOOLS_JSON: &str = include_str!("../../tools.json");
-    let parsed: serde_json::Value = serde_json::from_str(TOOLS_JSON)
-        .expect("tools.json is not valid JSON");
-    parsed.get("tools").and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|entry| {
-            let func = entry.get("function")?;
-            Some(McpTool {
-                name: func["name"].as_str().unwrap_or("").to_string(),
-                description: func["description"].as_str().unwrap_or("").to_string(),
-                input_schema: func.get("parameters").cloned()
-                    .unwrap_or(serde_json::json!({"type": "object"})),
-            })
-        }).collect())
+    let parsed: serde_json::Value =
+        serde_json::from_str(TOOLS_JSON).expect("tools.json is not valid JSON");
+    parsed
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| {
+                    let func = entry.get("function")?;
+                    Some(McpTool {
+                        name: func["name"].as_str().unwrap_or("").to_string(),
+                        description: func["description"].as_str().unwrap_or("").to_string(),
+                        input_schema: func
+                            .get("parameters")
+                            .cloned()
+                            .unwrap_or(serde_json::json!({"type": "object"})),
+                    })
+                })
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -1243,18 +1770,29 @@ pub(crate) fn load_tools(tools_path: &PathBuf) -> Vec<McpTool> {
     match fs::read_to_string(tools_path) {
         Ok(content) => {
             let parsed: Value = serde_json::from_str(&content).unwrap_or(Value::Null);
-            parsed.get("tools").and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|entry| {
-                    let func = entry.get("function")?;
-                    Some(McpTool {
-                        name: func["name"].as_str().unwrap_or("").to_string(),
-                        description: func["description"].as_str().unwrap_or("").to_string(),
-                        input_schema: func.get("parameters").cloned()
-                            .unwrap_or(json!({"type": "object"})),
-                    })
-                }).collect())
+            parsed
+                .get("tools")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|entry| {
+                            let func = entry.get("function")?;
+                            Some(McpTool {
+                                name: func["name"].as_str().unwrap_or("").to_string(),
+                                description: func["description"].as_str().unwrap_or("").to_string(),
+                                input_schema: func
+                                    .get("parameters")
+                                    .cloned()
+                                    .unwrap_or(json!({"type": "object"})),
+                            })
+                        })
+                        .collect()
+                })
                 .unwrap_or_default()
         }
-        Err(e) => { log::error!("Failed to load tools.json: {}", e); vec![] }
+        Err(e) => {
+            log::error!("Failed to load tools.json: {}", e);
+            vec![]
+        }
     }
 }

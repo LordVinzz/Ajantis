@@ -1,13 +1,13 @@
-mod helpers;
 mod agent_config;
-mod workspace;
-mod memory;
-mod state;
-mod models;
 mod chat;
 mod config_persistence;
-mod routing;
+mod helpers;
 mod mcp;
+mod memory;
+mod models;
+mod routing;
+mod state;
+mod workspace;
 
 use std::fs;
 use std::path::PathBuf;
@@ -20,10 +20,14 @@ use crate::chat::{send_message, StreamEvent};
 use crate::config_persistence::{config_path, load_agent_config, save_agent_config};
 use crate::mcp::{load_tools_embedded, start_mcp_server, McpState};
 use crate::memory::{clear_memory_pool, get_memory_pool, search_memory_pool, MemoryPool};
-use crate::models::{download_model, fetch_loaded_models, fetch_models, load_model, set_model, unload_model};
+use crate::models::{
+    download_model, fetch_loaded_models, fetch_models, load_model, set_model, unload_model,
+};
 use crate::routing::route_message;
 use crate::state::AppState;
-use crate::workspace::{load_workspace_config, pick_folder, save_workspace_config, set_active_workspace};
+use crate::workspace::{
+    load_workspace_config, pick_folder, save_workspace_config, set_active_workspace,
+};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -36,7 +40,8 @@ pub fn run() {
     let agent_config: AgentConfig = {
         let path = config_path(&workspace_root);
         if path.exists() {
-            fs::read_to_string(&path).ok()
+            fs::read_to_string(&path)
+                .ok()
                 .and_then(|c| serde_json::from_str(&c).ok())
                 .unwrap_or_default()
         } else {
@@ -44,11 +49,10 @@ pub fn run() {
         }
     };
 
-    let agent_config_arc    = Arc::new(Mutex::new(agent_config));
-    let memory_pool_arc     = Arc::new(Mutex::new(MemoryPool::default()));
-    let todo_list_arc       = Arc::new(Mutex::new(vec![]));
-    let event_channel_arc: Arc<Mutex<Option<Channel<StreamEvent>>>> =
-        Arc::new(Mutex::new(None));
+    let agent_config_arc = Arc::new(Mutex::new(agent_config));
+    let memory_pool_arc = Arc::new(Mutex::new(MemoryPool::default()));
+    let todo_list_arc = Arc::new(Mutex::new(vec![]));
+    let event_channel_arc: Arc<Mutex<Option<Channel<StreamEvent>>>> = Arc::new(Mutex::new(None));
     // Starts as workspace_root; updated by set_active_workspace when the user picks a workspace.
     let active_workspace_arc = Arc::new(Mutex::new(workspace_root.clone()));
 
@@ -77,6 +81,8 @@ pub fn run() {
         mcp_port,
         event_channel: event_channel_arc,
         tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        read_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        glob_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
 
     tauri::Builder::default()

@@ -267,6 +267,8 @@ async function refreshLoadedModels() {
         m.instances.forEach((inst, ii) => {
           if (mi > 0 || ii > 0) loadedBar.appendChild(document.createTextNode(' \u00b7 '));
           const span = document.createElement('span');
+          // TODO: render remaining-context instead of only max context once the backend
+          // starts tracking per-agent budget and surfaces it on instance updates.
           span.textContent = m.display_name + ' (ctx: ' + (inst.context_length || '?') + ')';
           loadedBar.appendChild(span);
 

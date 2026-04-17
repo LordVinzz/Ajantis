@@ -32,6 +32,8 @@ pub(crate) struct Agent {
     pub(crate) load_config: Option<AgentLoadConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) allowed_tools: Option<Vec<String>>,
     #[serde(default = "default_true")]
     pub(crate) armed: bool,
     /// Enables MCP tool-call loop path (spawn_agent, send_message, etc.)
@@ -96,6 +98,7 @@ impl Default for AgentConfig {
                 role: None,
                 load_config: None,
                 mode: None,
+                allowed_tools: None,
                 armed: true,
                 is_manager: false,
                 paused: false,

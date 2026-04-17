@@ -55,12 +55,13 @@
     },
     {
       "function": {
-        "description": "Read a text file from the workspace.",
+        "description": "Read a text file from the workspace or ~/.ajantis after locating it with glob_search. Returns at most about 4000 chars and supports scoped reads.",
         "name": "read_file",
         "parameters": {
           "additionalProperties": false,
           "properties": {
             "limit": {
+              "maximum": 4000,
               "minimum": 1,
               "type": "integer"
             },
@@ -69,6 +70,10 @@
               "type": "integer"
             },
             "path": {
+              "type": "string"
+            },
+            "scope": {
+              "description": "Optional narrowed read scope. Use 'line:start-end' or 'char:start-end'.",
               "type": "string"
             }
           },
@@ -135,7 +140,7 @@
     },
     {
       "function": {
-        "description": "Find files by glob pattern.",
+        "description": "Find files by glob pattern. Use this before read_file or grep_search; subsequent file reads must match a returned path.",
         "name": "glob_search",
         "parameters": {
           "additionalProperties": false,
@@ -157,7 +162,7 @@
     },
     {
       "function": {
-        "description": "Search file contents with a regex pattern.",
+        "description": "Search file contents with a regex pattern. Directory searches must include a glob filter.",
         "name": "grep_search",
         "parameters": {
           "additionalProperties": false,
@@ -1316,7 +1321,7 @@
     },
     {
       "function": {
-        "description": "Spawn a new LLM subagent with a defined role, model, and system prompt. Returns a unique agent_id used to address this agent in subsequent calls. The manager uses this to dynamically instantiate specialized workers (e.g. a coder agent, a critic agent, a researcher agent).",
+        "description": "Spawn a new LLM subagent with a defined role, model, and system prompt. Spawned workers can use their allowed tools and self-message for short internal reasoning loops, but only managers can delegate across agents.",
         "name": "spawn_agent",
         "parameters": {
           "additionalProperties": false,
@@ -1330,7 +1335,7 @@
               "type": "string"
             },
             "model": {
-              "description": "Model ID to use for this agent (e.g. 'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'). Defaults to the manager's own model if omitted.",
+              "description": "Local LM Studio model key to use for this agent. It must already exist on this computer; guessed or remote-only model names are rejected. Defaults to the caller's own model if omitted.",
               "type": "string"
             },
             "context_limit": {
@@ -1339,7 +1344,7 @@
               "type": "integer"
             },
             "tools": {
-              "description": "List of tool names the agent is allowed to call. Omit to inherit the full tool set.",
+              "description": "List of tool names the agent is allowed to call. Omit to give the worker the default non-manager tool set.",
               "items": {
                 "type": "string"
               },
@@ -1361,7 +1366,7 @@
     },
     {
       "function": {
-        "description": "Send a user-role message to a specific agent and optionally wait for its response. This is the primary mechanism for the manager to drive an agent's inference loop one turn at a time.",
+        "description": "Send a user-role message to a specific agent and optionally wait for its response. Managers can delegate to any agent; non-managers may only message themselves.",
         "name": "send_message",
         "parameters": {
           "additionalProperties": false,
@@ -1402,7 +1407,7 @@
     },
     {
       "function": {
-        "description": "Read the full conversation history of a specific agent — every user turn, assistant turn, and tool call/result. Allows the manager to inspect what an agent has seen and produced without interrupting it.",
+        "description": "Read the conversation history of a specific agent, including estimated remaining context budget. Managers may inspect any agent; non-managers may inspect only themselves.",
         "name": "read_agent_messages",
         "parameters": {
           "additionalProperties": false,
@@ -1465,7 +1470,7 @@
     },
     {
       "function": {
-        "description": "Retrieve the detailed runtime state of a single agent: status, current inference step, tokens consumed, tokens remaining, last assistant output, and any pending tool calls.",
+        "description": "Retrieve the detailed runtime state of a single agent, including estimated used and remaining context budget.",
         "name": "get_agent_state",
         "parameters": {
           "additionalProperties": false,

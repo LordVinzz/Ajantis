@@ -13,6 +13,7 @@ Ajantis lets you build pipelines of LLM agents that talk to each other. Each age
 Key features:
 - **Multi-agent routing** — define agents and connections; messages flow recursively through the graph based on priority and optional conditions
 - **Manager agents** — special agents that get a tool-call loop and can spawn, kill, pause/resume, broadcast to, or pipe messages between other agents at runtime
+- **Manager enforcement** — managers are constrained to orchestration and delegation; spawned workers can use tools and self-message for short reflection loops
 - **Streaming** — responses stream token by token to the frontend; tool calls and results are surfaced as visible events
 - **Persistent memory** — each agent's conversation history is kept in a shared memory pool and fed back as context on subsequent turns
 - **Model management** — list, load, unload, and download models directly from the UI; supports `on_the_fly` mode (load before turn, unload after)
@@ -35,7 +36,9 @@ The backend connects to LM Studio at `http://localhost:1234` by default. Overrid
 
 ## Configuration
 
-Agents and routing rules are stored in `ajantis-config.json` at the project root and edited from the app's **Agents** tab.
+Agents and routing rules are stored in `~/.ajantis/ajantis-config.json` and edited from the app's **Agents** tab.
+
+Runtime config files under `~/.ajantis/` are also reachable through the MCP file tools.
 
 Each agent has:
 | Field | Description |
