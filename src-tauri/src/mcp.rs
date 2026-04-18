@@ -14,13 +14,17 @@ use std::sync::{Arc, Mutex};
 use tauri::ipc::Channel;
 use tower_http::cors::CorsLayer;
 
-use crate::agent_config::{Agent, AgentConfig, AgentLoadConfig};
+use crate::agent_config::{Agent, AgentConfig, AgentLoadConfig, GROUNDED_AUDIT_BEHAVIOR_ID};
 use crate::chat::{call_chat_blocking, StreamEvent};
 use crate::config_persistence::ajantis_dir;
-use crate::helpers::{compute_context_budget, is_manager_blocked_tool, is_manager_only_tool};
-use crate::memory::{MemoryEntry, MemoryPool};
+use crate::helpers::{
+    apply_runtime_agent_context, audit_response_acknowledges_refs, compute_context_budget,
+    extract_explicit_audit_refs, is_low_value_audit_response, is_manager_blocked_tool,
+    is_manager_only_tool, resolve_active_behaviors,
+};
+use crate::memory::{CommandExecution, CommandHistory, MemoryEntry, MemoryPool};
 use crate::models::fetch_models;
-use crate::state::McpTool;
+use crate::state::{BehaviorTriggerCache, McpTool};
 
 // ── Background task tracking ───────────────────────────────────────
 
@@ -53,10 +57,16 @@ pub(crate) struct McpState {
     pub(crate) event_channel: Arc<Mutex<Option<Channel<StreamEvent>>>>,
     /// Background tasks spawned via TaskCreate.
     pub(crate) tasks: Arc<Mutex<HashMap<String, AjantisTask>>>,
+    /// Active thread-scoped command execution history.
+    pub(crate) command_history: Arc<Mutex<CommandHistory>>,
     /// Per-agent cache of file slices already returned to the model.
     pub(crate) read_cache: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     /// Per-agent cache of files discovered by glob_search.
     pub(crate) glob_cache: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    /// Runtime embeddings cache for behavior-trigger evaluation.
+    pub(crate) behavior_trigger_cache: Arc<Mutex<BehaviorTriggerCache>>,
+    /// Active built-in behaviors for turns currently executing through the tool loop.
+    pub(crate) active_behavior_contexts: Arc<Mutex<HashMap<String, HashSet<String>>>>,
 }
 
 #[derive(Deserialize)]
@@ -183,6 +193,17 @@ pub(crate) async fn handle_tool_call(
             if let Err(reason) = check_command_sandbox(&command, &sandbox, state) {
                 return mcp_error(&reason);
             }
+            let cwd = sandbox.to_string_lossy().to_string();
+            let normalized = normalize_command(&command);
+            if let Some(cached) = reuse_cached_command(state, "bash", &normalized, &cwd) {
+                let reused = format!(
+                    "[cached result reused | tool: bash | cwd: {} | command: {}]\n{}",
+                    cwd,
+                    command,
+                    cached.result
+                );
+                return mcp_ok(&reused);
+            }
             match Command::new("bash").arg("-lc").arg(&command)
                 .current_dir(&sandbox).output()
             {
@@ -190,6 +211,15 @@ pub(crate) async fn handle_tool_call(
                     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
                     let text = if stderr.is_empty() { stdout } else { format!("{}\n{}", stdout, stderr) };
+                    remember_command_result(
+                        state,
+                        "bash",
+                        &command,
+                        &normalized,
+                        &cwd,
+                        out.status.success(),
+                        if text.is_empty() { "[no output]" } else { &text },
+                    );
                     mcp_ok(if text.is_empty() { "[no output]" } else { &text })
                 }
                 Err(e) => mcp_error(&format!("Error: {}", e)),
@@ -431,67 +461,49 @@ pub(crate) async fn handle_tool_call(
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
             let ctx_limit = args["context_limit"].as_u64();
+            let initial_message = args["initial_message"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            let await_reply = args["await_reply"].as_bool().unwrap_or(true);
             let allowed_tools = args["tools"].as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect::<Vec<_>>())
-                .unwrap_or_else(|| default_worker_tools(&state.tools));
-            let inherited_model = caller_agent_id.and_then(|agent_id| {
-                let config = state.agent_config.lock().unwrap();
-                config.agents.iter()
-                    .find(|agent| agent.id == agent_id)
-                    .and_then(|agent| agent.model_key.clone())
-            });
-            let available_models = match fetch_models().await {
-                Ok(models) => models,
-                Err(e) => return mcp_error(&format!("Error fetching local models: {}", e)),
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect::<Vec<_>>());
+
+            let agent_id = match spawn_agent_record(
+                state,
+                caller_agent_id,
+                role,
+                sys_prompt,
+                requested_model,
+                ctx_limit,
+                allowed_tools,
+            ).await {
+                Ok(agent_id) => agent_id,
+                Err(err) => return mcp_error(&err),
             };
-            let selected_model = requested_model.or(inherited_model);
-            let Some(model_key) = selected_model else {
-                return mcp_error("Error: spawn_agent requires a model, or the caller must already have one to inherit.");
-            };
-            let Some(model_info) = available_models.iter().find(|model| model.key == model_key) else {
-                let available = available_models.iter()
-                    .take(20)
-                    .map(|model| model.key.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return mcp_error(&format!(
-                    "Error: model '{}' is not available on this computer. Choose one of the locally available models{}{}",
-                    model_key,
-                    if available.is_empty() { "" } else { ": " },
-                    available,
-                ));
-            };
-            if model_info.model_type.as_deref() == Some("embedding") {
-                return mcp_error(&format!(
-                    "Error: model '{}' is an embedding model and cannot be used for spawn_agent chat workers.",
-                    model_key
-                ));
+
+            if let Some(message) = initial_message {
+                match run_agent_turn(
+                    state,
+                    &agent_id,
+                    &message,
+                    await_reply,
+                    caller_active_behaviors(caller_agent_id, state),
+                )
+                .await
+                {
+                    Ok(payload) => mcp_ok(&payload),
+                    Err(err) => mcp_error(&err),
+                }
+            } else {
+                let payload = json!({
+                    "agent_id": agent_id,
+                    "status": "spawned",
+                    "next_step": "Call send_message with this exact agent_id to start the worker."
+                });
+                mcp_ok(&serde_json::to_string(&payload).unwrap_or_default())
             }
-
-            let ts = chrono::Utc::now().timestamp_millis();
-            let agent_id = format!("agent-{}-{}", role, ts);
-
-            let new_agent = Agent {
-                id: agent_id.clone(),
-                name: role.to_string(),
-                agent_type: "model".to_string(),
-                model_key: Some(model_key),
-                model_type: model_info.model_type.clone().or_else(|| Some("llm".to_string())),
-                role: Some(sys_prompt.to_string()),
-                load_config: ctx_limit.map(|cl| AgentLoadConfig {
-                    context_length: Some(cl),
-                    eval_batch_size: None, flash_attention: None,
-                    num_experts: None, offload_kv_cache_to_gpu: None,
-                }),
-                mode: Some("stay_awake".to_string()),
-                allowed_tools: Some(allowed_tools),
-                armed: true,
-                is_manager: false,
-                paused: false,
-            };
-
-            state.agent_config.lock().unwrap().agents.push(new_agent);
-            mcp_ok(&format!(r#"{{"agent_id": "{}"}}"#, agent_id))
         }
         "send_message" => {
             let agent_id = args["agent_id"].as_str().unwrap_or("");
@@ -503,104 +515,17 @@ pub(crate) async fn handle_tool_call(
                 return mcp_error(&reason);
             }
 
-            let (model_key, sys_prompt, agent_name, is_manager, allowed_tools, context_limit) = {
-                let config = state.agent_config.lock().unwrap();
-                match config.agents.iter().find(|a| a.id == agent_id) {
-                    None => return mcp_error(&format!("Error: agent '{}' not found.", agent_id)),
-                    Some(a) => {
-                        if !a.armed  { return mcp_error(&format!("Error: agent '{}' is disarmed.", agent_id)); }
-                        if a.paused  { return mcp_error(&format!("Error: agent '{}' is paused.", agent_id)); }
-                        (
-                            a.model_key.clone().unwrap_or_default(),
-                            a.role.clone().unwrap_or_default(),
-                            a.name.clone(),
-                            a.is_manager,
-                            a.allowed_tools.clone().unwrap_or_default(),
-                            a.load_config.as_ref().and_then(|cfg| cfg.context_length),
-                        )
-                    }
-                }
-            };
-
-            if model_key.is_empty() { return mcp_error(&format!("Error: agent '{}' has no model.", agent_id)); }
-
-            if !await_reply {
-                state.memory_pool.lock().unwrap().push(agent_id, &agent_name, "user", content);
-                return mcp_ok(&format!(r#"{{"status":"queued","agent_id":"{}"}}"#, agent_id));
-            }
-
-            // Reconstruct history for this sub-agent BEFORE adding the current message
-            let history: Vec<Value> = {
-                let pool = state.memory_pool.lock().unwrap();
-                pool.entries.iter()
-                    .filter(|e| e.agent_id == agent_id && (e.role == "user" || e.role == "assistant"))
-                    .map(|e| json!({"role": e.role, "content": e.content}))
-                    .collect()
-            };
-
-            // Emit AgentStart so frontend creates a bubble for this sub-agent
-            let maybe_ch = state.event_channel.lock().unwrap().clone();
-            if let Some(ref ch) = maybe_ch {
-                let _ = ch.send(StreamEvent::AgentStart {
-                    agent_id: agent_id.to_string(),
-                    agent_name: agent_name.clone(),
-                });
-            }
-            if (is_manager || !allowed_tools.is_empty()) && maybe_ch.is_none() {
-                return mcp_error("Error: tool-enabled agents require an active routed session.");
-            }
-
-            let response_result = if is_manager || !allowed_tools.is_empty() {
-                let allowed = if is_manager { None } else { Some(allowed_tools.as_slice()) };
-                crate::chat::call_chat_with_tools(
-                    &model_key,
-                    &sys_prompt,
-                    content,
-                    agent_id,
-                    &state.tools,
-                    allowed,
-                    is_manager,
-                    is_manager,
-                    context_limit,
-                    state.mcp_port,
-                    maybe_ch.as_ref().unwrap_or_else(|| unreachable!()),
-                    &history,
-                ).await
-            } else {
-                call_chat_blocking(&model_key, &sys_prompt, content, &history, context_limit).await
-            };
-
-            match response_result {
-                Ok(response) => {
-                    // Store both sides of this turn in memory
-                    {
-                        let mut pool = state.memory_pool.lock().unwrap();
-                        pool.push(agent_id, &agent_name, "user", content);
-                        pool.push(agent_id, &agent_name, "assistant", &response);
-                    }
-                    // Emit the sub-agent's response as a visible bubble token
-                    if let Some(ref ch) = maybe_ch {
-                        let _ = ch.send(StreamEvent::Token {
-                            agent_id: agent_id.to_string(),
-                            content: response.clone(),
-                        });
-                        let _ = ch.send(StreamEvent::AgentEnd {
-                            agent_id: agent_id.to_string(),
-                        });
-                    }
-                    let payload = json!({ "agent_id": agent_id, "response": response });
-                    mcp_ok(&serde_json::to_string(&payload).unwrap_or_default())
-                }
-                Err(e) => {
-                    if let Some(ref ch) = maybe_ch {
-                        let _ = ch.send(StreamEvent::Error {
-                            agent_id: agent_id.to_string(),
-                            agent_name: agent_name.clone(),
-                            message: e.clone(),
-                        });
-                    }
-                    mcp_error(&format!("Error calling agent: {}", e))
-                }
+            match run_agent_turn(
+                state,
+                agent_id,
+                content,
+                await_reply,
+                caller_active_behaviors(caller_agent_id, state),
+            )
+            .await
+            {
+                Ok(payload) => mcp_ok(&payload),
+                Err(err) => mcp_error(&err),
             }
         }
         "read_agent_messages" => {
@@ -682,12 +607,18 @@ pub(crate) async fn handle_tool_call(
                         a.load_config.as_ref().and_then(|cfg| cfg.context_length),
                         0,
                     );
+                    let tool_enabled = a
+                        .allowed_tools
+                        .as_ref()
+                        .map(|tools| !tools.is_empty())
+                        .unwrap_or(true);
                     Some(json!({
                         "agent_id": a.id,
                         "name": a.name,
                         "model": a.model_key,
                         "status": status,
                         "is_manager": a.is_manager,
+                        "tool_enabled": tool_enabled,
                         "message_count": msg_count,
                         "last_output_preview": last_preview,
                         "context_limit": budget.limit,
@@ -772,15 +703,15 @@ pub(crate) async fn handle_tool_call(
         "broadcast_message" => {
             let content = args["content"].as_str().unwrap_or("");
             if content.is_empty() { return mcp_error("Error: content is required."); }
-            let await_reply = args["await_reply"].as_bool().unwrap_or(false);
+            let await_reply = args["await_reply"].as_bool().unwrap_or(true);
 
             let raw_ids: Vec<String> = match args["agent_ids"].as_array() {
                 None => return mcp_error("Error: agent_ids is required."),
                 Some(arr) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
             };
 
-            // Resolve targets (extract data while holding lock, then release)
-            let targets: Vec<(String, String, String, Option<u64>)> = {
+            // Resolve targets (extract ids while holding lock, then release)
+            let targets: Vec<String> = {
                 let config = state.agent_config.lock().unwrap();
                 let ids: Vec<String> = if raw_ids.len() == 1 && raw_ids[0] == "*" {
                     config.agents.iter()
@@ -788,40 +719,39 @@ pub(crate) async fn handle_tool_call(
                         .map(|a| a.id.clone()).collect()
                 } else { raw_ids };
                 ids.into_iter().filter_map(|id| {
-                    config.agents.iter().find(|a| a.id == id && a.armed && !a.paused)
-                        .and_then(|a| a.model_key.as_ref().map(|m| (
-                            id,
-                            m.clone(),
-                            a.role.clone().unwrap_or_default(),
-                            a.load_config.as_ref().and_then(|cfg| cfg.context_length),
-                        )))
+                    config.agents.iter()
+                        .find(|a| a.id == id && a.armed && !a.paused && a.model_key.is_some())
+                        .map(|_| id)
                 }).collect()
             };
 
             if !await_reply {
                 let mut pool = state.memory_pool.lock().unwrap();
-                for (id, _, _, _) in &targets { pool.push(id, id, "user", content); }
-                let ids: Vec<&str> = targets.iter().map(|(id, _, _, _)| id.as_str()).collect();
+                for id in &targets { pool.push(id, id, "user", content); }
+                let ids: Vec<&str> = targets.iter().map(|id| id.as_str()).collect();
                 return mcp_ok(&format!(r#"{{"queued":{},"agent_ids":{}}}"#,
                     targets.len(), serde_json::to_string(&ids).unwrap_or_default()));
             }
 
             let mut results = serde_json::Map::new();
-            for (agent_id, model_key, sys_prompt, context_limit) in &targets {
-                let history: Vec<Value> = {
-                    let pool = state.memory_pool.lock().unwrap();
-                    pool.entries.iter()
-                        .filter(|e| e.agent_id == *agent_id && (e.role == "user" || e.role == "assistant"))
-                        .map(|e| json!({"role": e.role, "content": e.content}))
-                        .collect()
-                };
-                state.memory_pool.lock().unwrap().push(agent_id, agent_id, "user", content);
-                match call_chat_blocking(model_key, sys_prompt, content, &history, *context_limit).await {
-                    Ok(resp) => {
-                        state.memory_pool.lock().unwrap().push(agent_id, agent_id, "assistant", &resp);
-                        results.insert(agent_id.clone(), json!({"status":"ok","response":resp}));
+            for agent_id in &targets {
+                match run_agent_turn(
+                    state,
+                    agent_id,
+                    content,
+                    true,
+                    caller_active_behaviors(caller_agent_id, state),
+                )
+                .await
+                {
+                    Ok(payload) => {
+                        let parsed = serde_json::from_str::<Value>(&payload)
+                            .unwrap_or_else(|_| json!({"status":"ok","response": payload}));
+                        results.insert(agent_id.clone(), parsed);
                     }
-                    Err(e) => { results.insert(agent_id.clone(), json!({"status":"error","error":e})); }
+                    Err(e) => {
+                        results.insert(agent_id.clone(), json!({"status":"error","error":e}));
+                    }
                 }
             }
             mcp_ok(&serde_json::to_string_pretty(&results).unwrap_or_default())
@@ -1085,12 +1015,41 @@ pub(crate) async fn handle_tool_call(
                 _ => return mcp_error(&format!("Unsupported language: {}", lang)),
             };
             let flag = if interpreter == "bash" { "-c" } else { "-e" };
+            let cwd = sandbox.to_string_lossy().to_string();
+            let command_repr = format!("{} {} {}", interpreter, flag, code);
+            let normalized = normalize_command(&command_repr);
+            if let Some(cached) = reuse_cached_command(state, "REPL", &normalized, &cwd) {
+                let reused = format!(
+                    "[cached result reused | tool: REPL | cwd: {} | command: {}]\n{}",
+                    cwd,
+                    command_repr,
+                    cached.result
+                );
+                return mcp_ok(&reused);
+            }
             match Command::new(interpreter).arg(flag).arg(code)
                 .current_dir(&sandbox).output()
             {
                 Ok(out) => {
                     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    let result_text = if !out.status.success() && !stderr.is_empty() {
+                        format!("Runtime error:\n{}", stderr)
+                    } else if stderr.is_empty() {
+                        if stdout.is_empty() { "[no output]".to_string() } else { stdout.clone() }
+                    } else {
+                        let text = format!("{}\n{}", stdout, stderr);
+                        if text.is_empty() { "[no output]".to_string() } else { text }
+                    };
+                    remember_command_result(
+                        state,
+                        "REPL",
+                        &command_repr,
+                        &normalized,
+                        &cwd,
+                        out.status.success(),
+                        &result_text,
+                    );
                     if !out.status.success() && !stderr.is_empty() {
                         mcp_error(&format!("Runtime error:\n{}", stderr))
                     } else {
@@ -1108,6 +1067,17 @@ pub(crate) async fn handle_tool_call(
             if let Err(reason) = check_command_sandbox(command, &sandbox, state) {
                 return mcp_error(&reason);
             }
+            let cwd = sandbox.to_string_lossy().to_string();
+            let normalized = normalize_command(command);
+            if let Some(cached) = reuse_cached_command(state, "PowerShell", &normalized, &cwd) {
+                let reused = format!(
+                    "[cached result reused | tool: PowerShell | cwd: {} | command: {}]\n{}",
+                    cwd,
+                    command,
+                    cached.result
+                );
+                return mcp_ok(&reused);
+            }
             match Command::new("pwsh").arg("-Command").arg(command)
                 .current_dir(&sandbox).output()
             {
@@ -1116,6 +1086,15 @@ pub(crate) async fn handle_tool_call(
                     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
                     let text = if stderr.is_empty() { stdout }
                                else { format!("{}\n{}", stdout, stderr) };
+                    remember_command_result(
+                        state,
+                        "PowerShell",
+                        command,
+                        &normalized,
+                        &cwd,
+                        out.status.success(),
+                        if text.is_empty() { "[no output]" } else { &text },
+                    );
                     mcp_ok(if text.is_empty() { "[no output]" } else { &text })
                 }
                 Err(_) => mcp_error("PowerShell (pwsh) is not available on this system."),
@@ -1153,24 +1132,13 @@ pub(crate) async fn handle_tool_call(
             }
         }
         "AskUserQuestion" => {
-            // Synchronous Q&A is not feasible in the current async pipeline.
-            // Emit the question as a notification so the user at least sees it.
-            let question = args["question"].as_str().unwrap_or("");
-            let maybe_ch = state.event_channel.lock().unwrap().clone();
-            if let Some(ref ch) = maybe_ch {
-                let _ = ch.send(StreamEvent::AgentStart {
-                    agent_id: "agent-notification".to_string(),
-                    agent_name: "Question".to_string(),
-                });
-                let _ = ch.send(StreamEvent::Token {
-                    agent_id: "agent-notification".to_string(),
-                    content: format!("❓ {}", question),
-                });
-                let _ = ch.send(StreamEvent::AgentEnd {
-                    agent_id: "agent-notification".to_string(),
-                });
-            }
-            mcp_ok("[Question displayed to user. Synchronous responses are not supported — the user's next chat message will serve as the answer.]")
+            let question = args["question"].as_str().unwrap_or("").trim();
+            let msg = if question.is_empty() {
+                "AskUserQuestion is unavailable in this environment. Continue by inspecting the workspace or making a reasonable assumption."
+            } else {
+                "AskUserQuestion is unavailable in this environment. Do not ask the user this question now; inspect the workspace or make a reasonable assumption and continue."
+            };
+            mcp_error(msg)
         }
 
         // ── Output / tools ────────────────────────────────────────
@@ -1291,30 +1259,68 @@ pub(crate) async fn handle_tool_call(
             mcp_ok("Acknowledged — process-based tasks do not support runtime message injection.")
         }
 
-        // ── Stubs for Claude Code-specific tools ──────────────────
-        "Agent" => mcp_ok("Use 'spawn_agent' + 'send_message' to manage sub-agents in Ajantis."),
-        "Skill" => mcp_error("Skill loading is a Claude Code feature, not available here."),
-        "NotebookEdit" => mcp_error("Notebook editing requires a Jupyter kernel."),
-        "EnterPlanMode" | "ExitPlanMode" => mcp_ok("Plan mode is a Claude Code feature; no-op here."),
-        "ListMcpResources" => mcp_ok(r#"{"resources":[]}"#),
-        "ReadMcpResource" => mcp_error("No resources are exposed on this MCP server."),
-        "McpAuth" => mcp_error("This MCP server does not require authentication."),
-        "RemoteTrigger" => mcp_error("Remote triggers are not implemented."),
-        "MCP" => mcp_error("Nested MCP execution is not supported."),
-        "TestingPermission" => mcp_ok(r#"{"granted":true}"#),
-        "WorkerCreate" | "WorkerGet" | "WorkerObserve" | "WorkerResolveTrust"
-        | "WorkerAwaitReady" | "WorkerSendPrompt" | "WorkerRestart"
-        | "WorkerTerminate" | "WorkerObserveCompletion" => {
-            mcp_error("Worker management is a Claude Code feature. Use agent tools instead.")
-        }
-        "TeamCreate" | "TeamDelete" => {
-            mcp_ok("Use 'spawn_agent' + 'broadcast_message' to manage agent groups.")
-        }
-        "CronCreate" | "CronList" | "CronDelete" => {
-            mcp_error("Scheduled tasks are not yet implemented. Use TaskCreate for one-shot background tasks.")
-        }
-        "LSP" => mcp_error("LSP queries are not available in this context."),
+        // ── Compatibility shims for Claude Code-specific tools ────
+        "Agent" => {
+            let description = args["description"].as_str().unwrap_or("").trim();
+            let prompt = args["prompt"].as_str().unwrap_or("").trim();
+            if description.is_empty() {
+                return mcp_error("Error: Agent.description is required.");
+            }
+            if prompt.is_empty() {
+                return mcp_error("Error: Agent.prompt is required.");
+            }
+            let role = args["name"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    args["subagent_type"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or("worker");
+            let compat_prompt = build_compat_agent_prompt(role, prompt);
+            let initial_task = if prompt.is_empty() || prompt == description {
+                description.to_string()
+            } else {
+                format!(
+                    "Task:\n{}\n\nAdditional instructions from the caller:\n{}",
+                    description, prompt
+                )
+            };
+            let requested_model = args["model"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
 
+            let agent_id = match spawn_agent_record(
+                state,
+                caller_agent_id,
+                role,
+                &compat_prompt,
+                requested_model,
+                None,
+                None,
+            ).await {
+                Ok(agent_id) => agent_id,
+                Err(err) => return mcp_error(&err),
+            };
+
+            match run_agent_turn(
+                state,
+                &agent_id,
+                &initial_task,
+                true,
+                caller_active_behaviors(caller_agent_id, state),
+            )
+            .await
+            {
+                Ok(payload) => mcp_ok(&payload),
+                Err(err) => mcp_error(&err),
+            }
+        }
         _ => mcp_error(&format!("Tool '{}' is not recognised by this MCP server.", name)),
     }
 }
@@ -1325,6 +1331,352 @@ fn default_worker_tools(tools: &[McpTool]) -> Vec<String> {
         .filter(|tool| !is_manager_only_tool(&tool.name))
         .map(|tool| tool.name.clone())
         .collect()
+}
+
+async fn spawn_agent_record(
+    state: &McpState,
+    caller_agent_id: Option<&str>,
+    role: &str,
+    sys_prompt: &str,
+    requested_model: Option<String>,
+    ctx_limit: Option<u64>,
+    allowed_tools: Option<Vec<String>>,
+) -> Result<String, String> {
+    let inherited_model = caller_agent_id.and_then(|agent_id| {
+        let config = state.agent_config.lock().unwrap();
+        config.agents.iter()
+            .find(|agent| agent.id == agent_id)
+            .and_then(|agent| agent.model_key.clone())
+    });
+    let available_models = fetch_models()
+        .await
+        .map_err(|e| format!("Error fetching local models: {}", e))?;
+    let selected_model = requested_model.or(inherited_model);
+    let Some(model_key) = selected_model else {
+        return Err(
+            "Error: spawn_agent requires a model, or the caller must already have one to inherit."
+                .to_string(),
+        );
+    };
+    let Some(model_info) = available_models.iter().find(|model| model.key == model_key) else {
+        let available = available_models.iter()
+            .take(20)
+            .map(|model| model.key.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "Error: model '{}' is not available on this computer. Choose one of the locally available models{}{}",
+            model_key,
+            if available.is_empty() { "" } else { ": " },
+            available,
+        ));
+    };
+    if model_info.model_type.as_deref() == Some("embedding") {
+        return Err(format!(
+            "Error: model '{}' is an embedding model and cannot be used for spawn_agent chat workers.",
+            model_key
+        ));
+    }
+
+    let ts = chrono::Utc::now().timestamp_millis();
+    let agent_id = format!("agent-{}-{}", role, ts);
+    let new_agent = Agent {
+        id: agent_id.clone(),
+        name: role.to_string(),
+        agent_type: "model".to_string(),
+        model_key: Some(model_key),
+        model_type: model_info.model_type.clone().or_else(|| Some("llm".to_string())),
+        role: Some(sys_prompt.to_string()),
+        load_config: ctx_limit.map(|cl| AgentLoadConfig {
+            context_length: Some(cl),
+            eval_batch_size: None,
+            flash_attention: None,
+            num_experts: None,
+            offload_kv_cache_to_gpu: None,
+        }),
+        mode: Some("stay_awake".to_string()),
+        allowed_tools: Some(allowed_tools.unwrap_or_else(|| default_worker_tools(&state.tools))),
+        armed: true,
+        is_manager: false,
+        paused: false,
+    };
+    state.agent_config.lock().unwrap().agents.push(new_agent);
+    Ok(agent_id)
+}
+
+fn build_compat_agent_prompt(role_hint: &str, caller_prompt: &str) -> String {
+    let normalized_role = normalize_role_hint(role_hint);
+    let specialization = match normalized_role.as_str() {
+        "explorer" => {
+            "Focus on identifying the minimum relevant files, directories, and entry points needed for the task. Do not stop at a blocked summary if the next obvious file to inspect is already implied."
+        }
+        "executor" => {
+            "Prefer direct execution with concise evidence. If asked to show command output, run the command and report the actual result."
+        }
+        "analyst" | "analyzer" => {
+            "Read the relevant sources and produce a factual summary grounded in the files you inspected. Every substantive conclusion must cite the file or observed code/config behavior behind it. If the caller names a broad scope, treat it as a coverage checklist and explicitly call out anything still uninspected."
+        }
+        "security_auditor" => {
+            "Look for concrete vulnerabilities, risky configurations, and unsafe patterns. Prefer verified findings over speculation. Do not assign severity without direct code/config evidence. If a concern is plausible but unproven, label it as a lower-confidence hypothesis only if you can cite a concrete file/config or observed behavior and state what proof is still missing. If the caller names a broad scope, treat it as a coverage checklist and explicitly call out anything still uninspected."
+        }
+        "code_reviewer" => {
+            "Review behavior critically. Call out bugs, regressions, unsafe assumptions, and missing tests before giving any summary. Base every finding on code you actually inspected."
+        }
+        "verifier" => {
+            "Verify whether the implementation actually satisfies the request. Prefer concrete checks over intent."
+        }
+        _ => "Use the available tools carefully and complete the assigned sub-task directly.",
+    };
+
+    format!(
+        "You are a specialized {} subagent working inside a local repository.\n\n{}\n\nGeneral rules:\n- Execute the assigned sub-task directly.\n- Prefer targeted tool calls and narrow reads.\n- For audit/review work, prefer direct file or config inspection over speculation.\n- Treat explicitly requested files, directories, file classes, and subsystems as a coverage checklist; if you did not inspect one, call it out explicitly as a coverage gap.\n- Quote the file/path and the specific observed behavior behind each conclusion.\n- Do not emit generic or dependency-only risk templates.\n- Do not ask the user follow-up questions in this environment.\n- Do not stop at a plan, status update, or statement of intent.\n- If a tool is blocked, adapt and try another minimal approach.\n- If evidence is insufficient, say `insufficient evidence` instead of inventing a finding.\n- Return the concrete result requested by the caller.\n\nSupplementary guidance from the caller:\n{}",
+        role_hint,
+        specialization,
+        if caller_prompt.trim().is_empty() {
+            "[none]"
+        } else {
+            caller_prompt
+        }
+    )
+}
+
+fn normalize_role_hint(role_hint: &str) -> String {
+    let mut normalized = String::with_capacity(role_hint.len());
+    let mut last_was_sep = false;
+    for ch in role_hint.chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if !last_was_sep {
+            normalized.push('_');
+            last_was_sep = true;
+        }
+    }
+    normalized.trim_matches('_').to_string()
+}
+
+fn normalize_command(command: &str) -> String {
+    command.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn reuse_cached_command(
+    state: &McpState,
+    tool_name: &str,
+    normalized_command: &str,
+    cwd: &str,
+) -> Option<CommandExecution> {
+    state
+        .command_history
+        .lock()
+        .unwrap()
+        .find_exact(tool_name, normalized_command, cwd)
+}
+
+fn remember_command_result(
+    state: &McpState,
+    tool_name: &str,
+    command: &str,
+    normalized_command: &str,
+    cwd: &str,
+    success: bool,
+    result: &str,
+) {
+    state.command_history.lock().unwrap().push(
+        tool_name,
+        command,
+        normalized_command,
+        cwd,
+        success,
+        result,
+    );
+}
+
+fn caller_active_behaviors(
+    caller_agent_id: Option<&str>,
+    state: &McpState,
+) -> Option<HashSet<String>> {
+    let caller_id = caller_agent_id?;
+    if caller_id.is_empty() {
+        return None;
+    }
+    state
+        .active_behavior_contexts
+        .lock()
+        .unwrap()
+        .get(caller_id)
+        .cloned()
+}
+
+async fn run_agent_turn(
+    state: &McpState,
+    agent_id: &str,
+    content: &str,
+    await_reply: bool,
+    inherited_behaviors: Option<HashSet<String>>,
+) -> Result<String, String> {
+    let (model_key, sys_prompt, agent_name, is_manager, allowed_tools, context_limit, behavior_triggers) = {
+        let config = state.agent_config.lock().unwrap();
+        match config.agents.iter().find(|a| a.id == agent_id) {
+            None => return Err(format!("Error: agent '{}' not found.", agent_id)),
+            Some(a) => {
+                if !a.armed {
+                    return Err(format!("Error: agent '{}' is disarmed.", agent_id));
+                }
+                if a.paused {
+                    return Err(format!("Error: agent '{}' is paused.", agent_id));
+                }
+                (
+                    a.model_key.clone().unwrap_or_default(),
+                    apply_runtime_agent_context(
+                        &a.role.clone().unwrap_or_default(),
+                        a.is_manager,
+                        &state.command_history.lock().unwrap().clone(),
+                    ),
+                    a.name.clone(),
+                    a.is_manager,
+                    if a.is_manager {
+                        Vec::new()
+                    } else {
+                        a.allowed_tools
+                            .clone()
+                            .unwrap_or_else(|| default_worker_tools(&state.tools))
+                    },
+                    a.load_config.as_ref().and_then(|cfg| cfg.context_length),
+                    config.behavior_triggers.clone(),
+                )
+            }
+        }
+    };
+
+    if model_key.is_empty() {
+        return Err(format!("Error: agent '{}' has no model.", agent_id));
+    }
+
+    if !await_reply {
+        let payload = json!({
+            "status": "queued",
+            "agent_id": agent_id,
+            "note": "No reply was awaited. To execute the agent immediately, call send_message with await_reply=true."
+        });
+        return Ok(serde_json::to_string(&payload).unwrap_or_default());
+    }
+
+    let active_behaviors = resolve_active_behaviors(
+        content,
+        inherited_behaviors.as_ref(),
+        &behavior_triggers,
+        &state.behavior_trigger_cache,
+    )
+    .await;
+    let grounded_audit_mode = active_behaviors.contains(GROUNDED_AUDIT_BEHAVIOR_ID);
+
+    let history: Vec<Value> = {
+        let pool = state.memory_pool.lock().unwrap();
+        pool.entries.iter()
+            .filter(|e| e.agent_id == agent_id && (e.role == "user" || e.role == "assistant"))
+            .map(|e| json!({"role": e.role, "content": e.content}))
+            .collect()
+    };
+
+    let maybe_ch = state.event_channel.lock().unwrap().clone();
+    if let Some(ref ch) = maybe_ch {
+        let _ = ch.send(StreamEvent::AgentStart {
+            agent_id: agent_id.to_string(),
+            agent_name: agent_name.clone(),
+        });
+    }
+    if (is_manager || !allowed_tools.is_empty()) && maybe_ch.is_none() {
+        return Err("Error: tool-enabled agents require an active routed session.".to_string());
+    }
+
+    let uses_tool_loop = is_manager || !allowed_tools.is_empty();
+
+    let response_result = if uses_tool_loop {
+        let allowed = if is_manager { None } else { Some(allowed_tools.as_slice()) };
+        let glob_ready = state
+            .glob_cache
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .map(|matches| !matches.is_empty())
+            .unwrap_or(false);
+        crate::chat::call_chat_with_tools(
+            &model_key,
+            &sys_prompt,
+            content,
+            agent_id,
+            &state.tools,
+            allowed,
+            is_manager,
+            is_manager,
+            context_limit,
+            glob_ready,
+            state,
+            Some(&active_behaviors),
+            maybe_ch.as_ref().unwrap_or_else(|| unreachable!()),
+            &history,
+        ).await
+    } else {
+        call_chat_blocking(&model_key, &sys_prompt, content, &history, context_limit).await
+    };
+
+    match response_result {
+        Ok(response) => {
+            if grounded_audit_mode && is_low_value_audit_response(&response)
+            {
+                return Err(format!(
+                    "Agent '{}' returned an audit response without grounded, file-backed findings.",
+                    agent_name
+                ));
+            }
+            if grounded_audit_mode {
+                let requested_refs = extract_explicit_audit_refs(content);
+                if !requested_refs.is_empty()
+                    && !audit_response_acknowledges_refs(&response, &requested_refs)
+                {
+                    return Err(format!(
+                        "Agent '{}' did not address all explicitly requested audit scopes: {}.",
+                        agent_name,
+                        requested_refs.join(", ")
+                    ));
+                }
+            }
+            if response.trim().is_empty() {
+                return Err(format!(
+                    "Agent '{}' completed its turn without returning a usable answer.",
+                    agent_name
+                ));
+            }
+            {
+                let mut pool = state.memory_pool.lock().unwrap();
+                pool.push(agent_id, &agent_name, "user", content);
+                pool.push(agent_id, &agent_name, "assistant", &response);
+            }
+            if let Some(ref ch) = maybe_ch {
+                if !uses_tool_loop {
+                    let _ = ch.send(StreamEvent::Token {
+                        agent_id: agent_id.to_string(),
+                        content: response.clone(),
+                    });
+                }
+                let _ = ch.send(StreamEvent::AgentEnd {
+                    agent_id: agent_id.to_string(),
+                });
+            }
+            let payload = json!({ "agent_id": agent_id, "response": response });
+            Ok(serde_json::to_string(&payload).unwrap_or_default())
+        }
+        Err(e) => {
+            if let Some(ref ch) = maybe_ch {
+                let _ = ch.send(StreamEvent::Error {
+                    agent_id: agent_id.to_string(),
+                    agent_name: agent_name.clone(),
+                    message: e.clone(),
+                });
+            }
+            Err(format!("Error calling agent: {}", e))
+        }
+    }
 }
 
 fn enforce_tool_policy(

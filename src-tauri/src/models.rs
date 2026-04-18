@@ -218,6 +218,66 @@ pub(crate) async fn unload_model_internal(instance_id: &str) -> Result<(), Strin
     Ok(())
 }
 
+pub(crate) async fn create_embeddings(
+    model_key: &str,
+    inputs: &[String],
+) -> Result<Vec<Vec<f32>>, String> {
+    if model_key.trim().is_empty() {
+        return Err("Embedding model is not configured.".to_string());
+    }
+    if inputs.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let url = format!("{}/v1/embeddings", lm_base_url());
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .json(&json!({
+            "model": model_key,
+            "input": inputs,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Embedding request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!(
+            "Embedding request failed: {}",
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Invalid embeddings response: {}", e))?;
+    let items = data["data"]
+        .as_array()
+        .ok_or("Invalid embeddings response: missing data array")?;
+
+    items
+        .iter()
+        .map(|item| {
+            item["embedding"]
+                .as_array()
+                .ok_or("Invalid embeddings response: missing embedding")
+                .and_then(|values| {
+                    values
+                        .iter()
+                        .map(|value| {
+                            value
+                                .as_f64()
+                                .map(|v| v as f32)
+                                .ok_or("Invalid embeddings response: non-numeric value")
+                        })
+                        .collect::<Result<Vec<f32>, _>>()
+                })
+                .map_err(|e| e.to_string())
+        })
+        .collect()
+}
+
 #[tauri::command]
 pub(crate) async fn load_model(config: LoadConfig) -> Result<(), String> {
     load_model_internal(

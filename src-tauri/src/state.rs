@@ -7,7 +7,13 @@ use tauri::ipc::Channel;
 
 use crate::agent_config::AgentConfig;
 use crate::chat::StreamEvent;
-use crate::memory::MemoryPool;
+use crate::mcp::McpState;
+use crate::memory::{CommandHistory, MemoryPool};
+
+#[derive(Default)]
+pub(crate) struct BehaviorTriggerCache {
+    pub(crate) embeddings: std::collections::HashMap<String, Vec<f32>>,
+}
 
 pub(crate) struct AppState {
     pub(crate) current_model: Mutex<String>,
@@ -21,6 +27,9 @@ pub(crate) struct AppState {
     pub(crate) todo_list: Arc<Mutex<Vec<Value>>>,
     pub(crate) agent_config: Arc<Mutex<AgentConfig>>,
     pub(crate) memory_pool: Arc<Mutex<MemoryPool>>,
+    pub(crate) command_history: Arc<Mutex<CommandHistory>>,
+    pub(crate) glob_cache: Arc<Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>>,
+    pub(crate) mcp_state: Arc<McpState>,
     /// Shared with McpState so MCP tool handlers can emit stream events to the frontend.
     pub(crate) event_channel: Arc<Mutex<Option<Channel<StreamEvent>>>>,
 }

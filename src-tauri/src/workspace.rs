@@ -4,15 +4,70 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::memory::{CommandExecution, MemoryEntry};
 use crate::state::AppState;
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub(crate) struct WorkspaceToolCall {
+    pub(crate) tool_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) args: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) result: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) status: String,
+    #[serde(default)]
+    pub(crate) semantic: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub(crate) struct WorkspaceMessageSignal {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) text: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub(crate) struct WorkspaceThreadMessage {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) agent_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) content: String,
+    #[serde(default)]
+    pub(crate) is_sent: bool,
+    #[serde(default)]
+    pub(crate) is_error: bool,
+    #[serde(default)]
+    pub(crate) for_user: bool,
+    #[serde(default)]
+    pub(crate) internal: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tools: Vec<WorkspaceToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) signal: Option<WorkspaceMessageSignal>,
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct WorkspaceThread {
     pub(crate) id: String,
     pub(crate) name: String,
-    /// Persisted HTML snapshot of the thread conversation.
+    /// Legacy persisted HTML snapshot of the thread conversation.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) messages: String,
+    /// Structured thread messages used to reconstruct the UI.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) message_items: Vec<WorkspaceThreadMessage>,
+    /// Persisted backend conversation state for the thread.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) memory_entries: Vec<MemoryEntry>,
+    /// Persisted thread-scoped command execution history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) command_history: Vec<CommandExecution>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

@@ -6,7 +6,8 @@ use tauri::ipc::Channel;
 
 use crate::agent_config::{AgentConfig, AgentLoadConfig};
 use crate::chat::{call_chat_with_tools, send_chat_completion_streaming, StreamEvent};
-use crate::memory::MemoryPool;
+use crate::helpers::{apply_runtime_agent_context, is_manager_only_tool};
+use crate::memory::{CommandHistory, MemoryPool};
 use crate::models::{fetch_models, load_model_internal, unload_model_internal};
 use crate::state::{AppState, McpTool};
 
@@ -19,8 +20,10 @@ pub(crate) async fn route_message(
 ) -> Result<(), String> {
     let config = state.agent_config.lock().unwrap().clone();
     let memory = state.memory_pool.clone();
+    let command_history = state.command_history.clone();
+    let glob_cache = state.glob_cache.clone();
+    let mcp_state = state.mcp_state.clone();
     let tools_arc = Arc::new(state.mcp_tools.clone());
-    let mcp_port = state.mcp_port;
     let mut visited: HashSet<String> = HashSet::new();
 
     let model_info_map: HashMap<String, (String, Option<u64>)> = match fetch_models().await {
@@ -41,9 +44,11 @@ pub(crate) async fn route_message(
         &on_event,
         &mut visited,
         &memory,
+        &command_history,
+        &glob_cache,
+        &mcp_state,
         &model_info_map,
         tools_arc,
-        mcp_port,
     )
     .await;
 
@@ -60,9 +65,11 @@ pub(crate) async fn route_recursive(
     on_event: &Channel<StreamEvent>,
     visited: &mut HashSet<String>,
     memory: &Arc<Mutex<MemoryPool>>,
+    command_history: &Arc<Mutex<CommandHistory>>,
+    glob_cache: &Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    mcp_state: &Arc<crate::mcp::McpState>,
     model_info_map: &HashMap<String, (String, Option<u64>)>,
     tools: Arc<Vec<McpTool>>,
-    mcp_port: u16,
 ) {
     // Collect enabled targets sorted by priority (lower = first)
     let mut targets: Vec<(String, u8)> = config
@@ -89,9 +96,10 @@ pub(crate) async fn route_recursive(
             agent_name,
             model_key,
             mode,
-            role,
+            system_prompt,
             load_cfg,
             is_manager,
+            allowed_tools,
             model_type_resolved,
             context_limit,
         ) = {
@@ -124,7 +132,11 @@ pub(crate) async fn route_recursive(
                         agent.name.clone(),
                         agent.model_key.clone().unwrap_or_default(),
                         agent.mode.as_deref().unwrap_or("stay_awake").to_string(),
-                        agent.role.clone().unwrap_or_default(),
+                        apply_runtime_agent_context(
+                            &agent.role.clone().unwrap_or_default(),
+                            agent.is_manager,
+                            &command_history.lock().unwrap().clone(),
+                        ),
                         agent.load_config.clone().unwrap_or(AgentLoadConfig {
                             context_length: None,
                             eval_batch_size: None,
@@ -133,6 +145,16 @@ pub(crate) async fn route_recursive(
                             offload_kv_cache_to_gpu: None,
                         }),
                         agent.is_manager,
+                        if agent.is_manager {
+                            Vec::new()
+                        } else {
+                            agent.allowed_tools
+                                .clone()
+                                .unwrap_or_else(|| tools.iter()
+                                    .filter(|tool| !is_manager_only_tool(&tool.name))
+                                    .map(|tool| tool.name.clone())
+                                    .collect())
+                        },
                         resolved,
                         agent
                             .load_config
@@ -191,18 +213,26 @@ pub(crate) async fn route_recursive(
                 .collect()
         };
 
-        let result = if is_manager {
+        let result = if is_manager || !allowed_tools.is_empty() {
+            let glob_ready = glob_cache
+                .lock()
+                .unwrap()
+                .get(&target_id)
+                .map(|matches| !matches.is_empty())
+                .unwrap_or(false);
             call_chat_with_tools(
                 &model_key,
-                &role,
+                &system_prompt,
                 message,
                 &target_id,
                 &tools,
-                None,
-                true,
-                true,
+                if is_manager { None } else { Some(allowed_tools.as_slice()) },
+                is_manager,
+                is_manager,
                 context_limit,
-                mcp_port,
+                glob_ready,
+                mcp_state.as_ref(),
+                None,
                 on_event,
                 &history,
             )
@@ -210,7 +240,7 @@ pub(crate) async fn route_recursive(
         } else {
             send_chat_completion_streaming(
                 &model_key,
-                &role,
+                &system_prompt,
                 message,
                 &target_id,
                 on_event,
@@ -241,9 +271,11 @@ pub(crate) async fn route_recursive(
                     on_event,
                     visited,
                     memory,
+                    command_history,
+                    glob_cache,
+                    mcp_state,
                     model_info_map,
                     tools.clone(),
-                    mcp_port,
                 )
                 .await;
             }

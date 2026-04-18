@@ -326,29 +326,7 @@
     },
     {
       "function": {
-        "description": "Load a local skill definition and its instructions.",
-        "name": "Skill",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {
-            "args": {
-              "type": "string"
-            },
-            "skill": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "skill"
-          ],
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Launch a specialized agent task and persist its handoff metadata.",
+        "description": "Compatibility wrapper: create a specialized subagent and immediately execute the task in `description`; use `prompt` for extra instructions, not as the final answer.",
         "name": "Agent",
         "parameters": {
           "additionalProperties": false,
@@ -395,46 +373,6 @@
           },
           "required": [
             "query"
-          ],
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Replace, insert, or delete a cell in a Jupyter notebook.",
-        "name": "NotebookEdit",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {
-            "cell_id": {
-              "type": "string"
-            },
-            "cell_type": {
-              "enum": [
-                "code",
-                "markdown"
-              ],
-              "type": "string"
-            },
-            "edit_mode": {
-              "enum": [
-                "replace",
-                "insert",
-                "delete"
-              ],
-              "type": "string"
-            },
-            "new_source": {
-              "type": "string"
-            },
-            "notebook_path": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "notebook_path"
           ],
           "type": "object"
         }
@@ -522,30 +460,6 @@
     },
     {
       "function": {
-        "description": "Enable a worktree-local planning mode override and remember the previous local setting for ExitPlanMode.",
-        "name": "EnterPlanMode",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {},
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Restore or clear the worktree-local planning mode override created by EnterPlanMode.",
-        "name": "ExitPlanMode",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {},
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
         "description": "Return structured output in the requested format.",
         "name": "StructuredOutput",
         "parameters": {
@@ -614,7 +528,7 @@
     },
     {
       "function": {
-        "description": "Ask the user a question and wait for their response.",
+        "description": "Unavailable in this environment. Prefer inspecting the workspace or making a reasonable assumption instead of using this tool.",
         "name": "AskUserQuestion",
         "parameters": {
           "additionalProperties": false,
@@ -803,477 +717,6 @@
     },
     {
       "function": {
-        "description": "Create a coding worker boot session with trust-gate and prompt-delivery guards.",
-        "name": "WorkerCreate",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {
-            "auto_recover_prompt_misdelivery": {
-              "type": "boolean"
-            },
-            "cwd": {
-              "type": "string"
-            },
-            "trusted_roots": {
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            }
-          },
-          "required": [
-            "cwd"
-          ],
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Fetch the current worker boot state, last error, and event history.",
-        "name": "WorkerGet",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {
-            "worker_id": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "worker_id"
-          ],
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Feed a terminal snapshot into worker boot detection to resolve trust gates, ready handshakes, and prompt misdelivery.",
-        "name": "WorkerObserve",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {
-            "screen_text": {
-              "type": "string"
-            },
-            "worker_id": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "worker_id",
-            "screen_text"
-          ],
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Resolve a detected trust prompt so worker boot can continue.",
-        "name": "WorkerResolveTrust",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {
-            "worker_id": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "worker_id"
-          ],
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Return the current ready-handshake verdict for a coding worker.",
-        "name": "WorkerAwaitReady",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {
-            "worker_id": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "worker_id"
-          ],
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Send a task prompt only after the worker reaches ready_for_prompt; can replay a recovered prompt.",
-        "name": "WorkerSendPrompt",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {
-            "prompt": {
-              "type": "string"
-            },
-            "worker_id": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "worker_id"
-          ],
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Restart worker boot state after a failed or stale startup.",
-        "name": "WorkerRestart",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {
-            "worker_id": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "worker_id"
-          ],
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Terminate a worker and mark the lane finished from the control plane.",
-        "name": "WorkerTerminate",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {
-            "worker_id": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "worker_id"
-          ],
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Report session completion to the worker, classifyi... <Truncated in logs> ...letes to advance the worker to its terminal state.",
-        "name": "WorkerObserveCompletion",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {
-            "finish_reason": {
-              "type": "string"
-            },
-            "tokens_output": {
-              "minimum": 0,
-              "type": "integer"
-            },
-            "worker_id": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "worker_id",
-            "finish_reason",
-            "tokens_output"
-          ],
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Create a team of sub-agents for parallel task execution.",
-        "name": "TeamCreate",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {
-            "name": {
-              "type": "string"
-            },
-            "tasks": {
-              "items": {
-                "additionalProperties": false,
-                "properties": {
-                  "description": {
-                    "type": "string"
-                  },
-                  "prompt": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "prompt"
-                ],
-                "type": "object"
-              },
-              "type": "array"
-            }
-          },
-          "required": [
-            "name",
-            "tasks"
-          ],
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Delete a team and stop all its running tasks.",
-        "name": "TeamDelete",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {
-            "team_id": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "team_id"
-          ],
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Create a scheduled recurring task.",
-        "name": "CronCreate",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {
-            "description": {
-              "type": "string"
-            },
-            "prompt": {
-              "type": "string"
-            },
-            "schedule": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "schedule",
-            "prompt"
-          ],
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Delete a scheduled recurring task by ID.",
-        "name": "CronDelete",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {
-            "cron_id": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "cron_id"
-          ],
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "List all scheduled recurring tasks.",
-        "name": "CronList",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {},
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Query Language Server Protocol for code intelligence (symbols, references, diagnostics).",
-        "name": "LSP",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {
-            "action": {
-              "enum": [
-                "symbols",
-                "references",
-                "diagnostics",
-                "definition",
-                "hover"
-              ],
-              "type": "string"
-            },
-            "character": {
-              "minimum": 0,
-              "type": "integer"
-            },
-            "line": {
-              "minimum": 0,
-              "type": "integer"
-            },
-            "path": {
-              "type": "string"
-            },
-            "query": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "action"
-          ],
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "List available resources from connected MCP servers.",
-        "name": "ListMcpResources",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {
-            "server": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Read a specific resource from an MCP server by URI.",
-        "name": "ReadMcpResource",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {
-            "server": {
-              "type": "string"
-            },
-            "uri": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "uri"
-          ],
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Authenticate with an MCP server that requires OAuth or credentials.",
-        "name": "McpAuth",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {
-            "server": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "server"
-          ],
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Trigger a remote action or webhook endpoint.",
-        "name": "RemoteTrigger",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {
-            "body": {
-              "type": "string"
-            },
-            "headers": {
-              "additionalProperties": false,
-              "properties": {},
-              "type": "object"
-            },
-            "method": {
-              "enum": [
-                "GET",
-                "POST",
-                "PUT",
-                "DELETE"
-              ],
-              "type": "string"
-            },
-            "url": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "url"
-          ],
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Execute a tool provided by a connected MCP server.",
-        "name": "MCP",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {
-            "arguments": {
-              "additionalProperties": false,
-              "properties": {},
-              "type": "object"
-            },
-            "server": {
-              "type": "string"
-            },
-            "tool": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "server",
-            "tool"
-          ],
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
         "description": "Access the memory pool which stores all user messages and LLM outputs from the current session. Use action 'list' to retrieve recent entries (with optional limit), 'search' to find entries matching a query string, or 'count' to get the total number of entries.",
         "name": "memory_pool",
         "parameters": {
@@ -1302,26 +745,7 @@
     },
     {
       "function": {
-        "description": "Test-only tool for verifying permission enforcement behavior.",
-        "name": "TestingPermission",
-        "parameters": {
-          "additionalProperties": false,
-          "properties": {
-            "action": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "action"
-          ],
-          "type": "object"
-        }
-      },
-      "type": "function"
-    },
-    {
-      "function": {
-        "description": "Spawn a new LLM subagent with a defined role, model, and system prompt. Spawned workers can use their allowed tools and self-message for short internal reasoning loops, but only managers can delegate across agents.",
+        "description": "Create a subagent; it stays idle until you pass `initial_message` here or call `send_message` with its `agent_id`.",
         "name": "spawn_agent",
         "parameters": {
           "additionalProperties": false,
@@ -1349,6 +773,14 @@
                 "type": "string"
               },
               "type": "array"
+            },
+            "initial_message": {
+              "description": "Optional first user message for the newly spawned agent.",
+              "type": "string"
+            },
+            "await_reply": {
+              "description": "Whether to execute that first message immediately and wait for the reply. Defaults to true.",
+              "type": "boolean"
             },
             "metadata": {
               "description": "Arbitrary key-value pairs to attach to the agent for routing or bookkeeping.",
@@ -1554,11 +986,11 @@
     },
     {
       "function": {
-        "description": "Send the same message to multiple agents simultaneously, triggering parallel inference. Returns a map of agent_id -> reply (or status if await_reply is false). Use this to fan out a question or task to a panel of specialists.",
+        "description": "Send the same message to multiple agents simultaneously. By default this waits for concrete replies from each agent; set `await_reply` to false only when you explicitly want queue-only delivery.",
         "name": "broadcast_message",
         "parameters": {
           "additionalProperties": false,
-          "properties": {
+        "properties": {
             "agent_ids": {
               "description": "List of agent IDs to receive the message. Pass ['*'] to target every active agent.",
               "items": {
@@ -1571,10 +1003,10 @@
               "description": "Text content of the message to send to all targets.",
               "type": "string"
             },
-            "await_reply": {
-              "description": "If true, wait for all agents to respond before returning. Defaults to false for large broadcasts.",
-              "type": "boolean"
-            },
+          "await_reply": {
+            "description": "If true, wait for all agents to respond before returning. Defaults to true.",
+            "type": "boolean"
+          },
             "timeout_ms": {
               "description": "Maximum milliseconds to wait per agent when await_reply is true.",
               "minimum": 100,

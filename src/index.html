@@ -246,6 +246,26 @@
       .tool-status.pending { color: #aaa; }
       .tool-status.done    { color: #34c759; }
       .tool-status.error   { color: #c00; }
+      .tool-item.semantic-hit {
+        border-left-color: #2aa198;
+        background: rgba(42,161,152,0.08);
+      }
+      .tool-item.semantic-hit .tool-icon,
+      .tool-item.semantic-hit .tool-name {
+        color: #2aa198;
+      }
+      .tool-badge {
+        display: inline-flex; align-items: center;
+        padding: 1px 7px; border-radius: 10px;
+        font-size: 0.65rem; font-weight: 700;
+        letter-spacing: 0.02em;
+        border: 1px solid transparent;
+      }
+      .tool-badge.semantic {
+        color: #0b5d56;
+        background: rgba(42,161,152,0.14);
+        border-color: rgba(42,161,152,0.22);
+      }
       .tool-detail {
         display: none; padding: 6px 8px; border-top: 1px solid rgba(0,0,0,0.08);
         font-family: monospace; font-size: 0.72rem; white-space: pre-wrap;
@@ -255,6 +275,20 @@
       .tool-item.expanded .tool-detail { display: block; }
       .tool-detail-label { font-weight: 700; color: #888; font-size: 0.68rem;
         text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 2px; }
+      .bubble-signal {
+        display: none;
+        margin: 0 0 6px;
+        padding: 6px 8px;
+        border-radius: 8px;
+        font-size: 0.74rem;
+        line-height: 1.35;
+      }
+      .bubble-signal.active { display: block; }
+      .bubble-signal.semantic {
+        background: rgba(42,161,152,0.10);
+        color: #0b5d56;
+        border: 1px solid rgba(42,161,152,0.20);
+      }
 
       /* ── Manager badge ── */
       .manager-badge {
@@ -319,6 +353,8 @@
           </div>
           <div id="agents-list"></div>
           <div id="command-policy-section" style="margin-top:20px;padding:14px 16px;background:#f0f4ff;border:1px solid #c8d8ff;border-radius:8px;"></div>
+          <div id="redundancy-detection-section" style="margin-top:20px;padding:14px 16px;background:#f5fff3;border:1px solid #cfe9c8;border-radius:8px;"></div>
+          <div id="behavior-triggers-section" style="margin-top:20px;padding:14px 16px;background:#fff7ef;border:1px solid #f0d4b8;border-radius:8px;"></div>
         </div>
       </div>
 
