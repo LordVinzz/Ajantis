@@ -7,6 +7,8 @@ use crate::state::AppState;
 pub(crate) const COMMAND_HISTORY_LIMIT: usize = 50;
 pub(crate) const COMMAND_HISTORY_CONTEXT_LIMIT: usize = 10;
 const COMMAND_RESULT_CHAR_LIMIT: usize = 4_000;
+const MEMORY_ENTRY_LIMIT: usize = 400;
+const MEMORY_ENTRY_CHAR_LIMIT: usize = 16_000;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct MemoryEntry {
@@ -45,17 +47,24 @@ impl MemoryPool {
             agent_id: agent_id.to_string(),
             agent_name: agent_name.to_string(),
             role: role.to_string(),
-            content: content.to_string(),
+            content: truncate_chars(content, MEMORY_ENTRY_CHAR_LIMIT),
         });
+        if self.entries.len() > MEMORY_ENTRY_LIMIT {
+            let overflow = self.entries.len() - MEMORY_ENTRY_LIMIT;
+            self.entries.drain(0..overflow);
+        }
     }
 
     pub(crate) fn search(&self, query: &str) -> Vec<&MemoryEntry> {
         let q = query.to_lowercase();
-        self.entries.iter().filter(|e| {
-            e.content.to_lowercase().contains(&q)
-                || e.agent_name.to_lowercase().contains(&q)
-                || e.role.to_lowercase().contains(&q)
-        }).collect()
+        self.entries
+            .iter()
+            .filter(|e| {
+                e.content.to_lowercase().contains(&q)
+                    || e.agent_name.to_lowercase().contains(&q)
+                    || e.role.to_lowercase().contains(&q)
+            })
+            .collect()
     }
 }
 
@@ -114,7 +123,11 @@ impl CommandHistory {
                     if entry.success { "ok" } else { "error" },
                     entry.cwd,
                     entry.command,
-                    if preview.is_empty() { "[no output]".to_string() } else { preview }
+                    if preview.is_empty() {
+                        "[no output]".to_string()
+                    } else {
+                        preview
+                    }
                 )
             })
             .collect::<Vec<_>>()
@@ -133,7 +146,9 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 }
 
 #[tauri::command]
-pub(crate) async fn get_memory_pool(state: tauri::State<'_, Arc<AppState>>) -> Result<MemoryPool, String> {
+pub(crate) async fn get_memory_pool(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<MemoryPool, String> {
     Ok(state.memory_pool.lock().unwrap().clone())
 }
 
@@ -180,7 +195,9 @@ pub(crate) async fn search_memory_pool(
 }
 
 #[tauri::command]
-pub(crate) async fn clear_memory_pool(state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+pub(crate) async fn clear_memory_pool(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
     state.memory_pool.lock().unwrap().entries.clear();
     Ok(())
 }

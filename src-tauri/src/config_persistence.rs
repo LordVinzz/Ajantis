@@ -28,6 +28,8 @@ pub(crate) fn load_agent_config_from_disk(workspace_root: &PathBuf) -> AgentConf
     let path = config_path(workspace_root);
     let mut missing_redundancy_config = false;
     let mut missing_behavior_triggers = false;
+    let mut missing_run_budgets = false;
+    let mut parsed_config = None;
     let config = if path.exists() {
         fs::read_to_string(&path)
             .ok()
@@ -36,8 +38,10 @@ pub(crate) fn load_agent_config_from_disk(workspace_root: &PathBuf) -> AgentConf
                     .ok()
                     .and_then(|value| value.as_object().cloned())
                     .unwrap_or_default();
+                parsed_config = Some(parsed.clone());
                 missing_redundancy_config = !parsed.contains_key("redundancy_detection");
                 missing_behavior_triggers = !parsed.contains_key("behavior_triggers");
+                missing_run_budgets = !parsed.contains_key("run_budgets");
                 serde_json::from_str(&content).unwrap_or_default()
             })
             .unwrap_or_default()
@@ -45,8 +49,18 @@ pub(crate) fn load_agent_config_from_disk(workspace_root: &PathBuf) -> AgentConf
         AgentConfig::default()
     };
 
-    let (normalized, changed) = normalize_agent_config(config);
-    let changed = changed || missing_redundancy_config || missing_behavior_triggers;
+    let mut config = config;
+    let mut changed = parsed_config
+        .as_ref()
+        .map(|parsed| hydrate_grounded_audit_behavior(&mut config, parsed))
+        .unwrap_or(false);
+    let (normalized, normalized_changed) = normalize_agent_config(config);
+    changed =
+        changed
+            || normalized_changed
+            || missing_redundancy_config
+            || missing_behavior_triggers
+            || missing_run_budgets;
     if changed {
         let _ = write_agent_config_to_disk(workspace_root, &normalized);
     }
@@ -56,8 +70,10 @@ pub(crate) fn load_agent_config_from_disk(workspace_root: &PathBuf) -> AgentConf
 fn normalize_agent_config(mut config: AgentConfig) -> (AgentConfig, bool) {
     let mut changed = false;
     let threshold = config.redundancy_detection.semantic_similarity_threshold;
-    let normalized_threshold = threshold
-        .clamp(MIN_SEMANTIC_SIMILARITY_THRESHOLD, MAX_SEMANTIC_SIMILARITY_THRESHOLD);
+    let normalized_threshold = threshold.clamp(
+        MIN_SEMANTIC_SIMILARITY_THRESHOLD,
+        MAX_SEMANTIC_SIMILARITY_THRESHOLD,
+    );
     if (normalized_threshold - threshold).abs() > f32::EPSILON {
         config.redundancy_detection.semantic_similarity_threshold = normalized_threshold;
         changed = true;
@@ -104,10 +120,75 @@ fn normalize_agent_config(mut config: AgentConfig) -> (AgentConfig, bool) {
     (config, changed)
 }
 
-fn write_agent_config_to_disk(workspace_root: &PathBuf, config: &AgentConfig) -> Result<(), String> {
+fn hydrate_grounded_audit_behavior(
+    config: &mut AgentConfig,
+    parsed: &serde_json::Map<String, Value>,
+) -> bool {
+    let Some(behaviors) = parsed
+        .get("behavior_triggers")
+        .and_then(|value| value.get("behaviors"))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+
+    let mut changed = false;
+    for behavior in &mut config.behavior_triggers.behaviors {
+        if behavior.behavior_id != GROUNDED_AUDIT_BEHAVIOR_ID {
+            continue;
+        }
+        let raw_behavior = behaviors.iter().find(|value| {
+            value.get("behavior_id").and_then(Value::as_str) == Some(GROUNDED_AUDIT_BEHAVIOR_ID)
+        });
+        let Some(raw_behavior) = raw_behavior.and_then(Value::as_object) else {
+            continue;
+        };
+        let needs_hydration = [
+            "system_prompt_injection",
+            "runtime_note_enabled",
+            "runtime_note_template",
+            "coverage_manifest",
+            "required_sections",
+            "section_rules",
+            "response_rewrite",
+            "evidence_grading",
+            "force_synthesis",
+            "delegation_validation",
+            "tool_burst_reflection",
+            "non_progress",
+        ]
+        .iter()
+        .any(|key| !raw_behavior.contains_key(*key));
+        if !needs_hydration {
+            continue;
+        }
+
+        let defaults = BehaviorTriggerConfig::default_grounded_audit();
+        behavior.system_prompt_injection = defaults.system_prompt_injection;
+        behavior.runtime_note_enabled = defaults.runtime_note_enabled;
+        behavior.runtime_note_template = defaults.runtime_note_template;
+        behavior.coverage_manifest = defaults.coverage_manifest;
+        behavior.required_sections = defaults.required_sections;
+        behavior.section_rules = defaults.section_rules;
+        behavior.response_rewrite = defaults.response_rewrite;
+        behavior.evidence_grading = defaults.evidence_grading;
+        behavior.force_synthesis = defaults.force_synthesis;
+        behavior.delegation_validation = defaults.delegation_validation;
+        behavior.tool_burst_reflection = defaults.tool_burst_reflection;
+        behavior.non_progress = defaults.non_progress;
+        changed = true;
+    }
+
+    changed
+}
+
+fn write_agent_config_to_disk(
+    workspace_root: &PathBuf,
+    config: &AgentConfig,
+) -> Result<(), String> {
     let path = config_path(workspace_root);
-    let json = serde_json::to_string_pretty(config)
-        .map_err(|e| format!("Serialization failed: {}", e))?;
+    let json =
+        serde_json::to_string_pretty(config).map_err(|e| format!("Serialization failed: {}", e))?;
     fs::write(&path, json).map_err(|e| format!("Failed to write config: {}", e))
 }
 
@@ -135,8 +216,60 @@ pub(crate) async fn save_agent_config(
 }
 
 #[tauri::command]
-pub(crate) async fn load_agent_config(state: tauri::State<'_, Arc<AppState>>) -> Result<AgentConfig, String> {
+pub(crate) async fn load_agent_config(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<AgentConfig, String> {
     let config = load_agent_config_from_disk(&state.workspace_root);
     *state.agent_config.lock().unwrap() = config.clone();
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hydrates_old_grounded_audit_entries_with_new_defaults() {
+        let raw = serde_json::json!({
+            "agents": [{
+                "id": "user",
+                "name": "User",
+                "type": "user",
+                "armed": true,
+                "is_manager": false
+            }],
+            "connections": [],
+            "behavior_triggers": {
+                "behaviors": [{
+                    "behavior_id": "grounded_audit",
+                    "enabled": true,
+                    "keyword_triggers": ["security audit"],
+                    "embedding_trigger_phrases": [],
+                    "similarity_threshold": null
+                }]
+            }
+        });
+        let parsed = raw.as_object().cloned().unwrap();
+        let mut config: AgentConfig = serde_json::from_value(raw).unwrap();
+
+        assert!(config.behavior_triggers.behaviors[0]
+            .system_prompt_injection
+            .is_none());
+
+        let changed = hydrate_grounded_audit_behavior(&mut config, &parsed);
+
+        assert!(changed);
+        let behavior = &config.behavior_triggers.behaviors[0];
+        assert!(behavior.runtime_note_enabled);
+        assert!(behavior.coverage_manifest.enabled);
+        assert_eq!(
+            behavior.required_sections,
+            vec![
+                "Confirmed findings".to_string(),
+                "Hypotheses / lower-confidence risks".to_string(),
+                "Coverage gaps".to_string()
+            ]
+        );
+        assert_eq!(behavior.non_progress.limit, Some(4));
+    }
 }

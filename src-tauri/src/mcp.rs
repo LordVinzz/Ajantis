@@ -14,16 +14,16 @@ use std::sync::{Arc, Mutex};
 use tauri::ipc::Channel;
 use tower_http::cors::CorsLayer;
 
-use crate::agent_config::{Agent, AgentConfig, AgentLoadConfig, GROUNDED_AUDIT_BEHAVIOR_ID};
-use crate::chat::{call_chat_blocking, StreamEvent};
+use crate::agent_config::{resolve_audit_behavior_config, Agent, AgentConfig, AgentLoadConfig};
+use crate::chat::{call_chat_blocking, validate_audit_worker_response, StreamEvent};
 use crate::config_persistence::ajantis_dir;
 use crate::helpers::{
-    apply_runtime_agent_context, audit_response_acknowledges_refs, compute_context_budget,
-    extract_explicit_audit_refs, is_low_value_audit_response, is_manager_blocked_tool,
-    is_manager_only_tool, resolve_active_behaviors,
+    apply_runtime_agent_context, compute_context_budget, extract_explicit_audit_refs,
+    is_manager_blocked_tool, is_manager_only_tool, resolve_active_behaviors,
 };
 use crate::memory::{CommandExecution, CommandHistory, MemoryEntry, MemoryPool};
 use crate::models::fetch_models;
+use crate::runs::{primary_run_id, ActiveRuns};
 use crate::state::{BehaviorTriggerCache, McpTool};
 
 // ── Background task tracking ───────────────────────────────────────
@@ -67,6 +67,8 @@ pub(crate) struct McpState {
     pub(crate) behavior_trigger_cache: Arc<Mutex<BehaviorTriggerCache>>,
     /// Active built-in behaviors for turns currently executing through the tool loop.
     pub(crate) active_behavior_contexts: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    /// Active routed runs available to tool handlers for event emission and resumption.
+    pub(crate) active_runs: ActiveRuns,
 }
 
 #[derive(Deserialize)]
@@ -189,7 +191,9 @@ pub(crate) async fn handle_tool_call(
         // ── File system ───────────────────────────────────────────
         "bash" => {
             let command = args["command"].as_str().unwrap_or("").trim().to_string();
-            if command.is_empty() { return mcp_error("Error: command is required."); }
+            if command.is_empty() {
+                return mcp_error("Error: command is required.");
+            }
             if let Err(reason) = check_command_sandbox(&command, &sandbox, state) {
                 return mcp_error(&reason);
             }
@@ -198,19 +202,24 @@ pub(crate) async fn handle_tool_call(
             if let Some(cached) = reuse_cached_command(state, "bash", &normalized, &cwd) {
                 let reused = format!(
                     "[cached result reused | tool: bash | cwd: {} | command: {}]\n{}",
-                    cwd,
-                    command,
-                    cached.result
+                    cwd, command, cached.result
                 );
                 return mcp_ok(&reused);
             }
-            match Command::new("bash").arg("-lc").arg(&command)
-                .current_dir(&sandbox).output()
+            match Command::new("bash")
+                .arg("-lc")
+                .arg(&command)
+                .current_dir(&sandbox)
+                .output()
             {
                 Ok(out) => {
                     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    let text = if stderr.is_empty() { stdout } else { format!("{}\n{}", stdout, stderr) };
+                    let text = if stderr.is_empty() {
+                        stdout
+                    } else {
+                        format!("{}\n{}", stdout, stderr)
+                    };
                     remember_command_result(
                         state,
                         "bash",
@@ -218,16 +227,26 @@ pub(crate) async fn handle_tool_call(
                         &normalized,
                         &cwd,
                         out.status.success(),
-                        if text.is_empty() { "[no output]" } else { &text },
+                        if text.is_empty() {
+                            "[no output]"
+                        } else {
+                            &text
+                        },
                     );
-                    mcp_ok(if text.is_empty() { "[no output]" } else { &text })
+                    mcp_ok(if text.is_empty() {
+                        "[no output]"
+                    } else {
+                        &text
+                    })
                 }
                 Err(e) => mcp_error(&format!("Error: {}", e)),
             }
         }
         "read_file" => {
             let file_path = args["path"].as_str().unwrap_or("");
-            if file_path.is_empty() { return mcp_error("Error: path is required."); }
+            if file_path.is_empty() {
+                return mcp_error("Error: path is required.");
+            }
             let abs = match resolve_allowed_path(file_path, &sandbox) {
                 Ok(path) => path,
                 Err(reason) => return mcp_error(&reason),
@@ -239,12 +258,14 @@ pub(crate) async fn handle_tool_call(
                 Ok(data) => {
                     let scope = args["scope"].as_str();
                     let offset = args["offset"].as_u64().unwrap_or(0) as usize;
-                    let requested_limit = args["limit"].as_u64().map(|l| l as usize).unwrap_or(4_000);
+                    let requested_limit =
+                        args["limit"].as_u64().map(|l| l as usize).unwrap_or(4_000);
                     let hard_limit = requested_limit.min(4_000);
-                    let (slice, scope_label) = match extract_file_scope(&data, scope, offset, hard_limit) {
-                        Ok(result) => result,
-                        Err(reason) => return mcp_error(&reason),
-                    };
+                    let (slice, scope_label) =
+                        match extract_file_scope(&data, scope, offset, hard_limit) {
+                            Ok(result) => result,
+                            Err(reason) => return mcp_error(&reason),
+                        };
                     let cache_key = format!("{}::{}", abs.to_string_lossy(), scope_label);
                     if let Some(agent_id) = caller_agent_id {
                         let mut cache = state.read_cache.lock().unwrap();
@@ -269,12 +290,16 @@ pub(crate) async fn handle_tool_call(
         "write_file" => {
             let file_path = args["path"].as_str().unwrap_or("");
             let content = args["content"].as_str().unwrap_or("");
-            if file_path.is_empty() { return mcp_error("Error: path is required."); }
+            if file_path.is_empty() {
+                return mcp_error("Error: path is required.");
+            }
             let abs = match resolve_allowed_path(file_path, &sandbox) {
                 Ok(path) => path,
                 Err(reason) => return mcp_error(&reason),
             };
-            if let Some(parent) = abs.parent() { let _ = fs::create_dir_all(parent); }
+            if let Some(parent) = abs.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
             match fs::write(&abs, content) {
                 Ok(_) => mcp_ok("File written successfully."),
                 Err(e) => mcp_error(&format!("Error writing file: {}", e)),
@@ -285,15 +310,20 @@ pub(crate) async fn handle_tool_call(
             let old_str = args["old_string"].as_str().unwrap_or("");
             let new_str = args["new_string"].as_str().unwrap_or("");
             let replace_all = args["replace_all"].as_bool().unwrap_or(false);
-            if file_path.is_empty() { return mcp_error("Error: path is required."); }
+            if file_path.is_empty() {
+                return mcp_error("Error: path is required.");
+            }
             let abs = match resolve_allowed_path(file_path, &sandbox) {
                 Ok(path) => path,
                 Err(reason) => return mcp_error(&reason),
             };
             match fs::read_to_string(&abs) {
                 Ok(data) => {
-                    let result = if replace_all { data.replace(old_str, new_str) }
-                                 else { data.replacen(old_str, new_str, 1) };
+                    let result = if replace_all {
+                        data.replace(old_str, new_str)
+                    } else {
+                        data.replacen(old_str, new_str, 1)
+                    };
                     match fs::write(&abs, result) {
                         Ok(_) => mcp_ok("File edited successfully."),
                         Err(e) => mcp_error(&format!("Error editing file: {}", e)),
@@ -304,7 +334,9 @@ pub(crate) async fn handle_tool_call(
         }
         "glob_search" => {
             let pattern = args["pattern"].as_str().unwrap_or("");
-            if pattern.is_empty() { return mcp_error("Error: pattern is required."); }
+            if pattern.is_empty() {
+                return mcp_error("Error: pattern is required.");
+            }
             let base = match args["path"].as_str() {
                 Some(path) => match resolve_allowed_path(path, &sandbox) {
                     Ok(base) => base,
@@ -348,7 +380,9 @@ pub(crate) async fn handle_tool_call(
         }
         "grep_search" => {
             let pattern = args["pattern"].as_str().unwrap_or("");
-            if pattern.is_empty() { return mcp_error("Error: pattern is required."); }
+            if pattern.is_empty() {
+                return mcp_error("Error: pattern is required.");
+            }
             let search_path = match args["path"].as_str() {
                 Some(path) => match resolve_allowed_path(path, &sandbox) {
                     Ok(path) => path,
@@ -368,7 +402,9 @@ pub(crate) async fn handle_tool_call(
             let case_flag = args["-i"].as_bool().unwrap_or(false);
             let mut cmd = Command::new("rg");
             cmd.arg("--no-heading").arg("-n");
-            if case_flag { cmd.arg("-i"); }
+            if case_flag {
+                cmd.arg("-i");
+            }
             if let Some(glob_pat) = glob_pat {
                 cmd.arg("--glob").arg(glob_pat);
             }
@@ -395,8 +431,13 @@ pub(crate) async fn handle_tool_call(
             match cmd.output().or_else(|_| {
                 let mut fallback = Command::new("grep");
                 fallback.arg("-r").arg("-n");
-                if case_flag { fallback.arg("-i"); }
-                fallback.arg(pattern).arg(&search_path).current_dir(&sandbox);
+                if case_flag {
+                    fallback.arg("-i");
+                }
+                fallback
+                    .arg(pattern)
+                    .arg(&search_path)
+                    .current_dir(&sandbox);
                 fallback.output()
             }) {
                 Ok(out) => {
@@ -436,19 +477,33 @@ pub(crate) async fn handle_tool_call(
             match action {
                 "search" => {
                     let query = args["query"].as_str().unwrap_or("");
-                    if query.is_empty() { return mcp_error("Error: query is required for search."); }
+                    if query.is_empty() {
+                        return mcp_error("Error: query is required for search.");
+                    }
                     let results: Vec<&MemoryEntry> = pool.search(query);
                     let j = serde_json::to_string_pretty(&results).unwrap_or_default();
                     mcp_ok(&format!("Found {} entries:\n{}", results.len(), j))
                 }
                 "list" => {
                     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
-                    let entries: Vec<&MemoryEntry> = pool.entries.iter().rev().take(limit).collect();
+                    let entries: Vec<&MemoryEntry> =
+                        pool.entries.iter().rev().take(limit).collect();
                     let j = serde_json::to_string_pretty(&entries).unwrap_or_default();
-                    mcp_ok(&format!("{} entries (showing last {}):\n{}", pool.entries.len(), entries.len(), j))
+                    mcp_ok(&format!(
+                        "{} entries (showing last {}):\n{}",
+                        pool.entries.len(),
+                        entries.len(),
+                        j
+                    ))
                 }
-                "count" => mcp_ok(&format!("Memory pool contains {} entries.", pool.entries.len())),
-                _ => mcp_error(&format!("Unknown action '{}'. Use: list, search, count.", action)),
+                "count" => mcp_ok(&format!(
+                    "Memory pool contains {} entries.",
+                    pool.entries.len()
+                )),
+                _ => mcp_error(&format!(
+                    "Unknown action '{}'. Use: list, search, count.",
+                    action
+                )),
             }
         }
         // ── Manager tools ─────────────────────────────────────────
@@ -467,8 +522,11 @@ pub(crate) async fn handle_tool_call(
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
             let await_reply = args["await_reply"].as_bool().unwrap_or(true);
-            let allowed_tools = args["tools"].as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect::<Vec<_>>());
+            let allowed_tools = args["tools"].as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            });
 
             let agent_id = match spawn_agent_record(
                 state,
@@ -478,7 +536,9 @@ pub(crate) async fn handle_tool_call(
                 requested_model,
                 ctx_limit,
                 allowed_tools,
-            ).await {
+            )
+            .await
+            {
                 Ok(agent_id) => agent_id,
                 Err(err) => return mcp_error(&err),
             };
@@ -507,9 +567,13 @@ pub(crate) async fn handle_tool_call(
         }
         "send_message" => {
             let agent_id = args["agent_id"].as_str().unwrap_or("");
-            let content  = args["content"].as_str().unwrap_or("");
-            if agent_id.is_empty() { return mcp_error("Error: agent_id is required."); }
-            if content.is_empty()  { return mcp_error("Error: content is required."); }
+            let content = args["content"].as_str().unwrap_or("");
+            if agent_id.is_empty() {
+                return mcp_error("Error: agent_id is required.");
+            }
+            if content.is_empty() {
+                return mcp_error("Error: content is required.");
+            }
             let await_reply = args["await_reply"].as_bool().unwrap_or(true);
             if let Err(reason) = enforce_send_message_target(caller_agent_id, agent_id, state) {
                 return mcp_error(&reason);
@@ -530,30 +594,41 @@ pub(crate) async fn handle_tool_call(
         }
         "read_agent_messages" => {
             let agent_id = args["agent_id"].as_str().unwrap_or("");
-            if agent_id.is_empty() { return mcp_error("Error: agent_id is required."); }
+            if agent_id.is_empty() {
+                return mcp_error("Error: agent_id is required.");
+            }
             if let Err(reason) = enforce_agent_introspection(caller_agent_id, agent_id, state) {
                 return mcp_error(&reason);
             }
 
             let roles_filter: Option<Vec<String>> = args["roles"].as_array().map(|arr| {
-                arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
             });
-            let limit  = args["limit"].as_u64().map(|l| l as usize);
+            let limit = args["limit"].as_u64().map(|l| l as usize);
             let offset = args["offset"].as_u64().unwrap_or(0) as usize;
 
             let pool = state.memory_pool.lock().unwrap();
-            let filtered: Vec<&MemoryEntry> = pool.entries.iter()
+            let filtered: Vec<&MemoryEntry> = pool
+                .entries
+                .iter()
                 .filter(|e| e.agent_id == agent_id)
-                .filter(|e| roles_filter.as_ref()
-                    .map(|rf| rf.iter().any(|r| r == &e.role))
-                    .unwrap_or(true))
+                .filter(|e| {
+                    roles_filter
+                        .as_ref()
+                        .map(|rf| rf.iter().any(|r| r == &e.role))
+                        .unwrap_or(true)
+                })
                 .collect();
-            let history_json: Vec<Value> = filtered.iter()
+            let history_json: Vec<Value> = filtered
+                .iter()
                 .map(|e| json!({"role": e.role, "content": e.content}))
                 .collect();
 
             let total = filtered.len();
-            let page: Vec<&MemoryEntry> = filtered.into_iter()
+            let page: Vec<&MemoryEntry> = filtered
+                .into_iter()
                 .skip(offset)
                 .take(limit.unwrap_or(usize::MAX))
                 .collect();
@@ -573,31 +648,55 @@ pub(crate) async fn handle_tool_call(
         }
         "list_agents" => {
             let status_filter: Option<Vec<String>> = args["status_filter"].as_array().map(|arr| {
-                arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
             });
             let role_filter = args["role_filter"].as_str();
 
             let config = state.agent_config.lock().unwrap();
-            let pool   = state.memory_pool.lock().unwrap();
+            let pool = state.memory_pool.lock().unwrap();
 
-            let agents: Vec<Value> = config.agents.iter()
+            let agents: Vec<Value> = config
+                .agents
+                .iter()
                 .filter(|a| a.agent_type != "user")
                 .filter(|a| !a.is_manager) // exclude self — manager must not call itself via send_message
-                .filter(|a| role_filter.map(|r| a.name.contains(r)
-                    || a.role.as_deref().unwrap_or("").contains(r)).unwrap_or(true))
+                .filter(|a| {
+                    role_filter
+                        .map(|r| a.name.contains(r) || a.role.as_deref().unwrap_or("").contains(r))
+                        .unwrap_or(true)
+                })
                 .filter_map(|a| {
-                    let status = if !a.armed { "done" } else if a.paused { "paused" } else { "idle" };
-                    if status_filter.as_ref().map(|sf| sf.iter().any(|s| s == status)).unwrap_or(false)
+                    let status = if !a.armed {
+                        "done"
+                    } else if a.paused {
+                        "paused"
+                    } else {
+                        "idle"
+                    };
+                    if status_filter
+                        .as_ref()
+                        .map(|sf| sf.iter().any(|s| s == status))
+                        .unwrap_or(false)
                         && status_filter.is_some()
-                        && !status_filter.as_ref().unwrap().iter().any(|s| s == status) {
+                        && !status_filter.as_ref().unwrap().iter().any(|s| s == status)
+                    {
                         return None;
                     }
                     let msg_count = pool.entries.iter().filter(|e| e.agent_id == a.id).count();
-                    let last_preview = pool.entries.iter().rev()
+                    let last_preview = pool
+                        .entries
+                        .iter()
+                        .rev()
                         .find(|e| e.agent_id == a.id && e.role == "assistant")
                         .map(|e| e.content.chars().take(120).collect::<String>());
-                    let history_json: Vec<Value> = pool.entries.iter()
-                        .filter(|e| e.agent_id == a.id && (e.role == "user" || e.role == "assistant"))
+                    let history_json: Vec<Value> = pool
+                        .entries
+                        .iter()
+                        .filter(|e| {
+                            e.agent_id == a.id && (e.role == "user" || e.role == "assistant")
+                        })
                         .map(|e| json!({"role": e.role, "content": e.content}))
                         .collect();
                     let budget = compute_context_budget(
@@ -628,12 +727,17 @@ pub(crate) async fn handle_tool_call(
                 })
                 .collect();
 
-            mcp_ok(&format!("{} agents:\n{}", agents.len(),
-                serde_json::to_string_pretty(&agents).unwrap_or_default()))
+            mcp_ok(&format!(
+                "{} agents:\n{}",
+                agents.len(),
+                serde_json::to_string_pretty(&agents).unwrap_or_default()
+            ))
         }
         "get_agent_state" => {
             let agent_id = args["agent_id"].as_str().unwrap_or("");
-            if agent_id.is_empty() { return mcp_error("Error: agent_id is required."); }
+            if agent_id.is_empty() {
+                return mcp_error("Error: agent_id is required.");
+            }
             if let Err(reason) = enforce_agent_introspection(caller_agent_id, agent_id, state) {
                 return mcp_error(&reason);
             }
@@ -643,12 +747,25 @@ pub(crate) async fn handle_tool_call(
                 None => mcp_error(&format!("Error: agent '{}' not found.", agent_id)),
                 Some(a) => {
                     let pool = state.memory_pool.lock().unwrap();
-                    let messages: Vec<&MemoryEntry> = pool.entries.iter()
-                        .filter(|e| e.agent_id == agent_id).collect();
-                    let last_output = messages.iter().rev()
-                        .find(|e| e.role == "assistant").map(|e| e.content.clone());
-                    let status = if !a.armed { "done" } else if a.paused { "paused" } else { "idle" };
-                    let history_json: Vec<Value> = messages.iter()
+                    let messages: Vec<&MemoryEntry> = pool
+                        .entries
+                        .iter()
+                        .filter(|e| e.agent_id == agent_id)
+                        .collect();
+                    let last_output = messages
+                        .iter()
+                        .rev()
+                        .find(|e| e.role == "assistant")
+                        .map(|e| e.content.clone());
+                    let status = if !a.armed {
+                        "done"
+                    } else if a.paused {
+                        "paused"
+                    } else {
+                        "idle"
+                    };
+                    let history_json: Vec<Value> = messages
+                        .iter()
                         .filter(|e| e.role == "user" || e.role == "assistant")
                         .map(|e| json!({"role": e.role, "content": e.content}))
                         .collect();
@@ -674,63 +791,100 @@ pub(crate) async fn handle_tool_call(
         }
         "kill_agent" => {
             let agent_id = args["agent_id"].as_str().unwrap_or("");
-            if agent_id.is_empty() { return mcp_error("Error: agent_id is required."); }
+            if agent_id.is_empty() {
+                return mcp_error("Error: agent_id is required.");
+            }
             let reason = args["reason"].as_str().unwrap_or("terminated by manager");
             let mut config = state.agent_config.lock().unwrap();
             match config.agents.iter_mut().find(|a| a.id == agent_id) {
                 None => mcp_error(&format!("Error: agent '{}' not found.", agent_id)),
-                Some(a) => { a.armed = false; mcp_ok(&format!("Agent '{}' terminated. Reason: {}", agent_id, reason)) }
+                Some(a) => {
+                    a.armed = false;
+                    mcp_ok(&format!(
+                        "Agent '{}' terminated. Reason: {}",
+                        agent_id, reason
+                    ))
+                }
             }
         }
         "pause_agent" => {
             let agent_id = args["agent_id"].as_str().unwrap_or("");
-            if agent_id.is_empty() { return mcp_error("Error: agent_id is required."); }
+            if agent_id.is_empty() {
+                return mcp_error("Error: agent_id is required.");
+            }
             let mut config = state.agent_config.lock().unwrap();
             match config.agents.iter_mut().find(|a| a.id == agent_id) {
                 None => mcp_error(&format!("Error: agent '{}' not found.", agent_id)),
-                Some(a) => { a.paused = true; mcp_ok(&format!("Agent '{}' paused.", agent_id)) }
+                Some(a) => {
+                    a.paused = true;
+                    mcp_ok(&format!("Agent '{}' paused.", agent_id))
+                }
             }
         }
         "resume_agent" => {
             let agent_id = args["agent_id"].as_str().unwrap_or("");
-            if agent_id.is_empty() { return mcp_error("Error: agent_id is required."); }
+            if agent_id.is_empty() {
+                return mcp_error("Error: agent_id is required.");
+            }
             let mut config = state.agent_config.lock().unwrap();
             match config.agents.iter_mut().find(|a| a.id == agent_id) {
                 None => mcp_error(&format!("Error: agent '{}' not found.", agent_id)),
-                Some(a) => { a.paused = false; mcp_ok(&format!("Agent '{}' resumed.", agent_id)) }
+                Some(a) => {
+                    a.paused = false;
+                    mcp_ok(&format!("Agent '{}' resumed.", agent_id))
+                }
             }
         }
         "broadcast_message" => {
             let content = args["content"].as_str().unwrap_or("");
-            if content.is_empty() { return mcp_error("Error: content is required."); }
+            if content.is_empty() {
+                return mcp_error("Error: content is required.");
+            }
             let await_reply = args["await_reply"].as_bool().unwrap_or(true);
 
             let raw_ids: Vec<String> = match args["agent_ids"].as_array() {
                 None => return mcp_error("Error: agent_ids is required."),
-                Some(arr) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+                Some(arr) => arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect(),
             };
 
             // Resolve targets (extract ids while holding lock, then release)
             let targets: Vec<String> = {
                 let config = state.agent_config.lock().unwrap();
                 let ids: Vec<String> = if raw_ids.len() == 1 && raw_ids[0] == "*" {
-                    config.agents.iter()
+                    config
+                        .agents
+                        .iter()
                         .filter(|a| a.agent_type != "user" && !a.is_manager && a.armed && !a.paused)
-                        .map(|a| a.id.clone()).collect()
-                } else { raw_ids };
-                ids.into_iter().filter_map(|id| {
-                    config.agents.iter()
-                        .find(|a| a.id == id && a.armed && !a.paused && a.model_key.is_some())
-                        .map(|_| id)
-                }).collect()
+                        .map(|a| a.id.clone())
+                        .collect()
+                } else {
+                    raw_ids
+                };
+                ids.into_iter()
+                    .filter_map(|id| {
+                        config
+                            .agents
+                            .iter()
+                            .find(|a| a.id == id && a.armed && !a.paused && a.model_key.is_some())
+                            .map(|_| id)
+                    })
+                    .collect()
             };
 
             if !await_reply {
                 let mut pool = state.memory_pool.lock().unwrap();
-                for id in &targets { pool.push(id, id, "user", content); }
+                for id in &targets {
+                    pool.push(id, id, "user", content);
+                }
                 let ids: Vec<&str> = targets.iter().map(|id| id.as_str()).collect();
-                return mcp_ok(&format!(r#"{{"queued":{},"agent_ids":{}}}"#,
-                    targets.len(), serde_json::to_string(&ids).unwrap_or_default()));
+                return mcp_ok(&format!(
+                    r#"{{"queued":{},"agent_ids":{}}}"#,
+                    targets.len(),
+                    serde_json::to_string(&ids).unwrap_or_default()
+                ));
             }
 
             let mut results = serde_json::Map::new();
@@ -758,8 +912,10 @@ pub(crate) async fn handle_tool_call(
         }
         "fork_agent" => {
             let source_id = args["source_agent_id"].as_str().unwrap_or("");
-            if source_id.is_empty() { return mcp_error("Error: source_agent_id is required."); }
-            let new_role   = args["role"].as_str();
+            if source_id.is_empty() {
+                return mcp_error("Error: source_agent_id is required.");
+            }
+            let new_role = args["role"].as_str();
             let sp_override = args["system_prompt_override"].as_str();
             let truncate_at = args["truncate_at"].as_u64().map(|n| n as usize);
             let ts = chrono::Utc::now().timestamp_millis();
@@ -772,45 +928,81 @@ pub(crate) async fn handle_tool_call(
                     Some(a) => a,
                 };
                 let mut cloned = source.clone();
-                cloned.id     = new_id.clone();
-                cloned.name   = new_role.unwrap_or(&format!("{}-fork", source.name)).to_string();
+                cloned.id = new_id.clone();
+                cloned.name = new_role
+                    .unwrap_or(&format!("{}-fork", source.name))
+                    .to_string();
                 cloned.paused = false;
-                cloned.armed  = true;
-                if let Some(sp) = sp_override { cloned.role = Some(sp.to_string()); }
+                cloned.armed = true;
+                if let Some(sp) = sp_override {
+                    cloned.role = Some(sp.to_string());
+                }
 
                 let pool = state.memory_pool.lock().unwrap();
-                let src_entries: Vec<&MemoryEntry> = pool.entries.iter()
-                    .filter(|e| e.agent_id == source_id).collect();
+                let src_entries: Vec<&MemoryEntry> = pool
+                    .entries
+                    .iter()
+                    .filter(|e| e.agent_id == source_id)
+                    .collect();
                 let limit = truncate_at.unwrap_or(src_entries.len());
-                let copies: Vec<MemoryEntry> = src_entries.into_iter().take(limit).map(|e| {
-                    let mut c = e.clone(); c.agent_id = new_id.clone(); c
-                }).collect();
+                let copies: Vec<MemoryEntry> = src_entries
+                    .into_iter()
+                    .take(limit)
+                    .map(|e| {
+                        let mut c = e.clone();
+                        c.agent_id = new_id.clone();
+                        c
+                    })
+                    .collect();
                 (cloned, copies)
             };
 
             state.agent_config.lock().unwrap().agents.push(new_agent);
-            state.memory_pool.lock().unwrap().entries.extend(entries_to_copy);
-            mcp_ok(&format!(r#"{{"agent_id":"{}","forked_from":"{}"}}"#, new_id, source_id))
+            state
+                .memory_pool
+                .lock()
+                .unwrap()
+                .entries
+                .extend(entries_to_copy);
+            mcp_ok(&format!(
+                r#"{{"agent_id":"{}","forked_from":"{}"}}"#,
+                new_id, source_id
+            ))
         }
         "aggregate_results" => {
             let raw_ids: Vec<String> = match args["agent_ids"].as_array() {
                 None => return mcp_error("Error: agent_ids is required."),
-                Some(arr) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+                Some(arr) => arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect(),
             };
-            let fmt             = args["format"].as_str().unwrap_or("structured");
+            let fmt = args["format"].as_str().unwrap_or("structured");
             let synthesis_prompt = args["synthesis_prompt"].as_str();
-            let synthesis_model  = args["synthesis_model"].as_str();
+            let synthesis_model = args["synthesis_model"].as_str();
 
             let target_ids: Vec<String> = if raw_ids.len() == 1 && raw_ids[0] == "*" {
-                state.agent_config.lock().unwrap().agents.iter()
-                    .filter(|a| a.agent_type != "user").map(|a| a.id.clone()).collect()
-            } else { raw_ids };
+                state
+                    .agent_config
+                    .lock()
+                    .unwrap()
+                    .agents
+                    .iter()
+                    .filter(|a| a.agent_type != "user")
+                    .map(|a| a.id.clone())
+                    .collect()
+            } else {
+                raw_ids
+            };
 
             let mut collected: serde_json::Map<String, Value> = serde_json::Map::new();
             {
                 let pool = state.memory_pool.lock().unwrap();
                 for id in &target_ids {
-                    let last = pool.entries.iter().rev()
+                    let last = pool
+                        .entries
+                        .iter()
+                        .rev()
                         .find(|e| e.agent_id == *id && e.role == "assistant")
                         .map(|e| e.content.clone())
                         .unwrap_or_else(|| "[no output]".to_string());
@@ -819,17 +1011,27 @@ pub(crate) async fn handle_tool_call(
             }
 
             if let Some(sp) = synthesis_prompt {
-                let combined = collected.iter()
+                let combined = collected
+                    .iter()
                     .map(|(id, v)| format!("Agent {}:\n{}", id, v.as_str().unwrap_or("")))
-                    .collect::<Vec<_>>().join("\n\n---\n\n");
+                    .collect::<Vec<_>>()
+                    .join("\n\n---\n\n");
                 let full_prompt = format!("{}\n\nAgent outputs:\n{}", sp, combined);
                 let model_to_use = synthesis_model.map(|s| s.to_string()).unwrap_or_else(|| {
-                    state.agent_config.lock().unwrap().agents.iter()
+                    state
+                        .agent_config
+                        .lock()
+                        .unwrap()
+                        .agents
+                        .iter()
                         .find(|a| a.agent_type != "user" && a.model_key.is_some())
-                        .and_then(|a| a.model_key.clone()).unwrap_or_default()
+                        .and_then(|a| a.model_key.clone())
+                        .unwrap_or_default()
                 });
                 if !model_to_use.is_empty() {
-                    return match call_chat_blocking(&model_to_use, "", &full_prompt, &[], None).await {
+                    return match call_chat_blocking(&model_to_use, "", &full_prompt, &[], None)
+                        .await
+                    {
                         Ok(synthesis) => mcp_ok(&synthesis),
                         Err(e) => mcp_error(&format!("Synthesis failed: {}", e)),
                     };
@@ -837,28 +1039,47 @@ pub(crate) async fn handle_tool_call(
             }
 
             match fmt {
-                "raw" => mcp_ok(&collected.values()
-                    .filter_map(|v| v.as_str()).collect::<Vec<_>>().join("\n\n---\n\n")),
-                "summary" => mcp_ok(&collected.iter()
-                    .map(|(id, v)| format!("**{}**: {}", id, v.as_str().unwrap_or("")))
-                    .collect::<Vec<_>>().join("\n\n")),
+                "raw" => mcp_ok(
+                    &collected
+                        .values()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n---\n\n"),
+                ),
+                "summary" => mcp_ok(
+                    &collected
+                        .iter()
+                        .map(|(id, v)| format!("**{}**: {}", id, v.as_str().unwrap_or("")))
+                        .collect::<Vec<_>>()
+                        .join("\n\n"),
+                ),
                 _ => mcp_ok(&serde_json::to_string_pretty(&collected).unwrap_or_default()),
             }
         }
         "pipe_message" => {
             let to_id = args["to_agent_id"].as_str().unwrap_or("");
-            let raw   = args["content"].as_str().unwrap_or("");
-            if to_id.is_empty() { return mcp_error("Error: to_agent_id is required."); }
-            if raw.is_empty()   { return mcp_error("Error: content is required."); }
+            let raw = args["content"].as_str().unwrap_or("");
+            if to_id.is_empty() {
+                return mcp_error("Error: to_agent_id is required.");
+            }
+            if raw.is_empty() {
+                return mcp_error("Error: content is required.");
+            }
 
             // Build the final message with optional prefix / suffix
             let mut content = String::new();
             if let Some(pre) = args["prefix"].as_str() {
-                if !pre.is_empty() { content.push_str(pre); content.push('\n'); }
+                if !pre.is_empty() {
+                    content.push_str(pre);
+                    content.push('\n');
+                }
             }
             content.push_str(raw);
             if let Some(suf) = args["suffix"].as_str() {
-                if !suf.is_empty() { content.push('\n'); content.push_str(suf); }
+                if !suf.is_empty() {
+                    content.push('\n');
+                    content.push_str(suf);
+                }
             }
 
             // Resolve target agent
@@ -867,8 +1088,12 @@ pub(crate) async fn handle_tool_call(
                 match config.agents.iter().find(|a| a.id == to_id) {
                     None => return mcp_error(&format!("Error: agent '{}' not found.", to_id)),
                     Some(a) => {
-                        if !a.armed { return mcp_error(&format!("Error: agent '{}' is disarmed.", to_id)); }
-                        if a.paused { return mcp_error(&format!("Error: agent '{}' is paused.", to_id)); }
+                        if !a.armed {
+                            return mcp_error(&format!("Error: agent '{}' is disarmed.", to_id));
+                        }
+                        if a.paused {
+                            return mcp_error(&format!("Error: agent '{}' is paused.", to_id));
+                        }
                         (
                             a.model_key.clone().unwrap_or_default(),
                             a.role.clone().unwrap_or_default(),
@@ -879,27 +1104,49 @@ pub(crate) async fn handle_tool_call(
                 }
             };
             if model_key.is_empty() {
-                return mcp_error(&format!("Error: agent '{}' has no model configured.", to_id));
+                return mcp_error(&format!(
+                    "Error: agent '{}' has no model configured.",
+                    to_id
+                ));
             }
 
             // Per-agent conversation history
             let history: Vec<Value> = {
                 let pool = state.memory_pool.lock().unwrap();
-                pool.entries.iter()
+                pool.entries
+                    .iter()
                     .filter(|e| e.agent_id == to_id && (e.role == "user" || e.role == "assistant"))
                     .map(|e| json!({"role": e.role, "content": e.content}))
                     .collect()
             };
 
             let maybe_ch = state.event_channel.lock().unwrap().clone();
+            let run_id = primary_run_id(&state.active_runs).unwrap_or_else(|| "detached-run".to_string());
             if let Some(ref ch) = maybe_ch {
+                let budget =
+                    compute_context_budget(&sys_prompt, &history, &content, context_limit, 0);
                 let _ = ch.send(StreamEvent::AgentStart {
+                    run_id: run_id.clone(),
                     agent_id: to_id.to_string(),
                     agent_name: agent_name.clone(),
+                    model_key: model_key.clone(),
+                    mode: "stay_awake".to_string(),
+                    is_manager: false,
+                    context_limit: budget.limit,
+                    estimated_input_tokens: budget.estimated_used,
+                    estimated_remaining_tokens: budget.remaining,
+                });
+                let _ = ch.send(StreamEvent::AgentStatus {
+                    run_id: run_id.clone(),
+                    agent_id: to_id.to_string(),
+                    stage: "thinking".to_string(),
+                    detail: "Generating response".to_string(),
                 });
             }
 
-            match call_chat_blocking(&model_key, &sys_prompt, &content, &history, context_limit).await {
+            match call_chat_blocking(&model_key, &sys_prompt, &content, &history, context_limit)
+                .await
+            {
                 Ok(response) => {
                     {
                         let mut pool = state.memory_pool.lock().unwrap();
@@ -908,10 +1155,12 @@ pub(crate) async fn handle_tool_call(
                     }
                     if let Some(ref ch) = maybe_ch {
                         let _ = ch.send(StreamEvent::Token {
+                            run_id: run_id.clone(),
                             agent_id: to_id.to_string(),
                             content: response.clone(),
                         });
                         let _ = ch.send(StreamEvent::AgentEnd {
+                            run_id: run_id.clone(),
                             agent_id: to_id.to_string(),
                         });
                     }
@@ -921,6 +1170,7 @@ pub(crate) async fn handle_tool_call(
                 Err(e) => {
                     if let Some(ref ch) = maybe_ch {
                         let _ = ch.send(StreamEvent::Error {
+                            run_id: run_id.clone(),
                             agent_id: to_id.to_string(),
                             agent_name: agent_name.clone(),
                             message: e.clone(),
@@ -933,11 +1183,14 @@ pub(crate) async fn handle_tool_call(
         // ── Web ───────────────────────────────────────────────────
         "WebFetch" => {
             let url = args["url"].as_str().unwrap_or("");
-            if url.is_empty() { return mcp_error("Error: url is required."); }
+            if url.is_empty() {
+                return mcp_error("Error: url is required.");
+            }
             let client = reqwest::Client::builder()
                 .user_agent("Mozilla/5.0 (compatible; Ajantis/1.0)")
                 .timeout(std::time::Duration::from_secs(30))
-                .build().unwrap_or_default();
+                .build()
+                .unwrap_or_default();
             match client.get(url).send().await {
                 Ok(resp) => {
                     if !resp.status().is_success() {
@@ -949,7 +1202,9 @@ pub(crate) async fn handle_tool_call(
                     let out = if char_count > 8000 {
                         let head: String = text.chars().take(8000).collect();
                         format!("{}…[truncated, {} chars total]", head, char_count)
-                    } else { text };
+                    } else {
+                        text
+                    };
                     mcp_ok(&format!("URL: {}\n\n{}", url, out))
                 }
                 Err(e) => mcp_error(&format!("Fetch failed: {}", e)),
@@ -957,14 +1212,24 @@ pub(crate) async fn handle_tool_call(
         }
         "WebSearch" => {
             let query = args["query"].as_str().unwrap_or("");
-            if query.is_empty() { return mcp_error("Error: query is required."); }
+            if query.is_empty() {
+                return mcp_error("Error: query is required.");
+            }
             let client = reqwest::Client::builder()
                 .user_agent("Mozilla/5.0 (compatible; Ajantis/1.0)")
                 .timeout(std::time::Duration::from_secs(15))
-                .build().unwrap_or_default();
-            match client.get("https://api.duckduckgo.com/")
-                .query(&[("q", query), ("format", "json"), ("no_html", "1"), ("skip_disambig", "1")])
-                .send().await
+                .build()
+                .unwrap_or_default();
+            match client
+                .get("https://api.duckduckgo.com/")
+                .query(&[
+                    ("q", query),
+                    ("format", "json"),
+                    ("no_html", "1"),
+                    ("skip_disambig", "1"),
+                ])
+                .send()
+                .await
             {
                 Err(e) => mcp_error(&format!("Search failed: {}", e)),
                 Ok(resp) => {
@@ -974,7 +1239,9 @@ pub(crate) async fn handle_tool_call(
                         if !abs.is_empty() {
                             lines.push(format!("**Summary**: {}", abs));
                             if let Some(src) = data["AbstractURL"].as_str() {
-                                if !src.is_empty() { lines.push(format!("Source: {}", src)); }
+                                if !src.is_empty() {
+                                    lines.push(format!("Source: {}", src));
+                                }
                             }
                         }
                     }
@@ -1001,17 +1268,19 @@ pub(crate) async fn handle_tool_call(
         "REPL" => {
             let code = args["code"].as_str().unwrap_or("");
             let lang = args["language"].as_str().unwrap_or("python").to_lowercase();
-            if code.is_empty() { return mcp_error("Error: code is required."); }
+            if code.is_empty() {
+                return mcp_error("Error: code is required.");
+            }
             if let Err(reason) = check_command_sandbox(code, &sandbox, state) {
                 return mcp_error(&reason);
             }
             let interpreter = match lang.as_str() {
                 "python" | "python3" | "py" => "python3",
                 "javascript" | "js" | "node" => "node",
-                "ruby" | "rb"               => "ruby",
-                "perl"                      => "perl",
-                "lua"                       => "lua",
-                "bash" | "sh" | "shell"     => "bash",
+                "ruby" | "rb" => "ruby",
+                "perl" => "perl",
+                "lua" => "lua",
+                "bash" | "sh" | "shell" => "bash",
                 _ => return mcp_error(&format!("Unsupported language: {}", lang)),
             };
             let flag = if interpreter == "bash" { "-c" } else { "-e" };
@@ -1021,14 +1290,15 @@ pub(crate) async fn handle_tool_call(
             if let Some(cached) = reuse_cached_command(state, "REPL", &normalized, &cwd) {
                 let reused = format!(
                     "[cached result reused | tool: REPL | cwd: {} | command: {}]\n{}",
-                    cwd,
-                    command_repr,
-                    cached.result
+                    cwd, command_repr, cached.result
                 );
                 return mcp_ok(&reused);
             }
-            match Command::new(interpreter).arg(flag).arg(code)
-                .current_dir(&sandbox).output()
+            match Command::new(interpreter)
+                .arg(flag)
+                .arg(code)
+                .current_dir(&sandbox)
+                .output()
             {
                 Ok(out) => {
                     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -1036,10 +1306,18 @@ pub(crate) async fn handle_tool_call(
                     let result_text = if !out.status.success() && !stderr.is_empty() {
                         format!("Runtime error:\n{}", stderr)
                     } else if stderr.is_empty() {
-                        if stdout.is_empty() { "[no output]".to_string() } else { stdout.clone() }
+                        if stdout.is_empty() {
+                            "[no output]".to_string()
+                        } else {
+                            stdout.clone()
+                        }
                     } else {
                         let text = format!("{}\n{}", stdout, stderr);
-                        if text.is_empty() { "[no output]".to_string() } else { text }
+                        if text.is_empty() {
+                            "[no output]".to_string()
+                        } else {
+                            text
+                        }
                     };
                     remember_command_result(
                         state,
@@ -1053,9 +1331,16 @@ pub(crate) async fn handle_tool_call(
                     if !out.status.success() && !stderr.is_empty() {
                         mcp_error(&format!("Runtime error:\n{}", stderr))
                     } else {
-                        let text = if stderr.is_empty() { stdout }
-                                   else { format!("{}\n{}", stdout, stderr) };
-                        mcp_ok(if text.is_empty() { "[no output]" } else { &text })
+                        let text = if stderr.is_empty() {
+                            stdout
+                        } else {
+                            format!("{}\n{}", stdout, stderr)
+                        };
+                        mcp_ok(if text.is_empty() {
+                            "[no output]"
+                        } else {
+                            &text
+                        })
                     }
                 }
                 Err(e) => mcp_error(&format!("Failed to run '{}': {}", interpreter, e)),
@@ -1063,7 +1348,9 @@ pub(crate) async fn handle_tool_call(
         }
         "PowerShell" => {
             let command = args["command"].as_str().unwrap_or("");
-            if command.is_empty() { return mcp_error("Error: command is required."); }
+            if command.is_empty() {
+                return mcp_error("Error: command is required.");
+            }
             if let Err(reason) = check_command_sandbox(command, &sandbox, state) {
                 return mcp_error(&reason);
             }
@@ -1072,20 +1359,24 @@ pub(crate) async fn handle_tool_call(
             if let Some(cached) = reuse_cached_command(state, "PowerShell", &normalized, &cwd) {
                 let reused = format!(
                     "[cached result reused | tool: PowerShell | cwd: {} | command: {}]\n{}",
-                    cwd,
-                    command,
-                    cached.result
+                    cwd, command, cached.result
                 );
                 return mcp_ok(&reused);
             }
-            match Command::new("pwsh").arg("-Command").arg(command)
-                .current_dir(&sandbox).output()
+            match Command::new("pwsh")
+                .arg("-Command")
+                .arg(command)
+                .current_dir(&sandbox)
+                .output()
             {
                 Ok(out) => {
                     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    let text = if stderr.is_empty() { stdout }
-                               else { format!("{}\n{}", stdout, stderr) };
+                    let text = if stderr.is_empty() {
+                        stdout
+                    } else {
+                        format!("{}\n{}", stdout, stderr)
+                    };
                     remember_command_result(
                         state,
                         "PowerShell",
@@ -1093,15 +1384,24 @@ pub(crate) async fn handle_tool_call(
                         &normalized,
                         &cwd,
                         out.status.success(),
-                        if text.is_empty() { "[no output]" } else { &text },
+                        if text.is_empty() {
+                            "[no output]"
+                        } else {
+                            &text
+                        },
                     );
-                    mcp_ok(if text.is_empty() { "[no output]" } else { &text })
+                    mcp_ok(if text.is_empty() {
+                        "[no output]"
+                    } else {
+                        &text
+                    })
                 }
                 Err(_) => mcp_error("PowerShell (pwsh) is not available on this system."),
             }
         }
         "Sleep" => {
-            let ms = args["duration_ms"].as_u64()
+            let ms = args["duration_ms"]
+                .as_u64()
                 .or_else(|| args["seconds"].as_f64().map(|s| (s * 1000.0) as u64))
                 .unwrap_or(1000)
                 .min(30_000); // cap at 30 s
@@ -1112,18 +1412,30 @@ pub(crate) async fn handle_tool_call(
         // ── UI / user interaction ─────────────────────────────────
         "SendUserMessage" => {
             let message = args["message"].as_str().unwrap_or("");
-            if message.is_empty() { return mcp_error("Error: message is required."); }
+            if message.is_empty() {
+                return mcp_error("Error: message is required.");
+            }
             let maybe_ch = state.event_channel.lock().unwrap().clone();
+            let run_id = primary_run_id(&state.active_runs).unwrap_or_else(|| "detached-run".to_string());
             if let Some(ref ch) = maybe_ch {
                 let _ = ch.send(StreamEvent::AgentStart {
+                    run_id: run_id.clone(),
                     agent_id: "agent-notification".to_string(),
                     agent_name: "Notification".to_string(),
+                    model_key: "system/notification".to_string(),
+                    mode: "ephemeral".to_string(),
+                    is_manager: false,
+                    context_limit: 0,
+                    estimated_input_tokens: 0,
+                    estimated_remaining_tokens: 0,
                 });
                 let _ = ch.send(StreamEvent::Token {
+                    run_id: run_id.clone(),
                     agent_id: "agent-notification".to_string(),
                     content: message.to_string(),
                 });
                 let _ = ch.send(StreamEvent::AgentEnd {
+                    run_id: run_id.clone(),
                     agent_id: "agent-notification".to_string(),
                 });
                 mcp_ok("Message delivered to user.")
@@ -1148,8 +1460,10 @@ pub(crate) async fn handle_tool_call(
         }
         "ToolSearch" => {
             let query = args["query"].as_str().unwrap_or("").to_lowercase();
-            let max   = args["max_results"].as_u64().unwrap_or(5) as usize;
-            if query.is_empty() { return mcp_error("Error: query is required."); }
+            let max = args["max_results"].as_u64().unwrap_or(5) as usize;
+            if query.is_empty() {
+                return mcp_error("Error: query is required.");
+            }
             let hits: Vec<Value> = state.tools.iter()
                 .filter(|t| t.name.to_lowercase().contains(&query)
                     || t.description.to_lowercase().contains(&query))
@@ -1159,8 +1473,11 @@ pub(crate) async fn handle_tool_call(
             if hits.is_empty() {
                 mcp_ok(&format!("No tools matched '{}'.", query))
             } else {
-                mcp_ok(&format!("{} tool(s) found:\n{}", hits.len(),
-                    serde_json::to_string_pretty(&hits).unwrap_or_default()))
+                mcp_ok(&format!(
+                    "{} tool(s) found:\n{}",
+                    hits.len(),
+                    serde_json::to_string_pretty(&hits).unwrap_or_default()
+                ))
             }
         }
         "Config" => {
@@ -1177,35 +1494,48 @@ pub(crate) async fn handle_tool_call(
             } else {
                 match cfg.get(key) {
                     Some(v) => mcp_ok(&v.to_string()),
-                    None    => mcp_error(&format!("Config key '{}' not found.", key)),
+                    None => mcp_error(&format!("Config key '{}' not found.", key)),
                 }
             }
         }
 
         // ── Background tasks ──────────────────────────────────────
         "TaskCreate" => {
-            let command     = args["command"].as_str().unwrap_or("");
+            let command = args["command"].as_str().unwrap_or("");
             let description = args["description"].as_str().unwrap_or("background task");
-            if command.is_empty() { return mcp_error("Error: command is required."); }
+            if command.is_empty() {
+                return mcp_error("Error: command is required.");
+            }
             create_task_internal(command, description, &sandbox, state).await
         }
         "RunTaskPacket" => {
-            let command = args["command"].as_str()
+            let command = args["command"]
+                .as_str()
                 .or_else(|| args["script"].as_str())
                 .unwrap_or("");
             let description = args["description"].as_str().unwrap_or("task packet");
-            if command.is_empty() { return mcp_error("Error: command or script is required."); }
+            if command.is_empty() {
+                return mcp_error("Error: command or script is required.");
+            }
             create_task_internal(command, description, &sandbox, state).await
         }
         "TaskGet" => {
             let id = args["task_id"].as_str().unwrap_or("");
-            if id.is_empty() { return mcp_error("Error: task_id is required."); }
+            if id.is_empty() {
+                return mcp_error("Error: task_id is required.");
+            }
             let tasks = state.tasks.lock().unwrap();
             match tasks.get(id) {
                 None => mcp_error(&format!("Task '{}' not found.", id)),
                 Some(t) => {
                     let status = t.status.lock().unwrap().clone();
-                    let preview = t.output.lock().unwrap().chars().take(300).collect::<String>();
+                    let preview = t
+                        .output
+                        .lock()
+                        .unwrap()
+                        .chars()
+                        .take(300)
+                        .collect::<String>();
                     let r = json!({
                         "task_id": t.id, "description": t.description,
                         "status": status, "started_at": t.started_at,
@@ -1217,23 +1547,35 @@ pub(crate) async fn handle_tool_call(
         }
         "TaskList" => {
             let tasks = state.tasks.lock().unwrap();
-            let list: Vec<Value> = tasks.values().map(|t| json!({
-                "task_id": t.id,
-                "description": t.description,
-                "status": t.status.lock().unwrap().clone(),
-                "started_at": t.started_at,
-            })).collect();
-            mcp_ok(&format!("{} task(s):\n{}", list.len(),
-                serde_json::to_string_pretty(&list).unwrap_or_default()))
+            let list: Vec<Value> = tasks
+                .values()
+                .map(|t| {
+                    json!({
+                        "task_id": t.id,
+                        "description": t.description,
+                        "status": t.status.lock().unwrap().clone(),
+                        "started_at": t.started_at,
+                    })
+                })
+                .collect();
+            mcp_ok(&format!(
+                "{} task(s):\n{}",
+                list.len(),
+                serde_json::to_string_pretty(&list).unwrap_or_default()
+            ))
         }
         "TaskStop" => {
             let id = args["task_id"].as_str().unwrap_or("");
-            if id.is_empty() { return mcp_error("Error: task_id is required."); }
+            if id.is_empty() {
+                return mcp_error("Error: task_id is required.");
+            }
             let mut tasks = state.tasks.lock().unwrap();
             match tasks.get_mut(id) {
                 None => mcp_error(&format!("Task '{}' not found.", id)),
                 Some(t) => {
-                    if let Some(ref h) = t.abort_handle { h.abort(); }
+                    if let Some(ref h) = t.abort_handle {
+                        h.abort();
+                    }
                     *t.status.lock().unwrap() = "stopped".to_string();
                     mcp_ok(&format!("Task '{}' stopped.", id))
                 }
@@ -1241,16 +1583,25 @@ pub(crate) async fn handle_tool_call(
         }
         "TaskOutput" => {
             let id = args["task_id"].as_str().unwrap_or("");
-            if id.is_empty() { return mcp_error("Error: task_id is required."); }
+            if id.is_empty() {
+                return mcp_error("Error: task_id is required.");
+            }
             let tasks = state.tasks.lock().unwrap();
             match tasks.get(id) {
                 None => mcp_error(&format!("Task '{}' not found.", id)),
                 Some(t) => {
                     let status = t.status.lock().unwrap().clone();
-                    let out    = t.output.lock().unwrap().clone();
-                    mcp_ok(&format!("[Task {} — {}]\n{}",
-                        id, status,
-                        if out.is_empty() { "[no output yet]".to_string() } else { out }))
+                    let out = t.output.lock().unwrap().clone();
+                    mcp_ok(&format!(
+                        "[Task {} — {}]\n{}",
+                        id,
+                        status,
+                        if out.is_empty() {
+                            "[no output yet]".to_string()
+                        } else {
+                            out
+                        }
+                    ))
                 }
             }
         }
@@ -1303,7 +1654,9 @@ pub(crate) async fn handle_tool_call(
                 requested_model,
                 None,
                 None,
-            ).await {
+            )
+            .await
+            {
                 Ok(agent_id) => agent_id,
                 Err(err) => return mcp_error(&err),
             };
@@ -1321,7 +1674,10 @@ pub(crate) async fn handle_tool_call(
                 Err(err) => mcp_error(&err),
             }
         }
-        _ => mcp_error(&format!("Tool '{}' is not recognised by this MCP server.", name)),
+        _ => mcp_error(&format!(
+            "Tool '{}' is not recognised by this MCP server.",
+            name
+        )),
     }
 }
 
@@ -1344,7 +1700,9 @@ async fn spawn_agent_record(
 ) -> Result<String, String> {
     let inherited_model = caller_agent_id.and_then(|agent_id| {
         let config = state.agent_config.lock().unwrap();
-        config.agents.iter()
+        config
+            .agents
+            .iter()
             .find(|agent| agent.id == agent_id)
             .and_then(|agent| agent.model_key.clone())
     });
@@ -1359,7 +1717,8 @@ async fn spawn_agent_record(
         );
     };
     let Some(model_info) = available_models.iter().find(|model| model.key == model_key) else {
-        let available = available_models.iter()
+        let available = available_models
+            .iter()
             .take(20)
             .map(|model| model.key.as_str())
             .collect::<Vec<_>>()
@@ -1385,7 +1744,10 @@ async fn spawn_agent_record(
         name: role.to_string(),
         agent_type: "model".to_string(),
         model_key: Some(model_key),
-        model_type: model_info.model_type.clone().or_else(|| Some("llm".to_string())),
+        model_type: model_info
+            .model_type
+            .clone()
+            .or_else(|| Some("llm".to_string())),
         role: Some(sys_prompt.to_string()),
         load_config: ctx_limit.map(|cl| AgentLoadConfig {
             context_length: Some(cl),
@@ -1429,7 +1791,7 @@ fn build_compat_agent_prompt(role_hint: &str, caller_prompt: &str) -> String {
     };
 
     format!(
-        "You are a specialized {} subagent working inside a local repository.\n\n{}\n\nGeneral rules:\n- Execute the assigned sub-task directly.\n- Prefer targeted tool calls and narrow reads.\n- For audit/review work, prefer direct file or config inspection over speculation.\n- Treat explicitly requested files, directories, file classes, and subsystems as a coverage checklist; if you did not inspect one, call it out explicitly as a coverage gap.\n- Quote the file/path and the specific observed behavior behind each conclusion.\n- Do not emit generic or dependency-only risk templates.\n- Do not ask the user follow-up questions in this environment.\n- Do not stop at a plan, status update, or statement of intent.\n- If a tool is blocked, adapt and try another minimal approach.\n- If evidence is insufficient, say `insufficient evidence` instead of inventing a finding.\n- Return the concrete result requested by the caller.\n\nSupplementary guidance from the caller:\n{}",
+        "You are a specialized {} subagent working inside a local repository.\n\n{}\n\nGeneral rules:\n- Execute the assigned sub-task directly.\n- Prefer targeted tool calls and narrow reads.\n- If the task is to build, implement, create, or modify workspace files, use the file tools to materialize the result on disk; a chat-only code block does not count as completion unless the caller explicitly asked for chat-only output.\n- If no target path is specified for a file task, choose a sensible path and state it in your result.\n- For audit/review work, prefer direct file or config inspection over speculation.\n- Treat explicitly requested files, directories, file classes, and subsystems as a coverage checklist; if you did not inspect one, call it out explicitly as a coverage gap.\n- Quote the file/path and the specific observed behavior behind each conclusion.\n- Do not emit generic or dependency-only risk templates.\n- Do not ask the user follow-up questions in this environment.\n- Do not stop at a plan, status update, or statement of intent.\n- If a tool is blocked, adapt and try another minimal approach.\n- If evidence is insufficient, say `insufficient evidence` instead of inventing a finding.\n- Return the concrete result requested by the caller.\n\nSupplementary guidance from the caller:\n{}",
         role_hint,
         specialization,
         if caller_prompt.trim().is_empty() {
@@ -1438,6 +1800,19 @@ fn build_compat_agent_prompt(role_hint: &str, caller_prompt: &str) -> String {
             caller_prompt
         }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_compat_agent_prompt;
+
+    #[test]
+    fn compat_prompt_requires_writing_file_tasks_to_disk() {
+        let prompt = build_compat_agent_prompt("executor", "Create a Python game");
+        assert!(prompt.contains("materialize the result on disk"));
+        assert!(prompt.contains("chat-only code block does not count as completion"));
+        assert!(prompt.contains("choose a sensible path"));
+    }
 }
 
 fn normalize_role_hint(role_hint: &str) -> String {
@@ -1514,7 +1889,15 @@ async fn run_agent_turn(
     await_reply: bool,
     inherited_behaviors: Option<HashSet<String>>,
 ) -> Result<String, String> {
-    let (model_key, sys_prompt, agent_name, is_manager, allowed_tools, context_limit, behavior_triggers) = {
+    let (
+        model_key,
+        sys_prompt,
+        agent_name,
+        is_manager,
+        allowed_tools,
+        context_limit,
+        behavior_triggers,
+    ) = {
         let config = state.agent_config.lock().unwrap();
         match config.agents.iter().find(|a| a.id == agent_id) {
             None => return Err(format!("Error: agent '{}' not found.", agent_id)),
@@ -1561,28 +1944,44 @@ async fn run_agent_turn(
         return Ok(serde_json::to_string(&payload).unwrap_or_default());
     }
 
-    let active_behaviors = resolve_active_behaviors(
+    let (active_behaviors, _embed_calls) = resolve_active_behaviors(
         content,
         inherited_behaviors.as_ref(),
         &behavior_triggers,
         &state.behavior_trigger_cache,
     )
     .await;
-    let grounded_audit_mode = active_behaviors.contains(GROUNDED_AUDIT_BEHAVIOR_ID);
+    let audit_config = resolve_audit_behavior_config(&active_behaviors, &behavior_triggers);
 
     let history: Vec<Value> = {
         let pool = state.memory_pool.lock().unwrap();
-        pool.entries.iter()
+        pool.entries
+            .iter()
             .filter(|e| e.agent_id == agent_id && (e.role == "user" || e.role == "assistant"))
             .map(|e| json!({"role": e.role, "content": e.content}))
             .collect()
     };
 
     let maybe_ch = state.event_channel.lock().unwrap().clone();
+    let run_id = primary_run_id(&state.active_runs).unwrap_or_else(|| "detached-run".to_string());
     if let Some(ref ch) = maybe_ch {
+        let budget = compute_context_budget(&sys_prompt, &history, &content, context_limit, 0);
         let _ = ch.send(StreamEvent::AgentStart {
+            run_id: run_id.clone(),
             agent_id: agent_id.to_string(),
             agent_name: agent_name.clone(),
+            model_key: model_key.clone(),
+            mode: "stay_awake".to_string(),
+            is_manager,
+            context_limit: budget.limit,
+            estimated_input_tokens: budget.estimated_used,
+            estimated_remaining_tokens: budget.remaining,
+        });
+        let _ = ch.send(StreamEvent::AgentStatus {
+            run_id: run_id.clone(),
+            agent_id: agent_id.to_string(),
+            stage: "thinking".to_string(),
+            detail: "Generating response".to_string(),
         });
     }
     if (is_manager || !allowed_tools.is_empty()) && maybe_ch.is_none() {
@@ -1592,7 +1991,11 @@ async fn run_agent_turn(
     let uses_tool_loop = is_manager || !allowed_tools.is_empty();
 
     let response_result = if uses_tool_loop {
-        let allowed = if is_manager { None } else { Some(allowed_tools.as_slice()) };
+        let allowed = if is_manager {
+            None
+        } else {
+            Some(allowed_tools.as_slice())
+        };
         let glob_ready = state
             .glob_cache
             .lock()
@@ -1604,6 +2007,7 @@ async fn run_agent_turn(
             &model_key,
             &sys_prompt,
             content,
+            &run_id,
             agent_id,
             &state.tools,
             allowed,
@@ -1615,30 +2019,20 @@ async fn run_agent_turn(
             Some(&active_behaviors),
             maybe_ch.as_ref().unwrap_or_else(|| unreachable!()),
             &history,
-        ).await
+        )
+        .await
     } else {
         call_chat_blocking(&model_key, &sys_prompt, content, &history, context_limit).await
     };
 
     match response_result {
         Ok(response) => {
-            if grounded_audit_mode && is_low_value_audit_response(&response)
-            {
-                return Err(format!(
-                    "Agent '{}' returned an audit response without grounded, file-backed findings.",
-                    agent_name
-                ));
-            }
-            if grounded_audit_mode {
+            if let Some(config) = audit_config.as_ref() {
                 let requested_refs = extract_explicit_audit_refs(content);
-                if !requested_refs.is_empty()
-                    && !audit_response_acknowledges_refs(&response, &requested_refs)
+                if let Err(reason) =
+                    validate_audit_worker_response(&response, &requested_refs, config)
                 {
-                    return Err(format!(
-                        "Agent '{}' did not address all explicitly requested audit scopes: {}.",
-                        agent_name,
-                        requested_refs.join(", ")
-                    ));
+                    return Err(format!("Agent '{}' {}", agent_name, reason));
                 }
             }
             if response.trim().is_empty() {
@@ -1655,11 +2049,13 @@ async fn run_agent_turn(
             if let Some(ref ch) = maybe_ch {
                 if !uses_tool_loop {
                     let _ = ch.send(StreamEvent::Token {
+                        run_id: run_id.clone(),
                         agent_id: agent_id.to_string(),
                         content: response.clone(),
                     });
                 }
                 let _ = ch.send(StreamEvent::AgentEnd {
+                    run_id: run_id.clone(),
                     agent_id: agent_id.to_string(),
                 });
             }
@@ -1669,6 +2065,7 @@ async fn run_agent_turn(
         Err(e) => {
             if let Some(ref ch) = maybe_ch {
                 let _ = ch.send(StreamEvent::Error {
+                    run_id: run_id.clone(),
                     agent_id: agent_id.to_string(),
                     agent_name: agent_name.clone(),
                     message: e.clone(),

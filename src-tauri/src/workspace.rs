@@ -5,6 +5,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::memory::{CommandExecution, MemoryEntry};
+use crate::runs::snapshot_path;
 use crate::state::AppState;
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -70,6 +71,20 @@ pub(crate) struct WorkspaceThread {
     pub(crate) command_history: Vec<CommandExecution>,
 }
 
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub(crate) struct ThreadSnapshot {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) message_items: Vec<WorkspaceThreadMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) memory_entries: Vec<MemoryEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) command_history: Vec<CommandExecution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) active_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) updated_at: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Workspace {
     pub(crate) id: String,
@@ -86,6 +101,43 @@ pub(crate) struct WorkspaceConfig {
 
 pub(crate) fn workspace_config_path(_workspace: &PathBuf) -> PathBuf {
     crate::config_persistence::ajantis_dir().join("workspace_config.json")
+}
+
+fn clear_inline_thread_payload(thread: &mut WorkspaceThread) {
+    thread.messages.clear();
+    thread.message_items.clear();
+    thread.memory_entries.clear();
+    thread.command_history.clear();
+}
+
+fn maybe_migrate_inline_thread_payloads(config: &mut WorkspaceConfig) -> Result<bool, String> {
+    let mut changed = false;
+    for workspace in &mut config.workspaces {
+        for thread in &mut workspace.threads {
+            let has_inline_payload = !thread.messages.is_empty()
+                || !thread.message_items.is_empty()
+                || !thread.memory_entries.is_empty()
+                || !thread.command_history.is_empty();
+            if !has_inline_payload {
+                continue;
+            }
+            let snapshot = ThreadSnapshot {
+                message_items: thread.message_items.clone(),
+                memory_entries: thread.memory_entries.clone(),
+                command_history: thread.command_history.clone(),
+                active_run_id: None,
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            };
+            let path = snapshot_path(&workspace.id, &thread.id);
+            let json = serde_json::to_string_pretty(&snapshot)
+                .map_err(|e| format!("Failed to serialize migrated thread snapshot: {}", e))?;
+            fs::write(&path, json)
+                .map_err(|e| format!("Failed to persist migrated thread snapshot: {}", e))?;
+            clear_inline_thread_payload(thread);
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 /// Called by the frontend when the user selects a workspace.
@@ -117,11 +169,20 @@ pub(crate) async fn load_workspace_config(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<WorkspaceConfig, String> {
     let path = workspace_config_path(&state.workspace_root);
-    if !path.exists() { return Ok(WorkspaceConfig::default()); }
-    let content = fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read workspace config: {}", e))?;
-    serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse workspace config: {}", e))
+    if !path.exists() {
+        return Ok(WorkspaceConfig::default());
+    }
+    let content =
+        fs::read_to_string(&path).map_err(|e| format!("Failed to read workspace config: {}", e))?;
+    let mut config: WorkspaceConfig = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse workspace config: {}", e))?;
+    if maybe_migrate_inline_thread_payloads(&mut config)? {
+        let stripped = serde_json::to_string_pretty(&config)
+            .map_err(|e| format!("Failed to serialize migrated workspace config: {}", e))?;
+        fs::write(&path, stripped)
+            .map_err(|e| format!("Failed to write migrated workspace config: {}", e))?;
+    }
+    Ok(config)
 }
 
 #[tauri::command]
@@ -130,7 +191,39 @@ pub(crate) async fn save_workspace_config(
     config: WorkspaceConfig,
 ) -> Result<(), String> {
     let path = workspace_config_path(&state.workspace_root);
-    let json = serde_json::to_string_pretty(&config)
+    let mut stripped = config.clone();
+    for workspace in &mut stripped.workspaces {
+        for thread in &mut workspace.threads {
+            clear_inline_thread_payload(thread);
+        }
+    }
+    let json = serde_json::to_string_pretty(&stripped)
         .map_err(|e| format!("Serialization failed: {}", e))?;
     fs::write(&path, json).map_err(|e| format!("Failed to write workspace config: {}", e))
+}
+
+#[tauri::command]
+pub(crate) async fn load_thread_snapshot(
+    workspace_id: String,
+    thread_id: String,
+) -> Result<ThreadSnapshot, String> {
+    let path = snapshot_path(&workspace_id, &thread_id);
+    if !path.exists() {
+        return Ok(ThreadSnapshot::default());
+    }
+    let content =
+        fs::read_to_string(&path).map_err(|e| format!("Failed to read thread snapshot: {}", e))?;
+    serde_json::from_str(&content).map_err(|e| format!("Failed to parse thread snapshot: {}", e))
+}
+
+#[tauri::command]
+pub(crate) async fn save_thread_snapshot(
+    workspace_id: String,
+    thread_id: String,
+    snapshot: ThreadSnapshot,
+) -> Result<(), String> {
+    let path = snapshot_path(&workspace_id, &thread_id);
+    let json = serde_json::to_string_pretty(&snapshot)
+        .map_err(|e| format!("Failed to serialize thread snapshot: {}", e))?;
+    fs::write(&path, json).map_err(|e| format!("Failed to write thread snapshot: {}", e))
 }

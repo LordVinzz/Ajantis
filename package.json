@@ -2,16 +2,34 @@
   "name": "ajantis",
   "version": "1.0.0",
   "description": "LM Studio Tool App - Tauri",
+  "private": true,
   "scripts": {
     "tauri": "tauri",
-    "dev": "tauri dev",
-    "build": "tauri build"
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "dev:app": "tauri dev",
+    "build:app": "tauri build"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
   "devDependencies": {
-    "@tauri-apps/cli": "^2.10.1"
+    "@tailwindcss/vite": "^4.2.2",
+    "@tauri-apps/cli": "^2.10.1",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "tailwindcss": "^4.2.2",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.8"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.10.1",
+    "@vitejs/plugin-react": "^6.0.1",
+    "dompurify": "^3.4.0",
+    "esbuild": "^0.28.0",
+    "marked": "^18.0.2",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5"
   }
 }

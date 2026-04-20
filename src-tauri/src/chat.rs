@@ -2,20 +2,25 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 use tauri::ipc::Channel;
 
 use crate::agent_config::{
-    RedundancyDetectionConfig, GROUNDED_AUDIT_BEHAVIOR_ID,
-    MAX_SEMANTIC_SIMILARITY_THRESHOLD, MIN_SEMANTIC_SIMILARITY_THRESHOLD,
+    resolve_audit_behavior_config, AuditEvidenceGrade, RedundancyDetectionConfig,
+    ResolvedAuditBehaviorConfig, MAX_SEMANTIC_SIMILARITY_THRESHOLD,
+    MIN_SEMANTIC_SIMILARITY_THRESHOLD, BudgetHitSummarizationConfig,
 };
 use crate::helpers::{
     audit_response_acknowledges_refs, compute_context_budget, extract_explicit_audit_refs,
-    grounded_audit_behavior_prompt, has_file_reference, is_low_value_audit_response,
-    is_manager_blocked_tool, is_manager_only_tool, is_path_like_audit_ref, lm_base_url,
-    normalize_audit_ref, resolve_active_behaviors, with_context_budget,
+    has_file_reference, is_manager_blocked_tool, is_manager_only_tool, is_path_like_audit_ref,
+    lm_base_url, normalize_audit_ref, resolve_active_behaviors, trim_history_to_budget,
+    with_context_budget,
 };
 use crate::mcp::{handle_tool_call, McpState};
 use crate::models::create_embeddings;
+use crate::runs::{
+    emit_run_event, run_budget_applies, PausedRunState, RunLimitHit, RunWindowUsage,
+};
 use crate::state::{AppState, McpTool};
 
 #[derive(Serialize)]
@@ -101,6 +106,286 @@ pub(crate) async fn send_message(
     }
 }
 
+#[derive(Clone, Default)]
+struct StreamUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    reasoning_output_tokens: Option<u64>,
+    tokens_per_second: Option<f64>,
+    time_to_first_token_seconds: Option<f64>,
+}
+
+#[derive(Default)]
+struct ToolCallDelta {
+    id: String,
+    tool_type: String,
+    function_name: String,
+    function_arguments: String,
+}
+
+struct StreamedAssistantTurn {
+    assistant_message: Value,
+    content: String,
+    usage: StreamUsage,
+}
+
+fn parse_stream_usage(chunk: &Value) -> StreamUsage {
+    let usage = chunk.get("usage");
+    let stats = chunk.get("result").and_then(|result| result.get("stats"));
+
+    let input_tokens = usage
+        .and_then(|value| value.get("prompt_tokens").and_then(Value::as_u64))
+        .or_else(|| usage.and_then(|value| value.get("input_tokens").and_then(Value::as_u64)))
+        .or_else(|| stats.and_then(|value| value.get("input_tokens").and_then(Value::as_u64)));
+
+    let output_tokens = usage
+        .and_then(|value| value.get("completion_tokens").and_then(Value::as_u64))
+        .or_else(|| usage.and_then(|value| value.get("output_tokens").and_then(Value::as_u64)))
+        .or_else(|| {
+            stats.and_then(|value| value.get("total_output_tokens").and_then(Value::as_u64))
+        });
+
+    let reasoning_output_tokens = usage
+        .and_then(|value| value.get("reasoning_output_tokens").and_then(Value::as_u64))
+        .or_else(|| {
+            stats.and_then(|value| value.get("reasoning_output_tokens").and_then(Value::as_u64))
+        });
+
+    let tokens_per_second =
+        stats.and_then(|value| value.get("tokens_per_second").and_then(Value::as_f64));
+    let time_to_first_token_seconds = stats.and_then(|value| {
+        value
+            .get("time_to_first_token_seconds")
+            .and_then(Value::as_f64)
+    });
+
+    StreamUsage {
+        input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
+        tokens_per_second,
+        time_to_first_token_seconds,
+    }
+}
+
+fn emit_generation_metrics(
+    on_event: &Channel<StreamEvent>,
+    run_id: &str,
+    agent_id: &str,
+    stage: &str,
+    usage: &StreamUsage,
+    estimated_output_tokens: u64,
+) {
+    let _ = on_event.send(StreamEvent::AgentMetrics {
+        run_id: run_id.to_string(),
+        agent_id: agent_id.to_string(),
+        stage: stage.to_string(),
+        estimated_output_tokens,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        reasoning_output_tokens: usage.reasoning_output_tokens,
+        tokens_per_second: usage.tokens_per_second,
+        time_to_first_token_seconds: usage.time_to_first_token_seconds,
+    });
+}
+
+fn estimated_stream_output_tokens(text: &str) -> u64 {
+    if text.trim().is_empty() {
+        0
+    } else {
+        crate::helpers::estimate_text_tokens(text)
+    }
+}
+
+async fn stream_chat_completion_turn(
+    client: &reqwest::Client,
+    url: &str,
+    body: &Value,
+    run_id: &str,
+    agent_id: &str,
+    on_event: &Channel<StreamEvent>,
+) -> Result<StreamedAssistantTurn, String> {
+    let mut resp = client
+        .post(url)
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!(
+            "LLM error: {}",
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+
+    let started_at = Instant::now();
+    let mut first_delta_at: Option<std::time::Duration> = None;
+    let mut full_content = String::new();
+    let mut buffer = String::new();
+    let mut assistant_role = "assistant".to_string();
+    let mut tool_calls: Vec<ToolCallDelta> = vec![];
+    let mut usage = StreamUsage::default();
+
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("Stream read error: {}", e))?
+    {
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(pos) = buffer.find('\n') {
+            let line = buffer[..pos].trim_end().to_string();
+            buffer = buffer[pos + 1..].to_string();
+            if line.is_empty() || line.starts_with(':') {
+                continue;
+            }
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if data.trim() == "[DONE]" {
+                let estimated_output_tokens = estimated_stream_output_tokens(&full_content);
+                if usage.output_tokens.is_none() && !full_content.is_empty() {
+                    usage.output_tokens = Some(estimated_output_tokens);
+                }
+                if usage.time_to_first_token_seconds.is_none() {
+                    usage.time_to_first_token_seconds =
+                        first_delta_at.map(|elapsed| elapsed.as_secs_f64());
+                }
+                if usage.tokens_per_second.is_none() && !full_content.is_empty() {
+                    let elapsed = started_at.elapsed().as_secs_f64();
+                    if elapsed > 0.0 {
+                        usage.tokens_per_second =
+                            usage.output_tokens.map(|tokens| tokens as f64 / elapsed);
+                    }
+                }
+                let tool_calls_json: Vec<Value> = tool_calls
+                    .into_iter()
+                    .map(|tool_call| {
+                        json!({
+                            "id": tool_call.id,
+                            "type": if tool_call.tool_type.is_empty() { "function".to_string() } else { tool_call.tool_type },
+                            "function": {
+                                "name": tool_call.function_name,
+                                "arguments": tool_call.function_arguments,
+                            }
+                        })
+                    })
+                    .collect();
+                let assistant_message = if tool_calls_json.is_empty() {
+                    json!({
+                        "role": assistant_role,
+                        "content": full_content,
+                    })
+                } else {
+                    json!({
+                        "role": assistant_role,
+                        "content": if full_content.is_empty() { Value::Null } else { json!(full_content) },
+                        "tool_calls": tool_calls_json,
+                    })
+                };
+                return Ok(StreamedAssistantTurn {
+                    assistant_message,
+                    content: full_content,
+                    usage,
+                });
+            }
+
+            let parsed =
+                serde_json::from_str::<Value>(data).map_err(|e| format!("Parse error: {}", e))?;
+
+            let parsed_usage = parse_stream_usage(&parsed);
+            if parsed_usage.input_tokens.is_some() {
+                usage.input_tokens = parsed_usage.input_tokens;
+            }
+            if parsed_usage.output_tokens.is_some() {
+                usage.output_tokens = parsed_usage.output_tokens;
+            }
+            if parsed_usage.reasoning_output_tokens.is_some() {
+                usage.reasoning_output_tokens = parsed_usage.reasoning_output_tokens;
+            }
+            if parsed_usage.tokens_per_second.is_some() {
+                usage.tokens_per_second = parsed_usage.tokens_per_second;
+            }
+            if parsed_usage.time_to_first_token_seconds.is_some() {
+                usage.time_to_first_token_seconds = parsed_usage.time_to_first_token_seconds;
+            }
+
+            let choice = parsed
+                .get("choices")
+                .and_then(Value::as_array)
+                .and_then(|choices| choices.first());
+            let delta = choice.and_then(|value| value.get("delta"));
+
+            if let Some(role) = delta
+                .and_then(|value| value.get("role"))
+                .and_then(Value::as_str)
+            {
+                assistant_role = role.to_string();
+            }
+
+            if let Some(content) = delta
+                .and_then(|value| value.get("content"))
+                .and_then(Value::as_str)
+            {
+                if !content.is_empty() {
+                    if first_delta_at.is_none() {
+                        first_delta_at = Some(started_at.elapsed());
+                        if usage.time_to_first_token_seconds.is_none() {
+                            usage.time_to_first_token_seconds =
+                                first_delta_at.map(|elapsed| elapsed.as_secs_f64());
+                        }
+                    }
+                    full_content.push_str(content);
+                    let _ = on_event.send(StreamEvent::Token {
+                        run_id: run_id.to_string(),
+                        agent_id: agent_id.to_string(),
+                        content: content.to_string(),
+                    });
+                    emit_generation_metrics(
+                        on_event,
+                        run_id,
+                        agent_id,
+                        "streaming",
+                        &usage,
+                        estimated_stream_output_tokens(&full_content),
+                    );
+                }
+            }
+
+            if let Some(tool_call_deltas) = delta
+                .and_then(|value| value.get("tool_calls"))
+                .and_then(Value::as_array)
+            {
+                for tool_call_delta in tool_call_deltas {
+                    let idx = tool_call_delta
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(tool_calls.len() as u64) as usize;
+                    if idx >= tool_calls.len() {
+                        tool_calls.resize_with(idx + 1, ToolCallDelta::default);
+                    }
+                    if let Some(id) = tool_call_delta.get("id").and_then(Value::as_str) {
+                        tool_calls[idx].id = id.to_string();
+                    }
+                    if let Some(tool_type) = tool_call_delta.get("type").and_then(Value::as_str) {
+                        tool_calls[idx].tool_type = tool_type.to_string();
+                    }
+                    if let Some(function) = tool_call_delta.get("function") {
+                        if let Some(name) = function.get("name").and_then(Value::as_str) {
+                            tool_calls[idx].function_name.push_str(name);
+                        }
+                        if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                            tool_calls[idx].function_arguments.push_str(arguments);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Err("Stream ended before completion.".to_string())
+}
+
 /// Non-streaming single-turn call. Used by manager MCP tools.
 /// `history` contains previous [user / assistant] turns for this agent.
 pub(crate) async fn call_chat_blocking(
@@ -111,13 +396,14 @@ pub(crate) async fn call_chat_blocking(
     context_limit: Option<u64>,
 ) -> Result<String, String> {
     let url = format!("{}/v1/chat/completions", lm_base_url());
-    let budget = compute_context_budget(system_prompt, history, message, context_limit, 0);
+    let trimmed_history = trim_history_to_budget(system_prompt, history, message, context_limit, 0);
+    let budget = compute_context_budget(system_prompt, &trimmed_history, message, context_limit, 0);
     let effective_system_prompt = with_context_budget(system_prompt, budget);
     let mut messages = vec![];
     if !effective_system_prompt.is_empty() {
         messages.push(json!({"role": "system", "content": effective_system_prompt}));
     }
-    for h in history {
+    for h in &trimmed_history {
         messages.push(h.clone());
     }
     messages.push(json!({"role": "user", "content": message}));
@@ -159,6 +445,326 @@ impl Drop for ActiveBehaviorContextGuard<'_> {
     }
 }
 
+pub(crate) const RUN_PAUSED_ERROR: &str = "__run_paused__";
+/// Returned when a budget-hit summary was generated and streamed: routing must stop without re-routing the summary text.
+pub(crate) const RUN_BUDGET_ENDED_ERROR: &str = "__run_budget_ended__";
+
+fn sync_active_run_behaviors(tool_state: &McpState, run_id: &str, active_behaviors: &HashSet<String>) {
+    if let Some(run) = tool_state.active_runs.lock().unwrap().get_mut(run_id) {
+        run.active_behaviors = active_behaviors.clone();
+    }
+}
+
+fn check_run_budget_for_llm_call(
+    tool_state: &McpState,
+    run_id: &str,
+    active_behaviors: &HashSet<String>,
+) -> Result<(), RunLimitHit> {
+    let mut runs = tool_state.active_runs.lock().unwrap();
+    let Some(run) = runs.get_mut(run_id) else {
+        return Ok(());
+    };
+    run.active_behaviors = active_behaviors.clone();
+    // Always count so the UI can display real-time usage regardless of behavior scope.
+    run.usage.llm_calls += 1;
+    // Only enforce limits when the budget is scoped to an active behavior.
+    if !run_budget_applies(&run.budgets, active_behaviors) {
+        return Ok(());
+    }
+    let elapsed_seconds = run.window_started_at.elapsed().as_secs();
+    if elapsed_seconds >= run.budgets.wall_clock_seconds_per_window {
+        return Err(RunLimitHit {
+            kind: "wall_clock_seconds_per_window".to_string(),
+            limit: run.budgets.wall_clock_seconds_per_window,
+            observed: elapsed_seconds,
+        });
+    }
+    if u64::from(run.usage.llm_calls) > u64::from(run.budgets.llm_calls_per_window) {
+        return Err(RunLimitHit {
+            kind: "llm_calls_per_window".to_string(),
+            limit: u64::from(run.budgets.llm_calls_per_window),
+            observed: u64::from(run.usage.llm_calls),
+        });
+    }
+    Ok(())
+}
+
+fn check_run_budget_for_tool_call(
+    tool_state: &McpState,
+    run_id: &str,
+    active_behaviors: &HashSet<String>,
+    tool_name: &str,
+) -> Result<(), RunLimitHit> {
+    let mut runs = tool_state.active_runs.lock().unwrap();
+    let Some(run) = runs.get_mut(run_id) else {
+        return Ok(());
+    };
+    run.active_behaviors = active_behaviors.clone();
+    // Always count.
+    run.usage.tool_calls += 1;
+    if tool_name == "spawn_agent" {
+        run.usage.spawned_agents += 1;
+    }
+    // Only enforce when budget applies.
+    if !run_budget_applies(&run.budgets, active_behaviors) {
+        return Ok(());
+    }
+    let elapsed_seconds = run.window_started_at.elapsed().as_secs();
+    if elapsed_seconds >= run.budgets.wall_clock_seconds_per_window {
+        return Err(RunLimitHit {
+            kind: "wall_clock_seconds_per_window".to_string(),
+            limit: run.budgets.wall_clock_seconds_per_window,
+            observed: elapsed_seconds,
+        });
+    }
+    if u64::from(run.usage.tool_calls) > u64::from(run.budgets.tool_calls_per_window) {
+        return Err(RunLimitHit {
+            kind: "tool_calls_per_window".to_string(),
+            limit: u64::from(run.budgets.tool_calls_per_window),
+            observed: u64::from(run.usage.tool_calls),
+        });
+    }
+    if tool_name == "spawn_agent"
+        && u64::from(run.usage.spawned_agents) > u64::from(run.budgets.spawned_agents_per_window)
+    {
+        return Err(RunLimitHit {
+            kind: "spawned_agents_per_window".to_string(),
+            limit: u64::from(run.budgets.spawned_agents_per_window),
+            observed: u64::from(run.usage.spawned_agents),
+        });
+    }
+    Ok(())
+}
+
+fn record_run_streamed_tokens(
+    tool_state: &McpState,
+    run_id: &str,
+    active_behaviors: &HashSet<String>,
+    streamed_tokens: u64,
+) -> Result<(), RunLimitHit> {
+    let mut runs = tool_state.active_runs.lock().unwrap();
+    let Some(run) = runs.get_mut(run_id) else {
+        return Ok(());
+    };
+    run.active_behaviors = active_behaviors.clone();
+    // Always count.
+    run.usage.streamed_tokens += streamed_tokens;
+    // Only enforce when budget applies.
+    if !run_budget_applies(&run.budgets, active_behaviors) {
+        return Ok(());
+    }
+    if run.usage.streamed_tokens > run.budgets.streamed_tokens_per_window {
+        return Err(RunLimitHit {
+            kind: "streamed_tokens_per_window".to_string(),
+            limit: run.budgets.streamed_tokens_per_window,
+            observed: run.usage.streamed_tokens,
+        });
+    }
+    Ok(())
+}
+
+fn capture_run_usage(tool_state: &McpState, run_id: &str) -> RunWindowUsage {
+    tool_state
+        .active_runs
+        .lock()
+        .unwrap()
+        .get(run_id)
+        .map(|run| run.usage.clone())
+        .unwrap_or_default()
+}
+
+fn pause_run_for_confirmation(
+    tool_state: &McpState,
+    run_id: &str,
+    paused_state: PausedRunState,
+) -> Result<(), String> {
+    {
+        let mut runs = tool_state.active_runs.lock().unwrap();
+        let run = runs
+            .get_mut(run_id)
+            .ok_or_else(|| format!("Run '{}' not found.", run_id))?;
+        run.waiting_confirmation = true;
+        run.paused = Some(paused_state.clone());
+    }
+    emit_run_event(
+        &tool_state.active_runs,
+        run_id,
+        StreamEvent::RunLimitReached {
+            run_id: run_id.to_string(),
+            kind: paused_state.limit_hit.kind.clone(),
+            limit: paused_state.limit_hit.limit,
+            observed: paused_state.limit_hit.observed,
+        },
+    )?;
+    emit_run_event(
+        &tool_state.active_runs,
+        run_id,
+        StreamEvent::RunWaitingConfirmation {
+            run_id: run_id.to_string(),
+            message: "This review hit the configured soft budget. Continue to open a fresh budget window, or stop and keep the partial result.".to_string(),
+        },
+    )
+}
+
+fn emit_usage_update(tool_state: &McpState, run_id: &str, on_event: &Channel<StreamEvent>) {
+    let snapshot = {
+        let runs = tool_state.active_runs.lock().unwrap();
+        runs.get(run_id).map(|run| {
+            (
+                run.usage.clone(),
+                run.window_started_at.elapsed().as_secs(),
+            )
+        })
+    };
+    if let Some((usage, wall_clock_seconds)) = snapshot {
+        let _ = on_event.send(StreamEvent::RunUsageUpdate {
+            run_id: run_id.to_string(),
+            llm_calls: usage.llm_calls,
+            tool_calls: usage.tool_calls,
+            spawned_agents: usage.spawned_agents,
+            streamed_tokens: usage.streamed_tokens,
+            embedding_calls: usage.embedding_calls,
+            wall_clock_seconds,
+        });
+    }
+}
+
+/// Stores the manager agent's current conversation state so that budget-hit summarization
+/// can always use the full manager context regardless of which agent triggers the limit.
+fn update_manager_context(
+    tool_state: &McpState,
+    run_id: &str,
+    agent_id: &str,
+    model_key: &str,
+    messages: &[Value],
+) {
+    let mut runs = tool_state.active_runs.lock().unwrap();
+    if let Some(run) = runs.get_mut(run_id) {
+        run.manager_agent_id = Some(agent_id.to_string());
+        run.manager_model_key = Some(model_key.to_string());
+        run.manager_messages = messages.to_vec();
+    }
+}
+
+fn record_embedding_calls(tool_state: &McpState, run_id: &str, count: u32) {
+    if count == 0 {
+        return;
+    }
+    let mut runs = tool_state.active_runs.lock().unwrap();
+    if let Some(run) = runs.get_mut(run_id) {
+        run.usage.embedding_calls += count;
+    }
+}
+
+enum BudgetLimitOutcome {
+    /// A final summary was streamed as tokens — routing must stop without re-routing the text.
+    Summarized,
+    /// Stop immediately — routing must stop.
+    Stopped,
+    /// Pause and wait for user confirmation (original behaviour).
+    Paused,
+}
+
+/// Reads `on_limit` from the current agent config and decides what to do on a budget hit.
+fn budget_limit_action(tool_state: &McpState) -> (String, BudgetHitSummarizationConfig) {
+    let cfg = tool_state.agent_config.lock().unwrap();
+    (
+        cfg.run_budgets.on_limit.clone(),
+        cfg.run_budgets.summarization.clone(),
+    )
+}
+
+/// One-shot LLM call that produces a synthesis without tools.
+/// Always uses the manager agent's context (messages + agent_id) so the summary
+/// covers all sub-agent tool results. Model priority: config override > manager model > current agent model.
+async fn force_budget_summary(
+    fallback_model_key: &str,
+    fallback_messages: &[Value],
+    fallback_agent_id: &str,
+    summary_prompt: &str,
+    model_override: Option<&str>,
+    run_id: &str,
+    tool_state: &McpState,
+    on_event: &Channel<StreamEvent>,
+) {
+    let (manager_model, messages, agent_id) = {
+        let runs = tool_state.active_runs.lock().unwrap();
+        if let Some(run) = runs.get(run_id) {
+            match (&run.manager_agent_id, &run.manager_model_key) {
+                (Some(mid), Some(mmodel)) if !run.manager_messages.is_empty() => {
+                    (Some(mmodel.clone()), run.manager_messages.clone(), mid.clone())
+                }
+                _ => (None, fallback_messages.to_vec(), fallback_agent_id.to_string()),
+            }
+        } else {
+            (None, fallback_messages.to_vec(), fallback_agent_id.to_string())
+        }
+    };
+    // Priority: explicit config override > manager model > current agent model
+    let model_key = model_override
+        .or(manager_model.as_deref())
+        .unwrap_or(fallback_model_key);
+
+    let url = format!("{}/v1/chat/completions", lm_base_url());
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .unwrap_or_default();
+
+    let mut summary_messages = messages;
+    summary_messages.push(json!({"role": "user", "content": summary_prompt}));
+
+    let body = json!({
+        "model": model_key,
+        "messages": summary_messages,
+        "stream": true,
+        "stream_options": { "include_usage": true },
+    });
+
+    let _ = on_event.send(StreamEvent::AgentStatus {
+        run_id: run_id.to_string(),
+        agent_id: agent_id.clone(),
+        stage: "thinking".to_string(),
+        detail: "Generating budget-limit summary".to_string(),
+    });
+
+    let _ = stream_chat_completion_turn(&client, &url, &body, run_id, &agent_id, on_event).await;
+}
+
+/// Handles a budget limit hit: summarize, stop, or pause based on config.
+async fn resolve_budget_limit(
+    tool_state: &McpState,
+    run_id: &str,
+    model_key: &str,
+    messages: &[Value],
+    agent_id: &str,
+    paused_state: PausedRunState,
+    on_event: &Channel<StreamEvent>,
+) -> Result<BudgetLimitOutcome, String> {
+    let (on_limit, sum_cfg) = budget_limit_action(tool_state);
+    match on_limit.as_str() {
+        "summarize" if sum_cfg.enabled => {
+            force_budget_summary(
+                model_key,
+                messages,
+                agent_id,
+                &sum_cfg.prompt,
+                sum_cfg.model_key.as_deref(),
+                run_id,
+                tool_state,
+                on_event,
+            ).await;
+            Ok(BudgetLimitOutcome::Summarized)
+        }
+        "stop" => Ok(BudgetLimitOutcome::Stopped),
+        _ => {
+            // "pause" or "summarize" with disabled summarization
+            pause_run_for_confirmation(tool_state, run_id, paused_state)?;
+            Ok(BudgetLimitOutcome::Paused)
+        }
+    }
+}
+
 /// Manager agent path: iterates the tool-call loop until the LLM returns a text response.
 /// Emits Token events so the frontend streams the final answer.
 /// `history` contains previous [user / assistant] turns for this agent.
@@ -167,6 +773,7 @@ pub(crate) async fn call_chat_with_tools(
     model_key: &str,
     system_prompt: &str,
     message: &str,
+    run_id: &str,
     agent_id: &str,
     tools: &[McpTool],
     allowed_tools: Option<&[String]>,
@@ -188,25 +795,29 @@ pub(crate) async fn call_chat_with_tools(
             config.behavior_triggers.clone(),
         )
     };
-    let active_behaviors = resolve_active_behaviors(
+    let (active_behaviors, behavior_embed_calls) = resolve_active_behaviors(
         message,
         inherited_behaviors,
         &behavior_triggers,
         &tool_state.behavior_trigger_cache,
     )
     .await;
-    let grounded_audit_mode = active_behaviors.contains(GROUNDED_AUDIT_BEHAVIOR_ID);
+    record_embedding_calls(tool_state, run_id, behavior_embed_calls);
+    let audit_config = resolve_audit_behavior_config(&active_behaviors, &behavior_triggers);
+    let audit_mode = audit_config.is_some();
+    sync_active_run_behaviors(tool_state, run_id, &active_behaviors);
     tool_state
         .active_behavior_contexts
         .lock()
         .unwrap()
-        .insert(agent_id.to_string(), active_behaviors);
+        .insert(agent_id.to_string(), active_behaviors.clone());
     let _behavior_context_guard = ActiveBehaviorContextGuard {
         state: tool_state,
         agent_id: agent_id.to_string(),
     };
     let audit_request_summary = summarize_audit_request(message);
-    let budget_tools = visible_tools_for_agent(tools, allowed_tools, allow_manager_tools, glob_ready);
+    let budget_tools =
+        visible_tools_for_agent(tools, allowed_tools, allow_manager_tools, glob_ready);
     let tool_defs: Vec<Value> = budget_tools
         .iter()
         .map(|t| {
@@ -236,16 +847,24 @@ pub(crate) async fn call_chat_with_tools(
         .div_ceil(4);
     let budget = compute_context_budget(
         system_prompt,
-        history,
+        &trim_history_to_budget(
+            system_prompt,
+            history,
+            message,
+            context_limit,
+            tool_overhead,
+        ),
         message,
         context_limit,
         tool_overhead,
     );
     let effective_system_prompt = with_context_budget(system_prompt, budget);
+    let trimmed_history =
+        trim_history_to_budget(system_prompt, history, message, context_limit, tool_overhead);
     if !effective_system_prompt.is_empty() {
         messages.push(json!({"role": "system", "content": effective_system_prompt}));
     }
-    for h in history {
+    for h in &trimmed_history {
         messages.push(h.clone());
     }
     messages.push(json!({"role": "user", "content": message}));
@@ -264,22 +883,39 @@ pub(crate) async fn call_chat_with_tools(
     let mut covered_audit_topics: Vec<CoveredAuditTopic> = Vec::new();
     let mut redundant_audit_retries = 0usize;
     let mut weak_delegation_retries: HashMap<String, usize> = HashMap::new();
-    let mut coverage_manifest = if grounded_audit_mode {
+    let mut coverage_manifest = if audit_config
+        .as_ref()
+        .map(|config| config.coverage_manifest.enabled)
+        .unwrap_or(false)
+    {
         initialize_audit_coverage_manifest(message)
     } else {
         Vec::new()
     };
-    const NON_PROGRESS_LIMIT: usize = 4;
+    let non_progress_limit = audit_config
+        .as_ref()
+        .and_then(|config| config.non_progress.limit)
+        .unwrap_or(4);
 
     for _ in 0u8..64 {
-        let redundancy_note =
-            audit_runtime_note(grounded_audit_mode, &covered_audit_topics, &coverage_manifest);
+        // Keep manager context snapshot fresh so budget-hit summarization always has
+        // the latest tool results, regardless of which agent triggers the limit.
+        if allow_manager_tools {
+            update_manager_context(tool_state, run_id, agent_id, model_key, &messages);
+        }
+        let redundancy_note = audit_runtime_note(
+            audit_config.as_ref(),
+            &covered_audit_topics,
+            &coverage_manifest,
+        );
         let mut request_messages = vec![];
-        if grounded_audit_mode {
-            request_messages.push(json!({
-                "role": "system",
-                "content": grounded_audit_behavior_prompt(),
-            }));
+        if let Some(config) = audit_config.as_ref() {
+            if let Some(injection) = config.system_prompt_injection.as_deref() {
+                request_messages.push(json!({
+                    "role": "system",
+                        "content": injection,
+                }));
+            }
         }
         request_messages.extend(messages.clone());
         if let Some(note) = redundancy_note {
@@ -306,33 +942,88 @@ pub(crate) async fn call_chat_with_tools(
                 })
             })
             .collect();
+        let _ = on_event.send(StreamEvent::AgentStatus {
+            run_id: run_id.to_string(),
+            agent_id: agent_id.to_string(),
+            stage: "thinking".to_string(),
+            detail: if tool_burst == 0 {
+                "Generating response".to_string()
+            } else {
+                format!("Generating follow-up after {} tool call(s)", tool_burst)
+            },
+        });
+        if let Err(limit_hit) = check_run_budget_for_llm_call(tool_state, run_id, &active_behaviors)
+        {
+            let paused_state = PausedRunState {
+                agent_id: agent_id.to_string(),
+                model_key: model_key.to_string(),
+                system_prompt: system_prompt.to_string(),
+                messages: messages.clone(),
+                allowed_tools: allowed_tools.map(|tools| tools.to_vec()),
+                allow_manager_tools,
+                require_delegation,
+                context_limit,
+                glob_ready: glob_scope_ready,
+                active_behaviors: active_behaviors.clone(),
+                usage: capture_run_usage(tool_state, run_id),
+                limit_hit,
+            };
+            match resolve_budget_limit(tool_state, run_id, model_key, &messages, agent_id, paused_state, on_event).await? {
+                BudgetLimitOutcome::Summarized => return Err(RUN_BUDGET_ENDED_ERROR.to_string()),
+                BudgetLimitOutcome::Stopped => return Err(RUN_BUDGET_ENDED_ERROR.to_string()),
+                BudgetLimitOutcome::Paused => return Err(RUN_PAUSED_ERROR.to_string()),
+            }
+        }
+
         let body = json!({
             "model": model_key,
             "messages": request_messages,
             "tools": tool_defs,
-            "stream": false,
+            "stream": true,
+            "stream_options": { "include_usage": true },
         });
 
-        let resp = llm_client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("Request failed: {}", e))?;
-        if !resp.status().is_success() {
-            return Err(format!(
-                "LLM error: {}",
-                resp.text().await.unwrap_or_default()
-            ));
-        }
-        let data: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("Parse error: {}", e))?;
+        let streamed_turn =
+            stream_chat_completion_turn(&llm_client, &url, &body, run_id, agent_id, on_event)
+                .await?;
+        let assistant_msg = streamed_turn.assistant_message.clone();
 
-        let choice = &data["choices"][0];
-        let _finish_reason = choice["finish_reason"].as_str().unwrap_or("");
-        let assistant_msg = choice["message"].clone();
+        emit_generation_metrics(
+            on_event,
+            run_id,
+            agent_id,
+            "generated",
+            &streamed_turn.usage,
+            estimated_stream_output_tokens(&streamed_turn.content),
+        );
+        if let Err(limit_hit) = record_run_streamed_tokens(
+            tool_state,
+            run_id,
+            &active_behaviors,
+            estimated_stream_output_tokens(&streamed_turn.content),
+        ) {
+            let paused_state = PausedRunState {
+                agent_id: agent_id.to_string(),
+                model_key: model_key.to_string(),
+                system_prompt: system_prompt.to_string(),
+                messages: messages.clone(),
+                allowed_tools: allowed_tools.map(|tools| tools.to_vec()),
+                allow_manager_tools,
+                require_delegation,
+                context_limit,
+                glob_ready: glob_scope_ready,
+                active_behaviors: active_behaviors.clone(),
+                usage: capture_run_usage(tool_state, run_id),
+                limit_hit,
+            };
+            match resolve_budget_limit(tool_state, run_id, model_key, &messages, agent_id, paused_state, on_event).await? {
+                BudgetLimitOutcome::Summarized => return Err(RUN_BUDGET_ENDED_ERROR.to_string()),
+                BudgetLimitOutcome::Stopped => return Err(RUN_BUDGET_ENDED_ERROR.to_string()),
+                BudgetLimitOutcome::Paused => return Err(RUN_PAUSED_ERROR.to_string()),
+            }
+        }
+
+        emit_usage_update(tool_state, run_id, on_event);
 
         // Only treat as tool call if the array is non-empty ([] means no calls)
         let tool_calls_arr = assistant_msg["tool_calls"]
@@ -354,44 +1045,82 @@ pub(crate) async fn call_chat_with_tools(
                 if is_delegation_tool(&fn_name) {
                     delegated = true;
                 }
-                if grounded_audit_mode {
+                if audit_config
+                    .as_ref()
+                    .map(|config| config.coverage_manifest.enabled)
+                    .unwrap_or(false)
+                {
                     extend_audit_coverage_manifest(&mut coverage_manifest, &args_text);
                 }
                 tool_burst += 1;
 
                 // Notify frontend: tool about to be called
+                if let Err(limit_hit) =
+                    check_run_budget_for_tool_call(tool_state, run_id, &active_behaviors, &fn_name)
+                {
+                    let paused_state = PausedRunState {
+                        agent_id: agent_id.to_string(),
+                        model_key: model_key.to_string(),
+                        system_prompt: system_prompt.to_string(),
+                        messages: messages.clone(),
+                        allowed_tools: allowed_tools.map(|tools| tools.to_vec()),
+                        allow_manager_tools,
+                        require_delegation,
+                        context_limit,
+                        glob_ready: glob_scope_ready,
+                        active_behaviors: active_behaviors.clone(),
+                        usage: capture_run_usage(tool_state, run_id),
+                        limit_hit,
+                    };
+                    match resolve_budget_limit(tool_state, run_id, model_key, &messages, agent_id, paused_state, on_event).await? {
+                        BudgetLimitOutcome::Summarized => return Err(RUN_BUDGET_ENDED_ERROR.to_string()),
+                        BudgetLimitOutcome::Stopped => return Err(RUN_BUDGET_ENDED_ERROR.to_string()),
+                        BudgetLimitOutcome::Paused => return Err(RUN_PAUSED_ERROR.to_string()),
+                    }
+                }
+                let _ = on_event.send(StreamEvent::AgentStatus {
+                    run_id: run_id.to_string(),
+                    agent_id: agent_id.to_string(),
+                    stage: "tool_call".to_string(),
+                    detail: format!("Calling tool {}", fn_name),
+                });
                 let _ = on_event.send(StreamEvent::ToolCall {
+                    run_id: run_id.to_string(),
                     agent_id: agent_id.to_string(),
                     tool_name: fn_name.clone(),
                     args: serde_json::to_string_pretty(&fn_args).unwrap_or_default(),
                 });
 
-                let pre_dispatch_topic = if grounded_audit_mode && allow_manager_tools {
-                    Some(
-                        materialize_audit_topic(
-                            &fn_name,
-                            &args_text,
-                            None,
-                            &audit_request_summary,
-                            &redundancy_config,
-                        )
-                        .await,
-                    )
-                } else {
-                    None
-                };
-
-                let redundant_before_dispatch = if let Some(Some(candidate)) = pre_dispatch_topic.as_ref() {
-                    detect_redundant_audit_topic(
-                        candidate,
-                        &covered_audit_topics,
+                let pre_dispatch_topic = if audit_mode && allow_manager_tools {
+                    let (topic, embed_called) = materialize_audit_topic(
+                        &fn_name,
+                        &args_text,
+                        None,
+                        &audit_request_summary,
                         &redundancy_config,
                     )
+                    .await;
+                    if embed_called {
+                        record_embedding_calls(tool_state, run_id, 1);
+                    }
+                    Some(topic)
                 } else {
                     None
                 };
 
-                let (tool_is_error, tool_text) = if let Some(reason) = redundant_before_dispatch.clone()
+                let redundant_before_dispatch =
+                    if let Some(Some(candidate)) = pre_dispatch_topic.as_ref() {
+                        detect_redundant_audit_topic(
+                            candidate,
+                            &covered_audit_topics,
+                            &redundancy_config,
+                        )
+                    } else {
+                        None
+                    };
+
+                let (tool_is_error, tool_text) = if let Some(reason) =
+                    redundant_before_dispatch.clone()
                 {
                     (
                         false,
@@ -413,9 +1142,21 @@ pub(crate) async fn call_chat_with_tools(
                     tool_text.clone()
                 };
                 let _ = on_event.send(StreamEvent::ToolResult {
+                    run_id: run_id.to_string(),
                     agent_id: agent_id.to_string(),
                     tool_name: fn_name.clone(),
                     result: preview,
+                });
+                let _ = on_event.send(StreamEvent::AgentStatus {
+                    run_id: run_id.to_string(),
+                    agent_id: agent_id.to_string(),
+                    stage: if tool_is_error {
+                        "tool_error"
+                    } else {
+                        "tool_result"
+                    }
+                    .to_string(),
+                    detail: format!("{} returned {} chars", fn_name, tool_text.chars().count()),
                 });
 
                 messages.push(json!({
@@ -428,7 +1169,7 @@ pub(crate) async fn call_chat_with_tools(
                     redundant_audit_retries += 1;
                     non_progress_count += 1;
                     if allow_manager_tools
-                        && has_usable_evidence(&messages, grounded_audit_mode)
+                        && has_usable_evidence(&messages, audit_config.as_ref())
                         && redundant_audit_retries
                             > usize::from(redundancy_config.max_redundant_audit_retries)
                     {
@@ -439,14 +1180,21 @@ pub(crate) async fn call_chat_with_tools(
 
                 let failure_signature = classify_non_progress_tool_result(&fn_name, &tool_text);
                 if fn_name == "glob_search" {
-                    glob_scope_ready = !tool_is_error && !tool_text.trim().is_empty() && tool_text != "No files matched.";
+                    glob_scope_ready = !tool_is_error
+                        && !tool_text.trim().is_empty()
+                        && tool_text != "No files matched.";
                 }
-                if grounded_audit_mode {
+                if audit_config
+                    .as_ref()
+                    .map(|config| config.coverage_manifest.enabled)
+                    .unwrap_or(false)
+                {
                     update_audit_coverage_manifest_from_result(
                         &mut coverage_manifest,
                         &fn_name,
                         &args_text,
                         &tool_text,
+                        audit_config.as_ref(),
                     );
                 }
                 if tool_is_error || failure_signature.is_some() {
@@ -463,15 +1211,15 @@ pub(crate) async fn call_chat_with_tools(
                                 Some(sig) if sig.ends_with("::agent_error")
                                     || sig.ends_with("::internal_dispatch_failure")
                             ))
-                        && has_usable_evidence(&messages, grounded_audit_mode)
+                        && has_usable_evidence(&messages, audit_config.as_ref())
                     {
                         must_finish_from_evidence = true;
                     }
-                } else if is_delegation_tool(&fn_name)
-                    && is_unusable_delegation_result(&tool_text)
+                } else if is_delegation_tool(&fn_name) && is_unusable_delegation_result(&tool_text)
                 {
                     non_progress_count += 1;
-                    if allow_manager_tools && has_usable_evidence(&messages, grounded_audit_mode) {
+                    if allow_manager_tools && has_usable_evidence(&messages, audit_config.as_ref())
+                    {
                         must_finish_from_evidence = true;
                     }
                 } else if !tool_text.trim().is_empty() {
@@ -479,16 +1227,19 @@ pub(crate) async fn call_chat_with_tools(
                     non_progress_count = 0;
                 }
 
-                if grounded_audit_mode && allow_manager_tools {
-                    if let Some(topic) = materialize_audit_topic(
+                if audit_mode && allow_manager_tools {
+                    let (post_topic_opt, post_embed_called) = materialize_audit_topic(
                         &fn_name,
                         &args_text,
                         Some(&tool_text),
                         &audit_request_summary,
                         &redundancy_config,
                     )
-                    .await
-                    {
+                    .await;
+                    if post_embed_called {
+                        record_embedding_calls(tool_state, run_id, 1);
+                    }
+                    if let Some(topic) = post_topic_opt {
                         if let Some(_reason) = detect_redundant_audit_topic(
                             &topic,
                             &covered_audit_topics,
@@ -497,7 +1248,7 @@ pub(crate) async fn call_chat_with_tools(
                             redundant_audit_retries += 1;
                             non_progress_count += 1;
                             if allow_manager_tools
-                                && has_usable_evidence(&messages, grounded_audit_mode)
+                                && has_usable_evidence(&messages, audit_config.as_ref())
                                 && redundant_audit_retries
                                     > usize::from(redundancy_config.max_redundant_audit_retries)
                             {
@@ -510,70 +1261,103 @@ pub(crate) async fn call_chat_with_tools(
                     }
                 }
 
-                if grounded_audit_mode && is_delegation_tool(&fn_name) && !tool_is_error {
-                    let delegation_topic_key =
-                        stable_delegation_retry_key(&args_text, &audit_request_summary);
-                    if is_weak_audit_delegation_result(&tool_text, &covered_audit_topics) {
-                        let retries = weak_delegation_retries
-                            .entry(delegation_topic_key.clone())
-                            .or_insert(0);
-                        *retries += 1;
-                        if *retries == 1 {
-                            non_progress_count += 1;
-                            messages.push(json!({
+                if let Some(config) = audit_config
+                    .as_ref()
+                    .filter(|config| config.delegation_validation.enabled)
+                {
+                    if is_delegation_tool(&fn_name) && !tool_is_error {
+                        let delegation_topic_key =
+                            stable_delegation_retry_key(&args_text, &audit_request_summary);
+                        if is_weak_audit_delegation_result(
+                            &tool_text,
+                            &covered_audit_topics,
+                            config,
+                        ) {
+                            let retries = weak_delegation_retries
+                                .entry(delegation_topic_key.clone())
+                                .or_insert(0);
+                            *retries += 1;
+                            let max_weak_retries =
+                                config.delegation_validation.max_weak_retries.unwrap_or(1);
+                            if *retries <= max_weak_retries {
+                                non_progress_count += 1;
+                                messages.push(json!({
                                 "role": "user",
-                                "content": format!(
-                                    "The delegated audit result on `{}` did not add new useful evidence. Retry this topic at most once with one concrete file or function to inspect and one concrete question to answer. Do not return a plan, status update, or generic hypotheses.",
-                                    delegation_topic_key
-                                )
+                                    "content": render_audit_template(
+                                        config
+                                            .delegation_validation
+                                            .retry_prompt_template
+                                            .as_deref()
+                                            .unwrap_or("The delegated audit result on `{topic}` did not add new useful evidence. Retry this topic at most once with one concrete file or function to inspect and one concrete question to answer. Do not return a plan, status update, or generic hypotheses."),
+                                        &[("topic", delegation_topic_key.clone())],
+                                    )
                             }));
-                        } else {
-                            non_progress_count += 2;
-                            redundant_audit_retries += 1;
-                            if allow_manager_tools && has_usable_evidence(&messages, grounded_audit_mode) {
-                                must_finish_from_evidence = true;
+                            } else {
+                                non_progress_count += 2;
+                                redundant_audit_retries += 1;
+                                if allow_manager_tools
+                                    && has_usable_evidence(&messages, audit_config.as_ref())
+                                {
+                                    must_finish_from_evidence = true;
+                                }
                             }
                         }
                     }
                 }
 
-                if grounded_audit_mode
+                if audit_mode
                     && allow_manager_tools
-                    && has_usable_evidence(&messages, true)
+                    && has_usable_evidence(&messages, audit_config.as_ref())
                     && should_force_audit_synthesis(
                         &messages,
                         &covered_audit_topics,
                         &coverage_manifest,
                         redundant_audit_retries,
                         &redundancy_config,
+                        audit_config.as_ref(),
                     )
                 {
                     must_finish_from_evidence = true;
                 }
 
-                if tool_burst >= 3 {
-                    let reflection =
-                        force_tool_free_reflection(&llm_client, &url, model_key, &messages).await?;
-                    if !reflection.is_empty() {
-                        messages.push(json!({"role": "assistant", "content": reflection}));
+                if let Some(config) = audit_config.as_ref() {
+                    if let Some(limit) = config.tool_burst_reflection.limit {
+                        if tool_burst >= limit {
+                            let reflection = force_tool_free_reflection(
+                                &llm_client,
+                                &url,
+                                model_key,
+                                &messages,
+                                config,
+                            )
+                            .await?;
+                            if !reflection.is_empty() {
+                                messages.push(json!({"role": "assistant", "content": reflection}));
+                            }
+                            tool_burst = 0;
+                        }
                     }
-                    tool_burst = 0;
                 }
             }
             if !iteration_progress {
                 non_progress_count += 1;
             }
-            if must_finish_from_evidence || non_progress_count >= NON_PROGRESS_LIMIT {
-                let missing_scope_refs =
-                    unresolved_audit_coverage_manifest_entries(&coverage_manifest, None);
+            emit_usage_update(tool_state, run_id, on_event);
+            if must_finish_from_evidence || non_progress_count >= non_progress_limit {
+                let missing_scope_refs = unresolved_audit_coverage_manifest_entries(
+                    &coverage_manifest,
+                    None,
+                    audit_config.as_ref(),
+                );
                 return Ok(force_non_progress_summary(
                     &llm_client,
                     &url,
                     model_key,
                     &messages,
-                    grounded_audit_mode,
+                    audit_config.as_ref(),
                     &missing_scope_refs,
-                ).await);
+                )
+                .await);
             }
         } else {
             if require_delegation && !delegated {
@@ -584,77 +1368,83 @@ pub(crate) async fn call_chat_with_tools(
                 continue;
             }
 
-            // We already have the final assistant message in this non-streaming response.
-            // Re-issuing a second streaming request can lose the answer and return an empty string.
-            let final_content = assistant_msg["content"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+            let final_content = assistant_msg["content"].as_str().unwrap_or("").to_string();
 
-            let final_content = if grounded_audit_mode
-                && audit_response_needs_rewrite(&final_content, audit_evidence_grade(&messages))
-            {
-                rewrite_grounded_audit_response(
-                    &llm_client,
-                    &url,
-                    model_key,
-                    &messages,
+            let mut final_content = final_content;
+            if let Some(config) = audit_config.as_ref() {
+                if audit_response_needs_rewrite(
                     &final_content,
-                )
-                .await
-            } else {
-                final_content
-            };
+                    audit_evidence_grade(&messages, config),
+                    config,
+                ) {
+                    final_content = rewrite_grounded_audit_response(
+                        &llm_client,
+                        &url,
+                        model_key,
+                        &messages,
+                        &final_content,
+                        config,
+                    )
+                    .await;
+                }
+            }
 
-            let missing_scope_refs = if grounded_audit_mode {
-                unresolved_audit_coverage_manifest_entries(&coverage_manifest, Some(&final_content))
+            let missing_scope_refs = if audit_config
+                .as_ref()
+                .map(|config| config.coverage_manifest.enabled)
+                .unwrap_or(false)
+            {
+                unresolved_audit_coverage_manifest_entries(
+                    &coverage_manifest,
+                    Some(&final_content),
+                    audit_config.as_ref(),
+                )
             } else {
                 Vec::new()
             };
 
             if final_content.trim().is_empty() || is_progress_only_response(&final_content) {
                 non_progress_count += 1;
-                if non_progress_count >= NON_PROGRESS_LIMIT {
-                    let missing_scope_refs =
-                        unresolved_audit_coverage_manifest_entries(&coverage_manifest, None);
+                if non_progress_count >= non_progress_limit {
+                    let missing_scope_refs = unresolved_audit_coverage_manifest_entries(
+                        &coverage_manifest,
+                        None,
+                        audit_config.as_ref(),
+                    );
                     return Ok(force_non_progress_summary(
                         &llm_client,
                         &url,
                         model_key,
                         &messages,
-                        grounded_audit_mode,
+                        audit_config.as_ref(),
                         &missing_scope_refs,
-                    ).await);
+                    )
+                    .await);
                 }
                 messages.push(json!({
                     "role": "user",
-                    "content": "Your previous response did not contain a usable final answer. Stop exploring and provide either concrete findings or a short bounded summary of what is known, what blocked progress, and the smallest remaining useful next step."
+                    "content": audit_config
+                        .as_ref()
+                        .and_then(|config| config.non_progress.stall_prompt.clone())
+                        .unwrap_or_else(|| "Your previous response did not contain a usable final answer. Stop exploring and provide either concrete findings or a short bounded summary of what is known, what blocked progress, and the smallest remaining useful next step.".to_string())
                 }));
                 continue;
             }
-            if grounded_audit_mode && !missing_scope_refs.is_empty() {
-                messages.push(json!({
-                    "role": "user",
-                    "content": format!(
-                        "Before concluding, you must either inspect these required audit scopes or name them explicitly under `Coverage gaps`: {}. Do not omit them.",
-                        missing_scope_refs.join(", ")
-                    )
-                }));
-                continue;
-            }
-            if grounded_audit_mode && hypotheses_need_rewrite(&final_content) {
-                messages.push(json!({
-                    "role": "user",
-                    "content": "Your `Hypotheses / lower-confidence risks` section is still too generic or template-like. Keep only hypotheses tied to a concrete file/config or observed behavior already in context, and state the missing proof needed to confirm them. Remove generic dependency-presence or stack-template risks."
-                }));
-                continue;
-            }
-
-            if !final_content.is_empty() {
-                let _ = on_event.send(StreamEvent::Token {
-                    agent_id: agent_id.to_string(),
-                    content: final_content.clone(),
-                });
+            if let Some(config) = audit_config.as_ref() {
+                if config.coverage_manifest.require_resolution && !missing_scope_refs.is_empty() {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": unresolved_coverage_prompt(config, &missing_scope_refs),
+                    }));
+                    continue;
+                }
+                if let Some(prompt) = audit_section_followup_prompt(&final_content, config) {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": prompt,
+                    }));
+                    continue;
+                }
             }
 
             return Ok(final_content);
@@ -665,9 +1455,14 @@ pub(crate) async fn call_chat_with_tools(
         &url,
         model_key,
         &messages,
-        grounded_audit_mode,
-        &unresolved_audit_coverage_manifest_entries(&coverage_manifest, None),
-    ).await)
+        audit_config.as_ref(),
+        &unresolved_audit_coverage_manifest_entries(
+            &coverage_manifest,
+            None,
+            audit_config.as_ref(),
+        ),
+    )
+    .await)
 }
 
 #[derive(Clone, Serialize)]
@@ -675,15 +1470,51 @@ pub(crate) async fn call_chat_with_tools(
 pub(crate) enum StreamEvent {
     #[serde(rename = "agent_start")]
     AgentStart {
+        run_id: String,
         agent_id: String,
         agent_name: String,
+        model_key: String,
+        mode: String,
+        is_manager: bool,
+        context_limit: u64,
+        estimated_input_tokens: u64,
+        estimated_remaining_tokens: u64,
     },
     #[serde(rename = "token")]
-    Token { agent_id: String, content: String },
+    Token {
+        run_id: String,
+        agent_id: String,
+        content: String,
+    },
+    #[serde(rename = "agent_status")]
+    AgentStatus {
+        run_id: String,
+        agent_id: String,
+        stage: String,
+        detail: String,
+    },
+    #[serde(rename = "agent_metrics")]
+    AgentMetrics {
+        run_id: String,
+        agent_id: String,
+        stage: String,
+        estimated_output_tokens: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_tokens: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_tokens: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_output_tokens: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tokens_per_second: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        time_to_first_token_seconds: Option<f64>,
+    },
     #[serde(rename = "agent_end")]
-    AgentEnd { agent_id: String },
+    AgentEnd { run_id: String, agent_id: String },
     #[serde(rename = "error")]
     Error {
+        run_id: String,
         agent_id: String,
         agent_name: String,
         message: String,
@@ -691,6 +1522,7 @@ pub(crate) enum StreamEvent {
     /// Emitted just before a manager tool call is dispatched.
     #[serde(rename = "tool_call")]
     ToolCall {
+        run_id: String,
         agent_id: String,
         tool_name: String,
         args: String,
@@ -698,12 +1530,50 @@ pub(crate) enum StreamEvent {
     /// Emitted after the tool returns its result.
     #[serde(rename = "tool_result")]
     ToolResult {
+        run_id: String,
         agent_id: String,
         tool_name: String,
         result: String,
     },
+    #[serde(rename = "run_limit_reached")]
+    RunLimitReached {
+        run_id: String,
+        kind: String,
+        limit: u64,
+        observed: u64,
+    },
+    #[serde(rename = "run_waiting_confirmation")]
+    RunWaitingConfirmation {
+        run_id: String,
+        message: String,
+    },
+    #[serde(rename = "run_resumed")]
+    RunResumed {
+        run_id: String,
+        message: String,
+    },
+    #[serde(rename = "run_cancelled")]
+    RunCancelled {
+        run_id: String,
+        message: String,
+    },
+    #[serde(rename = "run_checkpoint_saved")]
+    RunCheckpointSaved {
+        run_id: String,
+        checkpoint: String,
+    },
+    #[serde(rename = "run_usage_update")]
+    RunUsageUpdate {
+        run_id: String,
+        llm_calls: u32,
+        tool_calls: u32,
+        spawned_agents: u32,
+        streamed_tokens: u64,
+        embedding_calls: u32,
+        wall_clock_seconds: u64,
+    },
     #[serde(rename = "done")]
-    Done,
+    Done { run_id: String },
 }
 
 /// Strip verbose descriptions from a JSON Schema while keeping the structure
@@ -885,17 +1755,36 @@ fn requested_broad_audit_scopes(text: &str) -> Vec<AuditCoverageScope> {
     let lower = text.to_lowercase();
     let mut scopes = Vec::new();
     if lower.contains(".rs")
+        || lower.contains(".py")
+        || lower.contains(".go")
+        || lower.contains(".java")
+        || lower.contains(".kt")
+        || lower.contains(".rb")
+        || lower.contains(".php")
+        || lower.contains(".cs")
+        || lower.contains(".c")
+        || lower.contains(".cpp")
+        || lower.contains(".swift")
+        || lower.contains(".scala")
         || lower.contains(" rust")
         || lower.contains("backend")
-        || lower.contains("src-tauri")
+        || lower.contains("server")
+        || lower.contains("api")
+        || lower.contains("service")
     {
         scopes.push(AuditCoverageScope::BackendRust);
     }
     if lower.contains("frontend")
+        || lower.contains("client")
+        || lower.contains("ui")
         || lower.contains("src/")
         || lower.contains(".js")
         || lower.contains(".ts")
+        || lower.contains(".jsx")
+        || lower.contains(".tsx")
         || lower.contains(".html")
+        || lower.contains(".css")
+        || lower.contains(".scss")
         || lower.contains("renderer")
     {
         scopes.push(AuditCoverageScope::Frontend);
@@ -904,8 +1793,14 @@ fn requested_broad_audit_scopes(text: &str) -> Vec<AuditCoverageScope> {
         || lower.contains("configs")
         || lower.contains(".json")
         || lower.contains(".toml")
+        || lower.contains(".yaml")
+        || lower.contains(".yml")
+        || lower.contains(".xml")
+        || lower.contains(".ini")
+        || lower.contains(".env")
         || lower.contains("package.json")
-        || lower.contains("tauri.conf")
+        || lower.contains("dockerfile")
+        || lower.contains("compose")
     {
         scopes.push(AuditCoverageScope::Configs);
     }
@@ -931,21 +1826,38 @@ fn audit_scope_key(scope: AuditCoverageScope) -> &'static str {
 
 fn audit_scope_label(scope: AuditCoverageScope) -> &'static str {
     match scope {
-        AuditCoverageScope::BackendRust => "backend Rust (.rs / src-tauri)",
-        AuditCoverageScope::Frontend => "frontend (src / JS / TS / HTML)",
-        AuditCoverageScope::Configs => "configs (.json / .toml / package / tauri)",
-        AuditCoverageScope::Capabilities => "capabilities / permissions",
+        AuditCoverageScope::BackendRust => "backend / application code",
+        AuditCoverageScope::Frontend => "frontend / client code",
+        AuditCoverageScope::Configs => "configs / manifests / deployment files",
+        AuditCoverageScope::Capabilities => "permissions / capabilities / access control",
     }
 }
 
 fn is_high_signal_audit_ref(reference: &str) -> bool {
     let lower = reference.to_lowercase();
     lower.ends_with(".rs")
+        || lower.ends_with(".py")
+        || lower.ends_with(".go")
+        || lower.ends_with(".java")
+        || lower.ends_with(".kt")
+        || lower.ends_with(".rb")
+        || lower.ends_with(".php")
+        || lower.ends_with(".cs")
+        || lower.ends_with(".c")
+        || lower.ends_with(".cpp")
+        || lower.ends_with(".swift")
+        || lower.ends_with(".scala")
         || lower.ends_with(".js")
         || lower.ends_with(".ts")
+        || lower.ends_with(".jsx")
+        || lower.ends_with(".tsx")
         || lower.ends_with(".html")
+        || lower.ends_with(".css")
         || lower.ends_with(".json")
         || lower.ends_with(".toml")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".yml")
+        || lower.ends_with(".xml")
 }
 
 fn manifest_scope_matches_ref(manifest: &[AuditCoverageEntry], reference: &str) -> bool {
@@ -958,15 +1870,43 @@ fn manifest_scope_matches_ref(manifest: &[AuditCoverageEntry], reference: &str) 
 fn audit_scope_matches_ref(scope: AuditCoverageScope, reference: &str) -> bool {
     let lower = reference.to_lowercase();
     match scope {
-        AuditCoverageScope::BackendRust => lower.ends_with(".rs"),
+        AuditCoverageScope::BackendRust => {
+            lower.ends_with(".rs")
+                || lower.ends_with(".py")
+                || lower.ends_with(".go")
+                || lower.ends_with(".java")
+                || lower.ends_with(".kt")
+                || lower.ends_with(".rb")
+                || lower.ends_with(".php")
+                || lower.ends_with(".cs")
+                || lower.ends_with(".c")
+                || lower.ends_with(".cpp")
+                || lower.ends_with(".swift")
+                || lower.ends_with(".scala")
+        }
         AuditCoverageScope::Frontend => {
             lower.starts_with("src/")
+                || lower.starts_with("app/")
                 || lower.ends_with(".js")
                 || lower.ends_with(".ts")
+                || lower.ends_with(".jsx")
+                || lower.ends_with(".tsx")
                 || lower.ends_with(".html")
+                || lower.ends_with(".css")
         }
-        AuditCoverageScope::Configs => lower.ends_with(".json") || lower.ends_with(".toml"),
-        AuditCoverageScope::Capabilities => lower.contains("capabilities/") || lower.contains("permissions"),
+        AuditCoverageScope::Configs => {
+            lower.ends_with(".json")
+                || lower.ends_with(".toml")
+                || lower.ends_with(".yaml")
+                || lower.ends_with(".yml")
+                || lower.ends_with(".xml")
+                || lower.ends_with(".ini")
+                || lower.ends_with(".env")
+                || lower.ends_with("dockerfile")
+        }
+        AuditCoverageScope::Capabilities => {
+            lower.contains("capabilities/") || lower.contains("permissions")
+        }
     }
 }
 
@@ -975,17 +1915,24 @@ fn update_audit_coverage_manifest_from_result(
     _tool_name: &str,
     args_text: &str,
     tool_text: &str,
+    audit_config: Option<&ResolvedAuditBehaviorConfig>,
 ) {
     extend_audit_coverage_manifest(manifest, args_text);
     if manifest.iter().any(|entry| entry.scope.is_some()) {
         for reference in extract_explicit_audit_refs(tool_text) {
-            if is_high_signal_audit_ref(&reference) && manifest_scope_matches_ref(manifest, &reference) {
+            if is_high_signal_audit_ref(&reference)
+                && manifest_scope_matches_ref(manifest, &reference)
+            {
                 push_coverage_file_entry(manifest, &reference);
             }
         }
     }
-    if tool_text.to_lowercase().contains("coverage gaps") {
-        mark_audit_coverage_manifest_reported_gap(manifest, tool_text);
+    let gap_label = audit_config
+        .map(ResolvedAuditBehaviorConfig::gap_section_label)
+        .unwrap_or("Coverage gaps")
+        .to_lowercase();
+    if tool_text.to_lowercase().contains(&gap_label) {
+        mark_audit_coverage_manifest_reported_gap(manifest, tool_text, audit_config);
     }
 }
 
@@ -1004,12 +1951,16 @@ fn mark_audit_coverage_manifest_inspected(
             continue;
         }
         if let Some(scope) = entry.scope {
-            if refs.iter().any(|reference| audit_scope_matches_ref(scope, reference))
+            if refs
+                .iter()
+                .any(|reference| audit_scope_matches_ref(scope, reference))
                 && topic.inspection_depth >= AuditInspectionDepth::Targeted
             {
                 entry.status = AuditCoverageStatus::Inspected;
             }
-        } else if refs.iter().any(|reference| audit_ref_entry_matches(reference, &entry.label))
+        } else if refs
+            .iter()
+            .any(|reference| audit_ref_entry_matches(reference, &entry.label))
             && topic.inspection_depth >= AuditInspectionDepth::EvidenceBacked
         {
             entry.status = AuditCoverageStatus::Inspected;
@@ -1020,8 +1971,12 @@ fn mark_audit_coverage_manifest_inspected(
 fn mark_audit_coverage_manifest_reported_gap(
     manifest: &mut [AuditCoverageEntry],
     response: &str,
+    audit_config: Option<&ResolvedAuditBehaviorConfig>,
 ) {
-    let coverage_gaps = extract_audit_section(response, "coverage gaps", &[]);
+    let gap_label = audit_config
+        .map(ResolvedAuditBehaviorConfig::gap_section_label)
+        .unwrap_or("Coverage gaps");
+    let coverage_gaps = extract_audit_section(response, gap_label, &[]);
     let lower = coverage_gaps.to_lowercase();
     let seen_refs = extract_explicit_audit_refs(&coverage_gaps);
     for entry in manifest.iter_mut() {
@@ -1062,10 +2017,11 @@ fn gap_mentions_scope(lower: &str, scope: AuditCoverageScope) -> bool {
 fn unresolved_audit_coverage_manifest_entries(
     manifest: &[AuditCoverageEntry],
     response: Option<&str>,
+    audit_config: Option<&ResolvedAuditBehaviorConfig>,
 ) -> Vec<String> {
     let mut snapshot = manifest.to_vec();
     if let Some(text) = response {
-        mark_audit_coverage_manifest_reported_gap(&mut snapshot, text);
+        mark_audit_coverage_manifest_reported_gap(&mut snapshot, text, audit_config);
     }
     let mut missing = snapshot
         .iter()
@@ -1089,57 +2045,115 @@ fn summarize_audit_request(message: &str) -> String {
     normalize_topic_text(message, 18)
 }
 
+fn render_bullet_list(items: &[String], empty_label: &str) -> String {
+    if items.is_empty() {
+        format!("- {}", empty_label)
+    } else {
+        items
+            .iter()
+            .map(|item| format!("- {}", item))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn render_csv_list(items: &[String], empty_label: &str) -> String {
+    if items.is_empty() {
+        empty_label.to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
+fn render_required_sections_csv(config: &ResolvedAuditBehaviorConfig) -> String {
+    if config.required_sections.is_empty() {
+        "`Confirmed findings`, `Hypotheses / lower-confidence risks`, `Coverage gaps`".to_string()
+    } else {
+        config
+            .required_sections
+            .iter()
+            .map(|section| format!("`{}`", section))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn render_audit_template(template: &str, replacements: &[(&str, String)]) -> String {
+    let mut rendered = template.to_string();
+    for (key, value) in replacements {
+        rendered = rendered.replace(&format!("{{{}}}", key), value);
+    }
+    rendered
+}
+
 fn audit_runtime_note(
-    grounded_audit_mode: bool,
+    audit_config: Option<&ResolvedAuditBehaviorConfig>,
     covered_topics: &[CoveredAuditTopic],
     coverage_manifest: &[AuditCoverageEntry],
 ) -> Option<String> {
-    if !grounded_audit_mode || (covered_topics.is_empty() && coverage_manifest.is_empty()) {
+    let Some(config) = audit_config else {
+        return None;
+    };
+    if !config.runtime_note_enabled || (covered_topics.is_empty() && coverage_manifest.is_empty()) {
         return None;
     }
 
-    let items = covered_topics
+    let covered_items = covered_topics
         .iter()
         .rev()
         .take(4)
-        .map(|topic| format!("- {}", topic.summary))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let items = if items.is_empty() {
-        "- none yet".to_string()
-    } else {
-        items
-    };
-
-    let unresolved = unresolved_audit_coverage_manifest_entries(coverage_manifest, None);
-    let unresolved_note = if unresolved.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n\nRequired audit coverage still unresolved:\n{}",
-            unresolved
-                .iter()
-                .take(6)
-                .map(|entry| format!("- {}", entry))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
-    };
-
-    Some(format!(
-        "Audit topics already covered in this turn:\n{}\n\nAvoid re-delegating or re-checking the same file/function/theme unless you are opening a genuinely new code/config area. If current evidence is already sufficient, synthesize now.{}",
-        items,
-        unresolved_note
+        .map(|topic| topic.summary.clone())
+        .collect::<Vec<_>>();
+    let unresolved =
+        unresolved_audit_coverage_manifest_entries(coverage_manifest, None, Some(config));
+    let template = config
+        .runtime_note_template
+        .as_deref()
+        .unwrap_or("Audit topics already covered in this turn:\n{covered_topics_bullets}\n\nAvoid re-delegating or re-checking the same file/function/theme unless you are opening a genuinely new code/config area. If current evidence is already sufficient, synthesize now.\n\nRequired audit coverage still unresolved:\n{unresolved_scopes_bullets}");
+    Some(render_audit_template(
+        template,
+        &[
+            (
+                "covered_topics_bullets",
+                render_bullet_list(&covered_items, "none yet"),
+            ),
+            (
+                "covered_topics_csv",
+                render_csv_list(&covered_items, "none yet"),
+            ),
+            (
+                "unresolved_scopes_bullets",
+                render_bullet_list(
+                    &unresolved.iter().take(6).cloned().collect::<Vec<_>>(),
+                    "none",
+                ),
+            ),
+            (
+                "unresolved_scopes_csv",
+                render_csv_list(&unresolved, "none"),
+            ),
+            (
+                "required_sections_bullets",
+                render_bullet_list(&config.required_sections, "none"),
+            ),
+            (
+                "required_sections_csv",
+                render_required_sections_csv(config),
+            ),
+            ("gap_section_label", config.gap_section_label().to_string()),
+        ],
     ))
 }
 
+/// Returns `(topic, embedding_api_called)` where the bool is true when `create_embeddings`
+/// was actually invoked (not inferred from cache).
 async fn materialize_audit_topic(
     tool_name: &str,
     args_text: &str,
     tool_result: Option<&str>,
     audit_request_summary: &str,
     config: &RedundancyDetectionConfig,
-) -> Option<CoveredAuditTopic> {
+) -> (Option<CoveredAuditTopic>, bool) {
     let combined = format!(
         "{}\n{}\n{}\n{}",
         tool_name,
@@ -1148,43 +2162,50 @@ async fn materialize_audit_topic(
         tool_result.unwrap_or("")
     );
     if !looks_like_audit_topic(&combined) {
-        return None;
+        return (None, false);
     }
 
     let refs = extract_topic_refs(&combined);
     let target_refs = extract_target_refs(args_text);
     let terms = extract_topic_terms(&combined);
     if refs.is_empty() && terms.is_empty() {
-        return None;
+        return (None, false);
     }
 
-    let inspection_depth =
-        infer_inspection_depth(tool_name, args_text, tool_result, &target_refs);
-    let lexical_signature = lexical_topic_signature(tool_name, audit_request_summary, &refs, &terms);
+    let inspection_depth = infer_inspection_depth(tool_name, args_text, tool_result, &target_refs);
+    let lexical_signature =
+        lexical_topic_signature(tool_name, audit_request_summary, &refs, &terms);
     let summary = format_topic_summary(tool_name, audit_request_summary, &refs, &terms);
+    let mut embed_api_called = false;
     let embedding = if config.enabled {
         match config.embedding_model_key.as_deref() {
-            Some(model_key) if !model_key.trim().is_empty() => create_embeddings(
-                model_key,
-                &[summary.clone()],
-            )
-            .await
-            .ok()
-            .and_then(|mut vectors| vectors.drain(..).next()),
+            Some(model_key) if !model_key.trim().is_empty() => {
+                let result = create_embeddings(model_key, &[summary.clone()])
+                    .await
+                    .ok()
+                    .and_then(|mut vectors| vectors.drain(..).next());
+                if result.is_some() {
+                    embed_api_called = true;
+                }
+                result
+            }
             _ => None,
         }
     } else {
         None
     };
 
-    Some(CoveredAuditTopic {
-        lexical_signature,
-        summary,
-        refs: refs.into_iter().collect(),
-        target_refs,
-        inspection_depth,
-        embedding,
-    })
+    (
+        Some(CoveredAuditTopic {
+            lexical_signature,
+            summary,
+            refs: refs.into_iter().collect(),
+            target_refs,
+            inspection_depth,
+            embedding,
+        }),
+        embed_api_called,
+    )
 }
 
 fn detect_redundant_audit_topic(
@@ -1243,12 +2264,10 @@ fn detect_redundant_audit_topic(
 }
 
 fn effective_similarity_threshold(config: &RedundancyDetectionConfig) -> f32 {
-    config
-        .semantic_similarity_threshold
-        .clamp(
-            MIN_SEMANTIC_SIMILARITY_THRESHOLD,
-            MAX_SEMANTIC_SIMILARITY_THRESHOLD,
-        )
+    config.semantic_similarity_threshold.clamp(
+        MIN_SEMANTIC_SIMILARITY_THRESHOLD,
+        MAX_SEMANTIC_SIMILARITY_THRESHOLD,
+    )
 }
 
 fn has_target_ref_coverage(
@@ -1352,7 +2371,13 @@ fn format_topic_summary(
 
 fn extract_topic_refs(text: &str) -> Vec<String> {
     let mut refs = text
-        .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'))
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+                )
+        })
         .filter_map(clean_topic_token)
         .filter(|token| is_path_like_audit_ref(token))
         .collect::<Vec<_>>();
@@ -1430,7 +2455,7 @@ fn infer_inspection_depth(
     let result_lower = tool_result.unwrap_or("").to_lowercase();
 
     if let Some(result) = tool_result {
-        if classify_audit_evidence(result) >= AuditEvidenceGrade::ConfigContent
+        if classify_default_audit_evidence(result) >= AuditEvidenceGrade::ConfigContent
             || (result_lower.contains("confirmed findings") && has_file_reference(result))
         {
             return AuditInspectionDepth::EvidenceBacked;
@@ -1439,13 +2464,7 @@ fn infer_inspection_depth(
 
     if !target_refs.is_empty()
         || [
-            "read ",
-            "analyze ",
-            "analyse ",
-            "audit ",
-            "examine ",
-            "inspect ",
-            "review ",
+            "read ", "analyze ", "analyse ", "audit ", "examine ", "inspect ", "review ",
             "focus on",
         ]
         .iter()
@@ -1463,12 +2482,37 @@ async fn force_tool_free_reflection(
     url: &str,
     model_key: &str,
     messages: &[Value],
+    audit_config: &ResolvedAuditBehaviorConfig,
 ) -> Result<String, String> {
     let reflection_messages = {
         let mut copy = messages.to_vec();
         copy.push(json!({
             "role": "user",
-            "content": "Pause tool use. Briefly summarize what you learned, what is still uncertain, and the smallest next step. Do not call any tools in this response."
+            "content": render_audit_template(
+                audit_config
+                    .tool_burst_reflection
+                    .prompt
+                    .as_deref()
+                    .unwrap_or("Pause tool use. Briefly summarize what you learned, what is still uncertain, and the smallest next step. Do not call any tools in this response."),
+                &[
+                    (
+                        "tool_burst_limit",
+                        audit_config
+                            .tool_burst_reflection
+                            .limit
+                            .unwrap_or(0)
+                            .to_string(),
+                    ),
+                    (
+                        "required_sections_csv",
+                        render_required_sections_csv(audit_config),
+                    ),
+                    (
+                        "gap_section_label",
+                        audit_config.gap_section_label().to_string(),
+                    ),
+                ],
+            )
         }));
         copy
     };
@@ -1503,26 +2547,14 @@ async fn force_non_progress_summary(
     url: &str,
     model_key: &str,
     messages: &[Value],
-    grounded_audit_mode: bool,
+    audit_config: Option<&ResolvedAuditBehaviorConfig>,
     missing_scope_refs: &[String],
 ) -> String {
     let reflection_messages = {
         let mut copy = messages.to_vec();
-        let missing_scope_note = if grounded_audit_mode && !missing_scope_refs.is_empty() {
-            format!(
-                "\n- Under `Coverage gaps`, explicitly list these requested scopes that remain uninspected: {}.",
-                missing_scope_refs.join(", ")
-            )
-        } else {
-            String::new()
-        };
         copy.push(json!({
             "role": "user",
-            "content": if grounded_audit_mode {
-                format!("Tooling or delegation has stalled. Using only the concrete evidence already present in this conversation, produce a grounded audit report with these sections exactly: `Confirmed findings`, `Hypotheses / lower-confidence risks`, and `Coverage gaps`. Only keep findings as confirmed if they are directly supported by code or config already shown. Downgrade unsupported concerns into hypotheses. Every hypothesis must cite a concrete file/config or observed behavior already in context, or explicitly state what evidence is still missing to confirm it. Remove generic dependency-presence or stack-template risks. Do not call any tools.{}", missing_scope_note)
-            } else {
-                "Stop now because progress has stalled. In 3 short bullets, state: 1) what is known, 2) what blocked progress, 3) the smallest remaining useful next step. Do not call any tools.".to_string()
-            }
+            "content": non_progress_summary_prompt(audit_config, missing_scope_refs),
         }));
         copy
     };
@@ -1545,18 +2577,14 @@ async fn force_non_progress_summary(
                     .trim()
                     .to_string();
                 if text.is_empty() {
-                    if grounded_audit_mode {
-                        fallback_non_progress_summary(true, missing_scope_refs)
-                    } else {
-                        fallback_non_progress_summary(false, missing_scope_refs)
-                    }
+                    fallback_non_progress_summary(audit_config, missing_scope_refs)
                 } else {
                     text
                 }
             }
-            Err(_) => fallback_non_progress_summary(grounded_audit_mode, missing_scope_refs),
+            Err(_) => fallback_non_progress_summary(audit_config, missing_scope_refs),
         },
-        _ => fallback_non_progress_summary(grounded_audit_mode, missing_scope_refs),
+        _ => fallback_non_progress_summary(audit_config, missing_scope_refs),
     }
 }
 
@@ -1597,37 +2625,82 @@ async fn dispatch_tool_call(
     )
 }
 
+fn non_progress_summary_prompt(
+    audit_config: Option<&ResolvedAuditBehaviorConfig>,
+    missing_scope_refs: &[String],
+) -> String {
+    let Some(config) = audit_config else {
+        return "Stop now because progress has stalled. In 3 short bullets, state: 1) what is known, 2) what blocked progress, 3) the smallest remaining useful next step. Do not call any tools.".to_string();
+    };
+    render_audit_template(
+        config
+            .force_synthesis
+            .prompt
+            .as_deref()
+            .unwrap_or("Tooling or delegation has stalled. Using only the concrete evidence already present in this conversation, produce a grounded audit report with these sections exactly: {required_sections_csv}. Only keep findings as confirmed if they are directly supported by code or config already shown. Downgrade unsupported concerns into hypotheses. Every hypothesis must cite a concrete file/config or observed behavior already in context, or explicitly state what evidence is still missing to confirm it. Remove generic dependency-presence or stack-template risks. Do not call any tools.\n\nIf some requested scopes remain uninspected, explicitly list them under `{gap_section_label}`: {missing_scope_refs_csv}."),
+        &[
+            (
+                "required_sections_csv",
+                render_required_sections_csv(config),
+            ),
+            (
+                "gap_section_label",
+                config.gap_section_label().to_string(),
+            ),
+            (
+                "missing_scope_refs_csv",
+                render_csv_list(missing_scope_refs, "none"),
+            ),
+        ],
+    )
+}
+
 fn has_concrete_repo_evidence(messages: &[Value]) -> bool {
-    audit_evidence_grade(messages) >= AuditEvidenceGrade::CommandOnly
+    messages
+        .iter()
+        .filter(|message| message["role"].as_str() == Some("tool"))
+        .map(|message| classify_default_audit_evidence(message["content"].as_str().unwrap_or("")))
+        .max()
+        .unwrap_or(AuditEvidenceGrade::Inferred)
+        >= AuditEvidenceGrade::CommandOnly
 }
 
-fn fallback_non_progress_summary(grounded_audit_mode: bool, missing_scope_refs: &[String]) -> String {
-    if grounded_audit_mode {
-        let extra_gap = if missing_scope_refs.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\n- Requested but not inspected: {}.",
-                missing_scope_refs.join(", ")
-            )
-        };
-        format!("Confirmed findings\n- None supported strongly enough to promote after tooling stalled.\n\nHypotheses / lower-confidence risks\n- Some concerns may remain, but the current conversation does not contain enough direct code/config evidence to confirm them.\n\nCoverage gaps\n- Tooling stalled before full inspection. Additional direct reads would be needed to upgrade any hypothesis into a confirmed finding.{}", extra_gap)
-    } else {
-        "Stopping early due to repeated non-progress. Known facts were collected, but the agent kept retrying without advancing. The smallest next step is to retry with a narrower task or inspect the blocked area directly.".to_string()
-    }
+fn fallback_non_progress_summary(
+    audit_config: Option<&ResolvedAuditBehaviorConfig>,
+    missing_scope_refs: &[String],
+) -> String {
+    let Some(config) = audit_config else {
+        return "Stopping early due to repeated non-progress. Known facts were collected, but the agent kept retrying without advancing. The smallest next step is to retry with a narrower task or inspect the blocked area directly.".to_string();
+    };
+    render_audit_template(
+        config
+            .force_synthesis
+            .fallback_text
+            .as_deref()
+            .unwrap_or("Confirmed findings\n- None supported strongly enough to promote after tooling stalled.\n\nHypotheses / lower-confidence risks\n- Some concerns may remain, but the current conversation does not contain enough direct code/config evidence to confirm them.\n\nCoverage gaps\n- Tooling stalled before full inspection. Additional direct reads would be needed to upgrade any hypothesis into a confirmed finding.\n- Requested but not inspected: {missing_scope_refs_csv}."),
+        &[
+            (
+                "missing_scope_refs_csv",
+                render_csv_list(missing_scope_refs, "none"),
+            ),
+            (
+                "gap_section_label",
+                config.gap_section_label().to_string(),
+            ),
+        ],
+    )
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum AuditEvidenceGrade {
-    Inferred,
-    CommandOnly,
-    ConfigContent,
-    CodeContent,
-}
-
-fn has_usable_evidence(messages: &[Value], grounded_audit_mode: bool) -> bool {
-    if grounded_audit_mode {
-        audit_evidence_grade(messages) >= AuditEvidenceGrade::ConfigContent
+fn has_usable_evidence(
+    messages: &[Value],
+    audit_config: Option<&ResolvedAuditBehaviorConfig>,
+) -> bool {
+    if let Some(config) = audit_config {
+        audit_evidence_grade(messages, config)
+            >= config
+                .evidence_grading
+                .min_grade_to_synthesize
+                .unwrap_or(AuditEvidenceGrade::ConfigContent)
     } else {
         has_concrete_repo_evidence(messages)
     }
@@ -1638,21 +2711,24 @@ fn should_force_audit_synthesis(
     covered_topics: &[CoveredAuditTopic],
     coverage_manifest: &[AuditCoverageEntry],
     redundant_audit_retries: usize,
-    config: &RedundancyDetectionConfig,
+    redundancy_config: &RedundancyDetectionConfig,
+    audit_config: Option<&ResolvedAuditBehaviorConfig>,
 ) -> bool {
-    if redundant_audit_retries > usize::from(config.max_redundant_audit_retries) {
+    let Some(config) = audit_config else {
+        return false;
+    };
+    if redundant_audit_retries > usize::from(redundancy_config.max_redundant_audit_retries) {
         return true;
     }
 
-    let completed_reports = count_completed_audit_reports(messages);
-    let issue_like_reports = count_issue_like_audit_reports(messages);
+    let completed_reports = count_completed_audit_reports(messages, config);
+    let issue_like_reports = count_issue_like_audit_reports(messages, config);
     let has_gaps = messages.iter().any(|message| {
         message["role"].as_str() == Some("tool")
-            && message["content"]
-                .as_str()
-                .unwrap_or("")
-                .to_lowercase()
-                .contains("coverage gaps")
+            && has_named_section(
+                message["content"].as_str().unwrap_or(""),
+                config.gap_section_label(),
+            )
     });
     let targeted_topics = covered_topics
         .iter()
@@ -1663,74 +2739,112 @@ fn should_force_audit_synthesis(
         .filter(|topic| topic.inspection_depth >= AuditInspectionDepth::EvidenceBacked)
         .count();
     let unresolved_manifest_entries =
-        unresolved_audit_coverage_manifest_entries(coverage_manifest, None).len();
+        unresolved_audit_coverage_manifest_entries(coverage_manifest, None, Some(config)).len();
+    let coverage_gate = !config.force_synthesis.require_coverage_gap_signal
+        || has_gaps
+        || coverage_manifest.is_empty()
+        || unresolved_manifest_entries == 0;
+    let completed_gate = config
+        .force_synthesis
+        .after_n_completed_reports
+        .map(|min| completed_reports >= min)
+        .unwrap_or(false)
+        && config
+            .force_synthesis
+            .min_targeted_topics
+            .map(|min| targeted_topics >= min)
+            .unwrap_or(true);
+    let issue_gate = config
+        .force_synthesis
+        .after_n_issue_reports
+        .map(|min| issue_like_reports >= min)
+        .unwrap_or(false)
+        && completed_reports
+            >= config
+                .force_synthesis
+                .after_n_completed_reports
+                .unwrap_or(1)
+                .saturating_sub(1);
+    let evidence_gate = config
+        .force_synthesis
+        .min_evidence_backed_topics
+        .map(|min| evidence_backed_topics >= min)
+        .unwrap_or(false);
 
-    ((completed_reports >= 3 && targeted_topics >= 3)
-        || (completed_reports >= 2 && issue_like_reports >= 1 && has_gaps)
-        || (evidence_backed_topics >= 3 && has_gaps))
-        && (coverage_manifest.is_empty()
-            || unresolved_manifest_entries == 0
-            || has_gaps)
+    coverage_gate && (completed_gate || issue_gate || evidence_gate)
 }
 
-fn count_completed_audit_reports(messages: &[Value]) -> usize {
-    messages
+fn find_matching_section_name<'a>(
+    config: &'a ResolvedAuditBehaviorConfig,
+    needle: &str,
+    fallback: &'a str,
+) -> &'a str {
+    config
+        .required_sections
         .iter()
-        .filter(|message| message["role"].as_str() == Some("tool"))
-        .filter(|message| {
-            let lower = message["content"].as_str().unwrap_or("").to_lowercase();
-            lower.contains("confirmed findings")
-                && lower.contains("coverage gaps")
+        .find(|section| section.eq_ignore_ascii_case(needle))
+        .map(String::as_str)
+        .or_else(|| {
+            config
+                .section_rules
+                .iter()
+                .find(|rule| rule.section_name.eq_ignore_ascii_case(needle))
+                .map(|rule| rule.section_name.as_str())
         })
-        .count()
+        .unwrap_or(fallback)
 }
 
-fn count_issue_like_audit_reports(messages: &[Value]) -> usize {
+fn count_completed_audit_reports(
+    messages: &[Value],
+    config: &ResolvedAuditBehaviorConfig,
+) -> usize {
+    let confirmed_label =
+        find_matching_section_name(config, "Confirmed findings", "Confirmed findings");
     messages
         .iter()
         .filter(|message| message["role"].as_str() == Some("tool"))
         .filter(|message| {
             let content = message["content"].as_str().unwrap_or("");
-            audit_report_has_issue_like_finding(content)
+            has_named_section(content, confirmed_label)
+                && has_named_section(content, config.gap_section_label())
         })
         .count()
 }
 
-fn audit_evidence_grade(messages: &[Value]) -> AuditEvidenceGrade {
+fn count_issue_like_audit_reports(
+    messages: &[Value],
+    config: &ResolvedAuditBehaviorConfig,
+) -> usize {
     messages
         .iter()
         .filter(|message| message["role"].as_str() == Some("tool"))
-        .map(|message| classify_audit_evidence(message["content"].as_str().unwrap_or("")))
-        .max()
-        .unwrap_or(AuditEvidenceGrade::Inferred)
+        .filter(|message| {
+            let content = message["content"].as_str().unwrap_or("");
+            audit_report_has_issue_like_finding(content, config)
+        })
+        .count()
 }
 
-fn classify_audit_evidence(content: &str) -> AuditEvidenceGrade {
+fn classify_evidence_against_signals(
+    content: &str,
+    code_signals: &[String],
+    config_signals: &[String],
+    command_signals: &[String],
+) -> AuditEvidenceGrade {
     let lower = content.to_lowercase();
-    if content.contains("#[tauri::command]")
-        || content.contains("pub(crate)")
-        || content.contains("async fn ")
-        || content.contains("fn ")
-        || content.contains("impl ")
-        || lower.contains("use std::")
-        || lower.contains("match ")
+    if code_signals
+        .iter()
+        .any(|signal| content.contains(signal) || lower.contains(&signal.to_lowercase()))
     {
         AuditEvidenceGrade::CodeContent
-    } else if content.contains("\"$schema\"")
-        || content.contains("\"permissions\"")
-        || content.contains("\"scripts\"")
-        || content.contains("\"devDependencies\"")
-        || content.contains("[package]")
-        || content.contains("[dependencies]")
-        || lower.contains("core:default")
-        || lower.contains("\"csp\"")
+    } else if config_signals
+        .iter()
+        .any(|signal| content.contains(signal) || lower.contains(&signal.to_lowercase()))
     {
         AuditEvidenceGrade::ConfigContent
-    } else if lower.contains("src-tauri/")
-        || lower.contains("package.json")
-        || lower.contains("workspace.rs")
-        || lower.contains("models.rs")
-        || lower.contains("src-tauri/src")
+    } else if command_signals
+        .iter()
+        .any(|signal| content.contains(signal) || lower.contains(&signal.to_lowercase()))
     {
         AuditEvidenceGrade::CommandOnly
     } else {
@@ -1738,36 +2852,110 @@ fn classify_audit_evidence(content: &str) -> AuditEvidenceGrade {
     }
 }
 
+fn classify_default_audit_evidence(content: &str) -> AuditEvidenceGrade {
+    classify_evidence_against_signals(
+        content,
+        &[
+            "#[tauri::command]".to_string(),
+            "pub(crate)".to_string(),
+            "async fn ".to_string(),
+            "fn ".to_string(),
+            "impl ".to_string(),
+            "use std::".to_string(),
+            "match ".to_string(),
+        ],
+        &[
+            "\"$schema\"".to_string(),
+            "\"permissions\"".to_string(),
+            "\"scripts\"".to_string(),
+            "\"devDependencies\"".to_string(),
+            "[package]".to_string(),
+            "[dependencies]".to_string(),
+            "core:default".to_string(),
+            "\"csp\"".to_string(),
+        ],
+        &[
+            "src-tauri/".to_string(),
+            "package.json".to_string(),
+            "workspace.rs".to_string(),
+            "models.rs".to_string(),
+            "src-tauri/src".to_string(),
+        ],
+    )
+}
+
+fn audit_evidence_grade(
+    messages: &[Value],
+    config: &ResolvedAuditBehaviorConfig,
+) -> AuditEvidenceGrade {
+    messages
+        .iter()
+        .filter(|message| message["role"].as_str() == Some("tool"))
+        .map(|message| classify_audit_evidence(message["content"].as_str().unwrap_or(""), config))
+        .max()
+        .unwrap_or(AuditEvidenceGrade::Inferred)
+}
+
+fn classify_audit_evidence(
+    content: &str,
+    config: &ResolvedAuditBehaviorConfig,
+) -> AuditEvidenceGrade {
+    classify_evidence_against_signals(
+        content,
+        &config.evidence_grading.code_signals,
+        &config.evidence_grading.config_signals,
+        &config.evidence_grading.command_signals,
+    )
+}
+
 fn audit_response_needs_rewrite(
     response: &str,
     evidence_grade: AuditEvidenceGrade,
+    config: &ResolvedAuditBehaviorConfig,
 ) -> bool {
+    if !config.response_rewrite.enabled {
+        return false;
+    }
     let lower = response.to_lowercase();
     if response.trim().is_empty() {
         return true;
     }
-    if !lower.contains("confirmed findings") || !lower.contains("hypotheses") {
+    if !missing_required_sections(response, config).is_empty() {
         return true;
     }
-    if contains_severity_label(&lower) && evidence_grade < AuditEvidenceGrade::ConfigContent {
+    if contains_severity_label(&lower)
+        && evidence_grade
+            < config
+                .response_rewrite
+                .min_evidence_grade_for_severity
+                .unwrap_or(AuditEvidenceGrade::ConfigContent)
+    {
         return true;
     }
-    if contains_speculation_marker(&lower) && !lower.contains("hypotheses") {
+    let hypotheses_label = find_matching_section_name(
+        config,
+        "Hypotheses / lower-confidence risks",
+        "Hypotheses / lower-confidence risks",
+    );
+    if contains_speculation_marker(&lower) && !has_named_section(response, hypotheses_label) {
         return true;
     }
-    if confirmed_findings_need_rewrite(response) {
-        return true;
-    }
-    if hypotheses_need_rewrite(response) {
-        return true;
-    }
-    false
+    config
+        .section_rules
+        .iter()
+        .any(|rule| section_rule_failed(response, rule, config))
 }
 
 fn contains_severity_label(lower: &str) -> bool {
-    ["critical", "high severity", "medium severity", "low severity", "severity:"]
-        .iter()
-        .any(|marker| lower.contains(marker))
+    [
+        "critical",
+        "high severity",
+        "medium severity",
+        "low severity",
+        "severity:",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 fn contains_speculation_marker(lower: &str) -> bool {
@@ -1789,14 +2977,29 @@ async fn rewrite_grounded_audit_response(
     model_key: &str,
     messages: &[Value],
     candidate: &str,
+    config: &ResolvedAuditBehaviorConfig,
 ) -> String {
     let rewrite_messages = {
         let mut copy = messages.to_vec();
         copy.push(json!({
             "role": "user",
-            "content": format!(
-                "Rewrite the audit answer below using only the evidence already present in this conversation.\n\nRules:\n- Use exactly these sections: `Confirmed findings`, `Hypotheses / lower-confidence risks`, `Coverage gaps`.\n- A confirmed finding must be directly supported by code or config already shown.\n- Keep only actual issues in `Confirmed findings`; move neutral observations, mitigations, architecture facts, and absence-of-risk statements out of that section.\n- Downgrade any unsupported concern into hypotheses.\n- Every hypothesis must cite a concrete file/config or observed behavior already in context, or explicitly state what evidence is still missing to confirm it.\n- Remove dependency-presence, stack-template, or generic speculative risks that are not tied to observed behavior.\n- Do not invent new evidence.\n- Do not label anything `High` or `Critical` without direct code/config support.\n\nCandidate answer:\n{}",
-                candidate
+            "content": render_audit_template(
+                config
+                    .response_rewrite
+                    .rewrite_prompt
+                    .as_deref()
+                    .unwrap_or("Rewrite the audit answer below using only the evidence already present in this conversation.\n\nRules:\n- Use exactly these sections: {required_sections_csv}.\n- A confirmed finding must be directly supported by code or config already shown.\n- Keep only actual issues in `Confirmed findings`; move neutral observations, mitigations, architecture facts, and absence-of-risk statements out of that section.\n- Downgrade any unsupported concern into hypotheses.\n- Every hypothesis must cite a concrete file/config or observed behavior already in context, or explicitly state what evidence is still missing to confirm it.\n- Remove dependency-presence, stack-template, or generic speculative risks that are not tied to observed behavior.\n- Do not invent new evidence.\n- Do not label anything `High` or `Critical` without direct code/config support.\n\nCandidate answer:\n{candidate_response}"),
+                &[
+                    (
+                        "required_sections_csv",
+                        render_required_sections_csv(config),
+                    ),
+                    ("candidate_response", candidate.to_string()),
+                    (
+                        "gap_section_label",
+                        config.gap_section_label().to_string(),
+                    ),
+                ],
             )
         }));
         copy
@@ -1824,17 +3027,65 @@ async fn rewrite_grounded_audit_response(
     }
 }
 
-fn confirmed_findings_need_rewrite(response: &str) -> bool {
-    let confirmed = extract_audit_section(
-        response,
-        "confirmed findings",
-        &["hypotheses / lower-confidence risks", "coverage gaps"],
-    );
-    if confirmed.trim().is_empty() {
-        return false;
-    }
+fn extract_audit_section(response: &str, start: &str, end_markers: &[&str]) -> String {
+    let lower = response.to_lowercase();
+    let start_lower = start.to_lowercase();
+    let Some(start_idx) = lower.find(&start_lower) else {
+        return String::new();
+    };
+    let content_start = response[start_idx..]
+        .find('\n')
+        .map(|offset| start_idx + offset + 1)
+        .unwrap_or(response.len());
+    let end_idx = end_markers
+        .iter()
+        .filter_map(|marker| {
+            lower[content_start..]
+                .find(&marker.to_lowercase())
+                .map(|idx| content_start + idx)
+        })
+        .min()
+        .unwrap_or(response.len());
+    response[content_start..end_idx].trim().to_string()
+}
 
-    confirmed
+fn has_named_section(response: &str, section_name: &str) -> bool {
+    response
+        .to_lowercase()
+        .contains(&section_name.to_lowercase())
+}
+
+fn configured_section_names(config: &ResolvedAuditBehaviorConfig) -> Vec<&str> {
+    let mut names = config
+        .required_sections
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    for rule in &config.section_rules {
+        if !names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&rule.section_name))
+        {
+            names.push(rule.section_name.as_str());
+        }
+    }
+    names
+}
+
+fn extract_configured_section(
+    response: &str,
+    section_name: &str,
+    config: &ResolvedAuditBehaviorConfig,
+) -> String {
+    let end_markers = configured_section_names(config)
+        .into_iter()
+        .filter(|name| !name.eq_ignore_ascii_case(section_name))
+        .collect::<Vec<_>>();
+    extract_audit_section(response, section_name, &end_markers)
+}
+
+fn audit_section_bullets(section: &str) -> Vec<String> {
+    section
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -1846,78 +3097,166 @@ fn confirmed_findings_need_rewrite(response: &str) -> bool {
                 || line.starts_with("3.")
                 || line.starts_with("####")
         })
-        .any(|line| {
-            let lower = line.to_lowercase();
-            is_non_issue_observation(&lower) || !is_issue_like_statement(&lower)
-        })
+        .map(str::to_string)
+        .collect()
 }
 
-fn hypotheses_need_rewrite(response: &str) -> bool {
-    let hypotheses = extract_audit_section(
-        response,
-        "hypotheses / lower-confidence risks",
-        &["coverage gaps"],
-    );
-    if hypotheses.trim().is_empty() {
+fn missing_required_sections(response: &str, config: &ResolvedAuditBehaviorConfig) -> Vec<String> {
+    config
+        .required_sections
+        .iter()
+        .filter(|section| !has_named_section(response, section))
+        .cloned()
+        .collect()
+}
+
+fn section_rule_failed(
+    response: &str,
+    rule: &crate::agent_config::SectionRule,
+    config: &ResolvedAuditBehaviorConfig,
+) -> bool {
+    let section = extract_configured_section(response, &rule.section_name, config);
+    if section.trim().is_empty() {
         return false;
     }
-
-    hypotheses
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .filter(|line| {
-            line.starts_with('-')
-                || line.starts_with('*')
-                || line.starts_with("1.")
-                || line.starts_with("2.")
-                || line.starts_with("3.")
-        })
-        .any(hypothesis_line_needs_rewrite)
+    let lower_name = rule.section_name.to_lowercase();
+    let is_hypotheses = lower_name.contains("hypoth");
+    let is_confirmed = lower_name.contains("confirmed");
+    audit_section_bullets(&section).into_iter().any(|line| {
+        let lower = line.to_lowercase();
+        let has_disallowed_phrase = rule
+            .disallow_template_phrases
+            .iter()
+            .any(|phrase| lower.contains(&phrase.to_lowercase()));
+        if rule.require_file_reference && !has_file_reference(&line) {
+            return true;
+        }
+        if is_hypotheses {
+            return hypothesis_line_needs_rewrite(&line, rule);
+        }
+        if is_confirmed {
+            return has_disallowed_phrase || !is_issue_like_statement(&lower);
+        }
+        has_disallowed_phrase
+    })
 }
 
-fn extract_audit_section(response: &str, start: &str, end_markers: &[&str]) -> String {
-    let lower = response.to_lowercase();
-    let Some(start_idx) = lower.find(start) else {
-        return String::new();
-    };
-    let content_start = response[start_idx..]
-        .find('\n')
-        .map(|offset| start_idx + offset + 1)
-        .unwrap_or(response.len());
-    let end_idx = end_markers
-        .iter()
-        .filter_map(|marker| lower[content_start..].find(marker).map(|idx| content_start + idx))
-        .min()
-        .unwrap_or(response.len());
-    response[content_start..end_idx].trim().to_string()
+fn audit_section_followup_prompt(
+    response: &str,
+    config: &ResolvedAuditBehaviorConfig,
+) -> Option<String> {
+    let missing_sections = missing_required_sections(response, config);
+    if !missing_sections.is_empty() {
+        return Some(format!(
+            "Your response must include these sections exactly: {}. Missing: {}.",
+            render_required_sections_csv(config),
+            missing_sections.join(", ")
+        ));
+    }
+
+    for rule in &config.section_rules {
+        if section_rule_failed(response, rule, config) {
+            let section_content = extract_configured_section(response, &rule.section_name, config);
+            if let Some(prompt) = rule.rewrite_loop_prompt.as_deref() {
+                return Some(render_audit_template(
+                    prompt,
+                    &[
+                        ("section_name", rule.section_name.clone()),
+                        ("section_content", section_content),
+                        ("gap_section_label", config.gap_section_label().to_string()),
+                    ],
+                ));
+            }
+            return Some(format!(
+                "Your `{}` section failed validation. Rework it using only grounded evidence already in context.",
+                rule.section_name
+            ));
+        }
+    }
+
+    None
 }
 
-fn audit_report_has_issue_like_finding(content: &str) -> bool {
-    let confirmed = extract_audit_section(
-        content,
-        "confirmed findings",
-        &["hypotheses / lower-confidence risks", "coverage gaps"],
-    );
-    confirmed
-        .lines()
-        .map(str::trim)
-        .any(|line| {
-            let lower = line.to_lowercase();
-            !lower.is_empty()
-                && !is_non_issue_observation(&lower)
-                && is_issue_like_statement(&lower)
-        })
+fn unresolved_coverage_prompt(
+    config: &ResolvedAuditBehaviorConfig,
+    missing_scope_refs: &[String],
+) -> String {
+    render_audit_template(
+        config
+            .coverage_manifest
+            .unresolved_prompt
+            .as_deref()
+            .unwrap_or("Before concluding, you must either inspect these required audit scopes or name them explicitly under `{gap_section_label}`: {unresolved_scopes_csv}. Do not omit them."),
+        &[
+            (
+                "gap_section_label",
+                config.gap_section_label().to_string(),
+            ),
+            (
+                "unresolved_scopes_csv",
+                render_csv_list(missing_scope_refs, "none"),
+            ),
+            (
+                "unresolved_scopes_bullets",
+                render_bullet_list(missing_scope_refs, "none"),
+            ),
+        ],
+    )
 }
 
-fn hypothesis_line_needs_rewrite(line: &str) -> bool {
+pub(crate) fn validate_audit_worker_response(
+    response: &str,
+    requested_refs: &[String],
+    config: &ResolvedAuditBehaviorConfig,
+) -> Result<(), String> {
+    if response.trim().is_empty() {
+        return Err("completed its turn without returning a usable answer".to_string());
+    }
+    if !requested_refs.is_empty() && !audit_response_acknowledges_refs(response, requested_refs) {
+        return Err(format!(
+            "did not address all explicitly requested audit scopes: {}.",
+            requested_refs.join(", ")
+        ));
+    }
+    if let Some(prompt) = audit_section_followup_prompt(response, config) {
+        return Err(format!(
+            "returned an audit response that needs revision: {}",
+            prompt
+        ));
+    }
+    if audit_response_needs_rewrite(response, classify_audit_evidence(response, config), config) {
+        return Err(
+            "returned an audit response without grounded, file-backed findings.".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn audit_report_has_issue_like_finding(
+    content: &str,
+    config: &ResolvedAuditBehaviorConfig,
+) -> bool {
+    let confirmed_label =
+        find_matching_section_name(config, "Confirmed findings", "Confirmed findings");
+    let confirmed = extract_configured_section(content, confirmed_label, config);
+    audit_section_bullets(&confirmed).into_iter().any(|line| {
+        let lower = line.to_lowercase();
+        !is_non_issue_observation(&lower) && is_issue_like_statement(&lower)
+    })
+}
+
+fn hypothesis_line_needs_rewrite(line: &str, rule: &crate::agent_config::SectionRule) -> bool {
     let lower = line.to_lowercase();
     let has_anchor = has_file_reference(line)
         || hypothesis_mentions_observed_behavior(&lower)
         || hypothesis_mentions_missing_proof(&lower);
-    let template = is_template_hypothesis(&lower);
-    let dependency_only = is_dependency_presence_hypothesis(&lower);
-    (template || dependency_only) && !has_anchor
+    let has_disallowed_phrase = rule
+        .disallow_template_phrases
+        .iter()
+        .any(|phrase| lower.contains(&phrase.to_lowercase()))
+        || is_template_hypothesis(&lower)
+        || is_dependency_presence_hypothesis(&lower);
+    has_disallowed_phrase && !has_anchor
 }
 
 fn is_issue_like_statement(lower: &str) -> bool {
@@ -1967,8 +3306,8 @@ fn is_non_issue_observation(lower: &str) -> bool {
         "no explicitly defined",
         "mitigation",
     ]
-        .iter()
-        .any(|marker| lower.contains(marker))
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 fn is_template_hypothesis(lower: &str) -> bool {
@@ -2070,12 +3409,20 @@ fn extract_delegation_response_text(result: &str) -> Option<String> {
 fn is_weak_audit_delegation_result(
     result: &str,
     covered_topics: &[CoveredAuditTopic],
+    config: &ResolvedAuditBehaviorConfig,
 ) -> bool {
     let Some(response) = extract_delegation_response_text(result) else {
         return false;
     };
 
-    if is_progress_only_response(&response) || is_low_value_audit_response(&response) {
+    if is_progress_only_response(&response)
+        || audit_section_followup_prompt(&response, config).is_some()
+        || audit_response_needs_rewrite(
+            &response,
+            classify_audit_evidence(&response, config),
+            config,
+        )
+    {
         return true;
     }
 
@@ -2087,12 +3434,15 @@ fn is_weak_audit_delegation_result(
         .flat_map(|topic| topic.refs.iter().chain(topic.target_refs.iter()))
         .cloned()
         .collect::<HashSet<_>>();
-    let has_new_refs = response_refs
-        .iter()
-        .any(|reference| !seen_refs.iter().any(|seen| audit_ref_entry_matches(reference, seen)));
-    let has_new_issue = audit_report_has_issue_like_finding(&response);
-    let has_evidence = classify_audit_evidence(&response) >= AuditEvidenceGrade::ConfigContent;
-    let has_specific_gap = extract_audit_section(&response, "coverage gaps", &[])
+    let has_new_refs = response_refs.iter().any(|reference| {
+        !seen_refs
+            .iter()
+            .any(|seen| audit_ref_entry_matches(reference, seen))
+    });
+    let has_new_issue = audit_report_has_issue_like_finding(&response, config);
+    let has_evidence =
+        classify_audit_evidence(&response, config) >= AuditEvidenceGrade::ConfigContent;
+    let has_specific_gap = extract_audit_section(&response, config.gap_section_label(), &[])
         .lines()
         .map(str::trim)
         .any(|line| has_file_reference(line));
@@ -2131,71 +3481,224 @@ pub(crate) async fn send_chat_completion_streaming(
     model_key: &str,
     system_prompt: &str,
     message: &str,
+    run_id: &str,
     agent_id: &str,
     on_event: &Channel<StreamEvent>,
     history: &[Value],
     context_limit: Option<u64>,
 ) -> Result<String, String> {
     let url = format!("{}/v1/chat/completions", lm_base_url());
-    let budget = compute_context_budget(system_prompt, history, message, context_limit, 0);
+    let trimmed_history = trim_history_to_budget(system_prompt, history, message, context_limit, 0);
+    let budget = compute_context_budget(system_prompt, &trimmed_history, message, context_limit, 0);
     let effective_system_prompt = with_context_budget(system_prompt, budget);
     let mut messages = vec![];
     if !effective_system_prompt.is_empty() {
         messages.push(json!({"role": "system", "content": effective_system_prompt}));
     }
-    for h in history {
+    for h in &trimmed_history {
         messages.push(h.clone());
     }
     messages.push(json!({"role": "user", "content": message}));
 
-    let body = json!({ "model": model_key, "messages": messages, "stream": true });
+    let body = json!({
+        "model": model_key,
+        "messages": messages,
+        "stream": true,
+        "stream_options": { "include_usage": true },
+    });
     let client = reqwest::Client::new();
-    let mut resp = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Chat request failed: {}", e))?;
+    let _ = on_event.send(StreamEvent::AgentStatus {
+        run_id: run_id.to_string(),
+        agent_id: agent_id.to_string(),
+        stage: "thinking".to_string(),
+        detail: "Generating response".to_string(),
+    });
+    let streamed_turn =
+        stream_chat_completion_turn(&client, &url, &body, run_id, agent_id, on_event)
+            .await
+            .map_err(|e| format!("Chat failed: {}", e))?;
+    emit_generation_metrics(
+        on_event,
+        run_id,
+        agent_id,
+        "generated",
+        &streamed_turn.usage,
+        estimated_stream_output_tokens(&streamed_turn.content),
+    );
+    Ok(streamed_turn.content)
+}
 
-    if !resp.status().is_success() {
-        return Err(format!(
-            "Chat failed: {}",
-            resp.text().await.unwrap_or_default()
-        ));
-    }
+pub(crate) async fn resume_paused_tool_loop(
+    tool_state: Arc<McpState>,
+    run_id: &str,
+    paused: PausedRunState,
+) -> Result<(), String> {
+    let channel = {
+        tool_state
+            .active_runs
+            .lock()
+            .unwrap()
+            .get(run_id)
+            .ok_or_else(|| format!("Run '{}' not found.", run_id))?
+            .channel
+            .clone()
+    };
+    let response = call_chat_with_tools(
+        &paused.model_key,
+        "",
+        "Continue the paused run from the current evidence. Do not restart completed steps.",
+        run_id,
+        &paused.agent_id,
+        &tool_state.tools,
+        paused.allowed_tools.as_deref(),
+        paused.allow_manager_tools,
+        paused.require_delegation,
+        paused.context_limit,
+        paused.glob_ready,
+        tool_state.as_ref(),
+        Some(&paused.active_behaviors),
+        &channel,
+        &paused.messages,
+    )
+    .await?;
 
-    let mut full_content = String::new();
-    let mut buffer = String::new();
-
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| format!("Stream read error: {}", e))?
     {
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(pos) = buffer.find('\n') {
-            let line = buffer[..pos].trim_end().to_string();
-            buffer = buffer[pos + 1..].to_string();
-            if line.is_empty() || line.starts_with(':') {
-                continue;
-            }
-            if let Some(data) = line.strip_prefix("data: ") {
-                if data.trim() == "[DONE]" {
-                    return Ok(full_content);
-                }
-                if let Ok(parsed) = serde_json::from_str::<Value>(data) {
-                    if let Some(delta_content) = parsed["choices"][0]["delta"]["content"].as_str() {
-                        if !delta_content.is_empty() {
-                            full_content.push_str(delta_content);
-                            let _ = on_event.send(StreamEvent::Token {
-                                agent_id: agent_id.to_string(),
-                                content: delta_content.to_string(),
-                            });
-                        }
-                    }
-                }
-            }
+        let mut runs = tool_state.active_runs.lock().unwrap();
+        if let Some(run) = runs.remove(run_id) {
+            let _ = run.channel.send(StreamEvent::Done {
+                run_id: run_id.to_string(),
+            });
         }
     }
-    Ok(full_content)
+    let _ = response;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_config::{BehaviorTriggerConfig, BehaviorTriggersConfig};
+
+    fn grounded_config() -> ResolvedAuditBehaviorConfig {
+        let config = BehaviorTriggersConfig {
+            enabled: true,
+            embedding_model_key: None,
+            default_similarity_threshold: 0.90,
+            behaviors: vec![BehaviorTriggerConfig::default_grounded_audit()],
+        };
+        let active = HashSet::from([crate::agent_config::GROUNDED_AUDIT_BEHAVIOR_ID.to_string()]);
+        resolve_audit_behavior_config(&active, &config).unwrap()
+    }
+
+    fn sample_completed_report() -> String {
+        "Confirmed findings\n- src-tauri/src/chat.rs: command handling risks resource exhaustion.\n\nHypotheses / lower-confidence risks\n- src-tauri/src/mcp.rs may allow escalation if exposed; insufficient evidence to confirm.\n\nCoverage gaps\n- src/renderer.js".to_string()
+    }
+
+    #[test]
+    fn template_renderer_replaces_known_placeholders_and_keeps_unknown() {
+        let rendered = render_audit_template(
+            "{covered_topics_csv} | {gap_section_label} | {unknown}",
+            &[
+                ("covered_topics_csv", "chat.rs, mcp.rs".to_string()),
+                ("gap_section_label", "Coverage gaps".to_string()),
+            ],
+        );
+
+        assert_eq!(rendered, "chat.rs, mcp.rs | Coverage gaps | {unknown}");
+    }
+
+    #[test]
+    fn evidence_grading_prefers_code_over_config_and_command() {
+        let config = grounded_config();
+
+        assert_eq!(
+            classify_audit_evidence(
+                "fn example() {}\n\"$schema\": \"value\"\nsrc-tauri/src",
+                &config
+            ),
+            AuditEvidenceGrade::CodeContent
+        );
+        assert_eq!(
+            classify_audit_evidence("package.json references src-tauri/src", &config),
+            AuditEvidenceGrade::CommandOnly
+        );
+    }
+
+    #[test]
+    fn section_validation_catches_missing_and_generic_sections() {
+        let config = grounded_config();
+        let missing_response = "Confirmed findings\n- src/main.rs issue";
+        let missing_prompt = audit_section_followup_prompt(missing_response, &config).unwrap();
+        assert!(missing_prompt.contains("Missing"));
+
+        let weak_hypothesis = "Confirmed findings\n- src-tauri/src/chat.rs risk\n\nHypotheses / lower-confidence risks\n- may allow compromise if exposed.\n\nCoverage gaps\n- none";
+        let hypothesis_prompt = audit_section_followup_prompt(weak_hypothesis, &config).unwrap();
+        assert!(hypothesis_prompt.contains("too generic"));
+    }
+
+    #[test]
+    fn forced_synthesis_and_fallback_use_configured_thresholds() {
+        let config = grounded_config();
+        let messages = vec![
+            json!({"role": "tool", "content": sample_completed_report()}),
+            json!({"role": "tool", "content": sample_completed_report()}),
+            json!({"role": "tool", "content": sample_completed_report()}),
+        ];
+        let covered_topics = vec![
+            CoveredAuditTopic {
+                lexical_signature: "a".to_string(),
+                summary: "src-tauri/src/chat.rs".to_string(),
+                refs: HashSet::from(["src-tauri/src/chat.rs".to_string()]),
+                target_refs: HashSet::from(["src-tauri/src/chat.rs".to_string()]),
+                inspection_depth: AuditInspectionDepth::Targeted,
+                embedding: None,
+            },
+            CoveredAuditTopic {
+                lexical_signature: "b".to_string(),
+                summary: "src-tauri/src/mcp.rs".to_string(),
+                refs: HashSet::from(["src-tauri/src/mcp.rs".to_string()]),
+                target_refs: HashSet::from(["src-tauri/src/mcp.rs".to_string()]),
+                inspection_depth: AuditInspectionDepth::Targeted,
+                embedding: None,
+            },
+            CoveredAuditTopic {
+                lexical_signature: "c".to_string(),
+                summary: "src/renderer.js".to_string(),
+                refs: HashSet::from(["src/renderer.js".to_string()]),
+                target_refs: HashSet::from(["src/renderer.js".to_string()]),
+                inspection_depth: AuditInspectionDepth::Targeted,
+                embedding: None,
+            },
+        ];
+
+        assert!(should_force_audit_synthesis(
+            &messages,
+            &covered_topics,
+            &[],
+            0,
+            &RedundancyDetectionConfig::default(),
+            Some(&config),
+        ));
+
+        let fallback =
+            fallback_non_progress_summary(Some(&config), &["src/renderer.js".to_string()]);
+        assert!(fallback.contains("src/renderer.js"));
+    }
+
+    #[test]
+    fn weak_delegation_result_and_worker_validation_follow_configured_rules() {
+        let config = grounded_config();
+        let weak = serde_json::json!({
+            "response": "Confirmed findings\n- None.\n\nHypotheses / lower-confidence risks\n- may allow compromise if exposed.\n\nCoverage gaps\n- none"
+        })
+        .to_string();
+
+        assert!(is_weak_audit_delegation_result(&weak, &[], &config));
+        assert!(validate_audit_worker_response(
+            "Confirmed findings\n- src-tauri/src/chat.rs risk\n\nHypotheses / lower-confidence risks\n- may allow compromise if exposed.\n\nCoverage gaps\n- src/renderer.js",
+            &["src-tauri/src/chat.rs".to_string()],
+            &config
+        )
+        .is_err());
+    }
 }

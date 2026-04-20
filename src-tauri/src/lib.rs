@@ -6,6 +6,7 @@ mod mcp;
 mod memory;
 mod models;
 mod routing;
+mod runs;
 mod state;
 mod workspace;
 
@@ -16,7 +17,9 @@ use tauri::ipc::Channel;
 
 use crate::agent_config::AgentConfig;
 use crate::chat::{send_message, StreamEvent};
-use crate::config_persistence::{load_agent_config, load_agent_config_from_disk, save_agent_config};
+use crate::config_persistence::{
+    load_agent_config, load_agent_config_from_disk, save_agent_config,
+};
 use crate::mcp::{load_tools_embedded, start_mcp_server, McpState};
 use crate::memory::{
     clear_command_history, clear_memory_pool, get_command_history, get_memory_pool,
@@ -25,10 +28,11 @@ use crate::memory::{
 use crate::models::{
     download_model, fetch_loaded_models, fetch_models, load_model, set_model, unload_model,
 };
-use crate::routing::route_message;
+use crate::routing::{cancel_route_run, continue_route_run, route_message};
 use crate::state::{AppState, BehaviorTriggerCache};
 use crate::workspace::{
-    load_workspace_config, pick_folder, save_workspace_config, set_active_workspace,
+    load_thread_snapshot, load_workspace_config, pick_folder, save_thread_snapshot,
+    save_workspace_config, set_active_workspace,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -50,8 +54,8 @@ pub fn run() {
     let active_workspace_arc = Arc::new(Mutex::new(workspace_root.clone()));
     let glob_cache_arc = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let behavior_trigger_cache_arc = Arc::new(Mutex::new(BehaviorTriggerCache::default()));
-    let active_behavior_contexts_arc =
-        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let active_behavior_contexts_arc = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let active_runs_arc = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
     let mcp_state = Arc::new(McpState {
         tools: mcp_tools,
@@ -68,6 +72,7 @@ pub fn run() {
         glob_cache: glob_cache_arc,
         behavior_trigger_cache: behavior_trigger_cache_arc,
         active_behavior_contexts: active_behavior_contexts_arc,
+        active_runs: active_runs_arc.clone(),
     });
 
     let app_state = Arc::new(AppState {
@@ -86,6 +91,7 @@ pub fn run() {
         glob_cache: mcp_state.glob_cache.clone(),
         mcp_state: mcp_state.clone(),
         event_channel: mcp_state.event_channel.clone(),
+        active_runs: active_runs_arc,
     });
 
     tauri::Builder::default()
@@ -122,9 +128,13 @@ pub fn run() {
             clear_memory_pool,
             clear_command_history,
             route_message,
+            cancel_route_run,
+            continue_route_run,
             pick_folder,
             load_workspace_config,
             save_workspace_config,
+            load_thread_snapshot,
+            save_thread_snapshot,
             set_active_workspace,
         ])
         .run(tauri::generate_context!())

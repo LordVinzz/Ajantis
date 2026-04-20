@@ -27,6 +27,7 @@ pub(crate) fn default_priority() -> u8 {
     128
 }
 pub(crate) const DEFAULT_CONTEXT_LIMIT: u64 = 8_000;
+pub(crate) const HARD_PROMPT_HISTORY_LIMIT: u64 = 32_000;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ContextBudget {
@@ -82,11 +83,95 @@ pub(crate) fn with_context_budget(system_prompt: &str, budget: ContextBudget) ->
     }
 }
 
+fn summarize_trimmed_history(history: &[Value]) -> Option<Value> {
+    if history.is_empty() {
+        return None;
+    }
+    let mut lines = Vec::new();
+    for message in history.iter().rev().take(12).rev() {
+        let role = message["role"].as_str().unwrap_or("unknown");
+        let content = message["content"].as_str().unwrap_or("").replace('\n', " ");
+        let preview = truncate_for_summary(&content, 220);
+        if !preview.is_empty() {
+            lines.push(format!("- {}: {}", role, preview));
+        }
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!({
+            "role": "system",
+            "content": format!(
+                "Summary of older conversation context trimmed for budget:\n{}",
+                lines.join("\n")
+            ),
+        }))
+    }
+}
+
+fn truncate_for_summary(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        text.to_string()
+    } else {
+        let head: String = text.chars().take(max_chars).collect();
+        format!("{}...", head)
+    }
+}
+
+pub(crate) fn trim_history_to_budget(
+    system_prompt: &str,
+    history: &[Value],
+    message: &str,
+    context_limit: Option<u64>,
+    extra_token_overhead: u64,
+) -> Vec<Value> {
+    let hard_limit = context_limit
+        .unwrap_or(DEFAULT_CONTEXT_LIMIT)
+        .min(HARD_PROMPT_HISTORY_LIMIT);
+    let reserved = estimate_text_tokens(system_prompt)
+        + estimate_text_tokens(message)
+        + extra_token_overhead
+        + 256;
+    let available_for_history = hard_limit.saturating_sub(reserved);
+    if available_for_history == 0 {
+        return Vec::new();
+    }
+
+    let mut kept = Vec::new();
+    let mut kept_tokens = 0u64;
+    let mut trimmed_prefix = Vec::new();
+
+    for item in history.iter().rev() {
+        let item_tokens = estimate_message_tokens(std::slice::from_ref(item));
+        if kept_tokens + item_tokens > available_for_history {
+            trimmed_prefix.push(item.clone());
+            continue;
+        }
+        kept.push(item.clone());
+        kept_tokens += item_tokens;
+    }
+
+    kept.reverse();
+    trimmed_prefix.reverse();
+
+    if let Some(summary) = summarize_trimmed_history(&trimmed_prefix) {
+        let summary_tokens = estimate_message_tokens(std::slice::from_ref(&summary));
+        if summary_tokens <= available_for_history.saturating_sub(kept_tokens) {
+            let mut with_summary = vec![summary];
+            with_summary.extend(kept);
+            return with_summary;
+        }
+    }
+
+    kept
+}
+
 pub(crate) fn apply_runtime_agent_rules(system_prompt: &str, is_manager: bool) -> String {
     let base_rules = if is_manager {
-        "Runtime execution contract:\n- You own the task end-to-end and must either finish it or continue working internally.\n- Do not stop at a plan, status update, or \"I asked another agent\" unless the user explicitly requested that.\n- Prefer inspecting the workspace over asking the user when the answer can be discovered locally.\n- `AskUserQuestion` is not usable in this environment; make a reasonable assumption and continue.\n- `broadcast_message` with `await_reply=false` only queues a message; if you need results now, use `await_reply=true` or inspect the target agent directly.\n- If a delegated worker returns an empty, vague, or partial answer, retry once with a narrower evidence-seeking task naming one concrete file/function and one concrete question; if the retry is still weak, stop delegating and synthesize or inspect locally.\n- Before replying to the user, ensure you are returning the requested result, not merely progress on obtaining it."
+        "Runtime execution contract:\n- You own the task end-to-end and must either finish it or continue working internally.\n- Do not stop at a plan, status update, or \"I asked another agent\" unless the user explicitly requested that.\n- Prefer inspecting the workspace over asking the user when the answer can be discovered locally.\n- `AskUserQuestion` is not usable in this environment; make a reasonable assumption and continue.\n- `broadcast_message` with `await_reply=false` only queues a message; if you need results now, use `await_reply=true` or inspect the target agent directly.\n- If the task requires creating or changing workspace files, delegate to a worker with file tools and instruct it to materialize the result on disk with `write_file` or `edit_file`.\n- A pasted code block or prose-only implementation does not count as completing a file creation or edit task unless the caller explicitly asked for chat-only output.\n- If a delegated worker returns an empty, vague, partial, or chat-only answer for a file task, retry once with a narrower evidence-seeking task naming one concrete file/function and one concrete question; if the retry is still weak, stop delegating and synthesize or inspect locally.\n- Before replying to the user, ensure you are returning the requested result, not merely progress on obtaining it."
     } else {
-        "Runtime execution contract:\n- Execute the assigned task directly.\n- Do not stop at a plan, status update, or statement of intent.\n- If a tool is blocked, adapt and try another minimal approach.\n- Return the concrete result requested by the caller."
+        "Runtime execution contract:\n- Execute the assigned task directly.\n- Do not stop at a plan, status update, or statement of intent.\n- If the task is to implement, create, or modify workspace files, use `write_file` or `edit_file` to materialize the result on disk instead of only pasting code in chat.\n- If no file path is specified for a file task, choose a sensible path and mention it in the result.\n- If a tool is blocked, adapt and try another minimal approach.\n- Return the concrete result requested by the caller."
     };
 
     if system_prompt.trim().is_empty() {
@@ -155,27 +240,46 @@ pub(crate) fn is_manager_blocked_tool(name: &str) -> bool {
 }
 
 pub(crate) fn canonical_manager_role_prompt() -> &'static str {
-    "You are the manager agent responsible for completing the user’s task end-to-end.\n\nCore rules:\n- Finish the task; do not stop at an information plan, status update, or delegation summary.\n- Prefer targeted reads and concrete inspection over broad exploration.\n- Validate subagent outputs before trusting them.\n- If a worker is vague, blocked, speculative, or fails to add new useful evidence, redirect it once with a narrower evidence-seeking task, then stop delegating and synthesize locally from verified evidence.\n- If repeated work starts circling around the same file, function, or question, stop delegating and synthesize from the current verified evidence.\n\nOutput discipline:\n- Return the requested result, not progress toward it.\n- Prefer concise, evidence-first conclusions with file references when available."
+    "You are the manager agent responsible for completing the user’s task end-to-end.\n\nCore rules:\n- Finish the task; do not stop at an information plan, status update, or delegation summary.\n- Prefer targeted reads and concrete inspection over broad exploration.\n- Validate subagent outputs before trusting them.\n- If the task requires creating or modifying workspace files, delegate to a worker with file tools and require it to materialize the changes on disk; a chat-only code block is not a completed file task unless the user explicitly asked for chat-only output.\n- If a worker is vague, blocked, speculative, fails to add new useful evidence, or answers a file task without actually writing the file, redirect it once with a narrower evidence-seeking task, then stop delegating and synthesize locally from verified evidence.\n- If repeated work starts circling around the same file, function, or question, stop delegating and synthesize from the current verified evidence.\n\nOutput discipline:\n- Return the requested result, not progress toward it.\n- Prefer concise, evidence-first conclusions with file references when available."
 }
 
-pub(crate) fn grounded_audit_behavior_prompt() -> &'static str {
-    "Grounded audit behavior is active for this task.\n- Treat explicitly requested files, directories, file classes, and subsystems as a coverage checklist.\n- Use the sections `Confirmed findings`, `Hypotheses / lower-confidence risks`, and `Coverage gaps` when reporting audit-style results.\n- A confirmed finding must be grounded in code or config actually inspected.\n- Do not label anything `High` or `Critical` without direct code/config evidence.\n- A hypothesis must cite a concrete file/config or observed behavior, or explicitly state what evidence is still missing to confirm it.\n- If evidence is insufficient, say `insufficient evidence` instead of inventing a finding."
+#[cfg(test)]
+mod tests {
+    use super::{apply_runtime_agent_rules, canonical_manager_role_prompt};
+
+    #[test]
+    fn worker_rules_require_materializing_file_tasks() {
+        let rules = apply_runtime_agent_rules("", false);
+        assert!(rules.contains("write_file"));
+        assert!(rules.contains("materialize the result on disk"));
+        assert!(rules.contains("choose a sensible path"));
+    }
+
+    #[test]
+    fn manager_prompt_rejects_chat_only_file_completion() {
+        let prompt = canonical_manager_role_prompt();
+        assert!(prompt.contains("materialize the changes on disk"));
+        assert!(prompt.contains("chat-only code block"));
+    }
 }
 
+/// Returns `(active_behaviors, embedding_api_calls)` where `embedding_api_calls` counts
+/// actual calls to the embedding model API (cache hits are not counted).
 pub(crate) async fn resolve_active_behaviors(
     message: &str,
     inherited: Option<&HashSet<String>>,
     config: &BehaviorTriggersConfig,
     cache: &Arc<Mutex<BehaviorTriggerCache>>,
-) -> HashSet<String> {
+) -> (HashSet<String>, u32) {
     let mut active = HashSet::new();
+    let mut api_calls: u32 = 0;
     if !config.enabled {
-        return active;
+        return (active, api_calls);
     }
 
     let normalized_message = normalize_behavior_trigger_text(message);
     if normalized_message.is_empty() {
-        return active;
+        return (active, api_calls);
     }
 
     let global_model_key = config
@@ -212,21 +316,24 @@ pub(crate) async fn resolve_active_behaviors(
     }
 
     let Some(model_key) = global_model_key else {
-        return active;
+        return (active, api_calls);
     };
     if embedding_candidates.is_empty() {
-        return active;
+        return (active, api_calls);
     }
 
-    let Some(message_embedding) = get_or_create_cached_embedding(
+    let (message_embedding_opt, msg_was_api) = get_or_create_cached_embedding(
         cache,
         &embedding_cache_key("message", None, model_key, &normalized_message),
         model_key,
         &normalized_message,
     )
-    .await
-    else {
-        return active;
+    .await;
+    if msg_was_api {
+        api_calls += 1;
+    }
+    let Some(message_embedding) = message_embedding_opt else {
+        return (active, api_calls);
     };
 
     for behavior in embedding_candidates {
@@ -240,7 +347,7 @@ pub(crate) async fn resolve_active_behaviors(
             if normalized_phrase.is_empty() {
                 continue;
             }
-            let Some(phrase_embedding) = get_or_create_cached_embedding(
+            let (phrase_embedding_opt, phrase_was_api) = get_or_create_cached_embedding(
                 cache,
                 &embedding_cache_key(
                     "phrase",
@@ -251,8 +358,11 @@ pub(crate) async fn resolve_active_behaviors(
                 model_key,
                 &normalized_phrase,
             )
-            .await
-            else {
+            .await;
+            if phrase_was_api {
+                api_calls += 1;
+            }
+            let Some(phrase_embedding) = phrase_embedding_opt else {
                 continue;
             };
             if cosine_similarity(&message_embedding, &phrase_embedding)
@@ -268,195 +378,7 @@ pub(crate) async fn resolve_active_behaviors(
         }
     }
 
-    active
-}
-
-pub(crate) fn is_low_value_audit_response(response: &str) -> bool {
-    let lower = response.trim().to_lowercase();
-    if lower.is_empty() {
-        return true;
-    }
-
-    if [
-        "what is known:",
-        "what blocked progress:",
-        "smallest remaining useful next step:",
-        "information plan",
-        "status update request",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-    {
-        return true;
-    }
-
-    let mentions_risk = [
-        "vulnerability",
-        "security concern",
-        "risk",
-        "severity",
-        "critical",
-        "high severity",
-        "medium severity",
-        "low severity",
-        "finding",
-        "issue",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker));
-
-    if mentions_risk && !has_file_reference(response) && !lower.contains("insufficient evidence") {
-        return true;
-    }
-
-    let has_confirmed = lower.contains("confirmed findings");
-    let has_real_issue_signal = [
-        "injection",
-        "xss",
-        "csp",
-        "race condition",
-        "unbounded",
-        "exhaustion",
-        "bypass",
-        "unsafe",
-        "unauthorized",
-        "path traversal",
-        "oom",
-        "resource exhaustion",
-        "withglobaltauri",
-        "vulnerab",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker));
-    let only_observations = [
-        "xss mitigation",
-        "absence of dangerous",
-        "no explicitly defined broad scopes",
-        "no usage of",
-        "project is",
-        "backend is built",
-        "frontend architecture includes",
-        "contains modules",
-        "hardcoded network port",
-        "mitigation",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker));
-
-    if has_confirmed && only_observations && !has_real_issue_signal {
-        return true;
-    }
-
-    has_template_only_hypotheses(response)
-}
-
-fn has_template_only_hypotheses(response: &str) -> bool {
-    let hypotheses = extract_named_section(
-        response,
-        "hypotheses / lower-confidence risks",
-        &["coverage gaps"],
-    );
-    if hypotheses.trim().is_empty() {
-        return false;
-    }
-
-    let mut bullet_count = 0usize;
-    let mut weak_count = 0usize;
-    for line in hypotheses.lines().map(str::trim) {
-        if line.is_empty() {
-            continue;
-        }
-        if !(line.starts_with('-')
-            || line.starts_with('*')
-            || line.starts_with("1.")
-            || line.starts_with("2.")
-            || line.starts_with("3."))
-        {
-            continue;
-        }
-        bullet_count += 1;
-        let lower = line.to_lowercase();
-        let has_anchor = has_file_reference(line)
-            || has_missing_proof_marker(&lower)
-            || has_observed_behavior_marker(&lower);
-        if is_template_hypothesis(&lower) && !has_anchor {
-            weak_count += 1;
-        }
-    }
-
-    bullet_count > 0 && weak_count == bullet_count
-}
-
-fn extract_named_section(response: &str, start: &str, end_markers: &[&str]) -> String {
-    let lower = response.to_lowercase();
-    let Some(start_idx) = lower.find(start) else {
-        return String::new();
-    };
-    let content_start = response[start_idx..]
-        .find('\n')
-        .map(|offset| start_idx + offset + 1)
-        .unwrap_or(response.len());
-    let end_idx = end_markers
-        .iter()
-        .filter_map(|marker| lower[content_start..].find(marker).map(|idx| content_start + idx))
-        .min()
-        .unwrap_or(response.len());
-    response[content_start..end_idx].trim().to_string()
-}
-
-fn has_missing_proof_marker(lower: &str) -> bool {
-    [
-        "insufficient evidence",
-        "not enough evidence",
-        "unable to confirm",
-        "would need to inspect",
-        "would need direct inspection",
-        "would need to verify",
-        "requires further inspection",
-        "missing proof",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-}
-
-fn has_observed_behavior_marker(lower: &str) -> bool {
-    [
-        "uses ",
-        "calls ",
-        "passes ",
-        "spawns ",
-        "reads ",
-        "writes ",
-        "normalizes ",
-        "sets ",
-        "disables ",
-        "allows ",
-        "constructs ",
-        "joins ",
-        "matches ",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-}
-
-fn is_template_hypothesis(lower: &str) -> bool {
-    [
-        "presence of ",
-        "possible risk",
-        "potential risk",
-        "could lead to",
-        "could allow",
-        "could be vulnerable if",
-        "may allow",
-        "may be vulnerable",
-        "if later",
-        "if exposed",
-        "dependency could",
-        "crate could",
-        "package could",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
+    (active, api_calls)
 }
 
 pub(crate) fn has_file_reference(text: &str) -> bool {
@@ -465,11 +387,36 @@ pub(crate) fn has_file_reference(text: &str) -> bool {
         ".rs",
         ".js",
         ".ts",
+        ".jsx",
+        ".tsx",
+        ".java",
+        ".kt",
+        ".go",
+        ".rb",
+        ".php",
+        ".cs",
+        ".c",
+        ".cpp",
+        ".h",
+        ".hpp",
+        ".swift",
+        ".scala",
+        ".sh",
+        ".sql",
+        ".xml",
+        ".yaml",
+        ".yml",
+        ".ini",
+        ".env",
         ".json",
         ".toml",
         ".md",
-        "src-tauri/",
         "src/",
+        "app/",
+        "lib/",
+        "cmd/",
+        "internal/",
+        "pkg/",
         "location:",
         "file:",
         "line ",
@@ -481,7 +428,13 @@ pub(crate) fn has_file_reference(text: &str) -> bool {
 
 pub(crate) fn extract_explicit_audit_refs(text: &str) -> Vec<String> {
     let mut refs = text
-        .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '`'))
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '`'
+                )
+        })
         .filter_map(normalize_audit_ref)
         .filter(|token| is_path_like_audit_ref(token))
         .collect::<Vec<_>>();
@@ -498,7 +451,9 @@ pub(crate) fn missing_audit_refs(required_refs: &[String], seen_refs: &[String])
     required_refs
         .iter()
         .filter(|required| {
-            !seen_refs.iter().any(|seen| audit_ref_matches(required, seen))
+            !seen_refs
+                .iter()
+                .any(|seen| audit_ref_matches(required, seen))
         })
         .cloned()
         .collect()
@@ -507,7 +462,12 @@ pub(crate) fn missing_audit_refs(required_refs: &[String], seen_refs: &[String])
 pub(crate) fn normalize_audit_ref(raw: &str) -> Option<String> {
     let trimmed = raw
         .trim()
-        .trim_matches(|c: char| matches!(c, '.' | ':' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '`'))
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '.' | ':' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '`'
+            )
+        })
         .trim_start_matches("./")
         .trim_end_matches('/');
     if trimmed.is_empty() {
@@ -521,6 +481,23 @@ pub(crate) fn is_path_like_audit_ref(token: &str) -> bool {
     if lower.ends_with(".rs")
         || lower.ends_with(".js")
         || lower.ends_with(".ts")
+        || lower.ends_with(".jsx")
+        || lower.ends_with(".tsx")
+        || lower.ends_with(".java")
+        || lower.ends_with(".kt")
+        || lower.ends_with(".go")
+        || lower.ends_with(".rb")
+        || lower.ends_with(".php")
+        || lower.ends_with(".cs")
+        || lower.ends_with(".c")
+        || lower.ends_with(".cpp")
+        || lower.ends_with(".h")
+        || lower.ends_with(".hpp")
+        || lower.ends_with(".swift")
+        || lower.ends_with(".scala")
+        || lower.ends_with(".sh")
+        || lower.ends_with(".sql")
+        || lower.ends_with(".xml")
         || lower.ends_with(".json")
         || lower.ends_with(".toml")
         || lower.ends_with(".html")
@@ -536,7 +513,20 @@ pub(crate) fn is_path_like_audit_ref(token: &str) -> bool {
     if !lower.contains('/') {
         return matches!(
             lower.as_str(),
-            "package.json" | "cargo.toml" | "cargo.lock" | "readme.md" | "tauri.conf.json"
+            "package.json"
+                | "cargo.toml"
+                | "cargo.lock"
+                | "readme.md"
+                | "tauri.conf.json"
+                | "pyproject.toml"
+                | "requirements.txt"
+                | "go.mod"
+                | "pom.xml"
+                | "build.gradle"
+                | "build.gradle.kts"
+                | "gemfile"
+                | "composer.json"
+                | "dockerfile"
         );
     }
 
@@ -552,19 +542,31 @@ pub(crate) fn is_path_like_audit_ref(token: &str) -> bool {
         matches!(
             *segment,
             "src"
-                | "src-tauri"
-                | "capabilities"
-                | "permissions"
                 | "components"
                 | "pages"
                 | "lib"
                 | "app"
+                | "cmd"
+                | "internal"
+                | "pkg"
                 | "tests"
                 | "scripts"
                 | "assets"
                 | "public"
                 | "backend"
                 | "frontend"
+                | "api"
+                | "controllers"
+                | "services"
+                | "handlers"
+                | "routes"
+                | "config"
+                | "configs"
+                | "deploy"
+                | "ops"
+                | "infra"
+                | "capabilities"
+                | "permissions"
         )
     });
     let last = segments.last().copied().unwrap_or_default();
@@ -610,34 +612,34 @@ fn embedding_cache_key(
     text: &str,
 ) -> String {
     match behavior_id {
-        Some(behavior_id) => format!(
-            "{}::{}::{}::{}",
-            kind, behavior_id, model_key, text
-        ),
+        Some(behavior_id) => format!("{}::{}::{}::{}", kind, behavior_id, model_key, text),
         None => format!("{}::{}::{}", kind, model_key, text),
     }
 }
 
+/// Returns the embedding vector and whether an actual API call was made (false = cache hit).
 async fn get_or_create_cached_embedding(
     cache: &Arc<Mutex<BehaviorTriggerCache>>,
     cache_key: &str,
     model_key: &str,
     text: &str,
-) -> Option<Vec<f32>> {
+) -> (Option<Vec<f32>>, bool) {
     if let Some(existing) = cache.lock().unwrap().embeddings.get(cache_key).cloned() {
-        return Some(existing);
+        return (Some(existing), false);
     }
 
     let embedding = create_embeddings(model_key, &[text.to_string()])
         .await
         .ok()
-        .and_then(|mut vectors| vectors.drain(..).next())?;
-    cache
-        .lock()
-        .unwrap()
-        .embeddings
-        .insert(cache_key.to_string(), embedding.clone());
-    Some(embedding)
+        .and_then(|mut vectors| vectors.drain(..).next());
+    if let Some(ref vec) = embedding {
+        cache
+            .lock()
+            .unwrap()
+            .embeddings
+            .insert(cache_key.to_string(), vec.clone());
+    }
+    (embedding, true)
 }
 
 fn cosine_similarity(left: &[f32], right: &[f32]) -> Option<f32> {
