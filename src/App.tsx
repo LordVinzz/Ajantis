@@ -1406,284 +1406,281 @@ export default function App() {
                 </div>
 
                 <div className="agents-layout">
-                  <div className="agents-stack">
-                    {agentConfig.agents.map((agent, index) => {
-                      const info = agent.model_key ? modelDetails[agent.model_key] : undefined;
-                      const isUser = (agent.type || agent.agent_type) === "user";
-                      const selectedMode = agent.mode || "stay_awake";
+                  {agentConfig.agents.map((agent, index) => {
+                    const info = agent.model_key ? modelDetails[agent.model_key] : undefined;
+                    const isUser = (agent.type || agent.agent_type) === "user";
+                    const selectedMode = agent.mode || "stay_awake";
 
-                      return (
-                        <div key={agent.id} className="w98-window agent-card">
-                          <div className="w98-titlebar">
-                            <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                              {agent.name}
+                    return (
+                      <div key={agent.id} className="w98-window agent-card">
+                        <div className="w98-titlebar">
+                          <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {agent.name}
+                          </span>
+                          <span className="w98-badge">{isUser ? "User" : agent.is_manager ? "Manager" : "Worker"}</span>
+                          {!isUser && (
+                            <span
+                              className="w98-badge"
+                              style={{
+                                background: agent.armed === false ? "var(--w98-gray)" : "#004400",
+                                color: agent.armed === false ? "var(--w98-dark)" : "var(--w98-white)",
+                                borderColor: agent.armed === false ? undefined : "#006600 #002200 #002200 #006600",
+                              }}
+                            >
+                              {agent.armed === false ? "Disarmed" : "Armed"}
                             </span>
-                            <span className="w98-badge">{isUser ? "User" : agent.is_manager ? "Manager" : "Worker"}</span>
+                          )}
+                        </div>
+
+                        <div className="agent-card-body">
+                          <div className="agent-meta-row">
+                            <span className="w98-badge">ID {agent.id}</span>
                             {!isUser && (
-                              <span
-                                className="w98-badge"
-                                style={{
-                                  background: agent.armed === false ? "var(--w98-gray)" : "#004400",
-                                  color: agent.armed === false ? "var(--w98-dark)" : "var(--w98-white)",
-                                  borderColor: agent.armed === false ? undefined : "#006600 #002200 #002200 #006600",
-                                }}
-                              >
-                                {agent.armed === false ? "Disarmed" : "Armed"}
-                              </span>
+                              <>
+                                <span className="w98-badge">{info?.display_name || agent.model_key || "No model selected"}</span>
+                                <span className="w98-badge">{selectedMode === "stay_awake" ? "Pinned in memory" : "Load on demand"}</span>
+                              </>
                             )}
                           </div>
 
-                          <div className="agent-card-body">
-                            <div className="agent-meta-row">
-                              <span className="w98-badge">ID {agent.id}</span>
-                              {!isUser && (
-                                <>
-                                  <span className="w98-badge">{info?.display_name || agent.model_key || "No model selected"}</span>
-                                  <span className="w98-badge">{selectedMode === "stay_awake" ? "Pinned in memory" : "Load on demand"}</span>
-                                </>
-                              )}
+                          {isUser ? (
+                            <div className="agent-user-panel">
+                              <p className="agents-copy" style={{ margin: 0 }}>
+                                The user node is the manual entrypoint for a thread and the sink for any response routed back to a human.
+                              </p>
+                              <label className="agent-field">
+                                <span className="w98-label">Visible name</span>
+                                <input
+                                  className="w98-input"
+                                  onChange={(e) => updateAgent(index, { name: e.target.value })}
+                                  value={agent.name}
+                                />
+                              </label>
                             </div>
-
-                            {isUser ? (
-                              <div className="agent-user-panel">
-                                <p className="agents-copy" style={{ margin: 0 }}>
-                                  The user node is the manual entrypoint for a thread and the sink for any response routed back to a human.
-                                </p>
-                                <label className="agent-field">
-                                  <span className="w98-label">Visible name</span>
-                                  <input
-                                    className="w98-input"
-                                    onChange={(e) => updateAgent(index, { name: e.target.value })}
-                                    value={agent.name}
-                                  />
-                                </label>
-                              </div>
-                            ) : (
-                              <>
-                                <div className="agent-section-grid">
-                                  <section className="agent-section">
-                                    <div className="agent-section-header">
-                                      <div>
-                                        <div className="agent-section-kicker">Identity</div>
-                                        <div className="agent-section-title">Who this agent is</div>
-                                      </div>
-                                      <label className="agent-inline-toggle">
-                                        <input
-                                          type="checkbox"
-                                          checked={!!agent.is_manager}
-                                          onChange={(e) => updateAgent(index, { is_manager: e.target.checked })}
-                                        />
-                                        Manager
-                                      </label>
+                          ) : (
+                            <>
+                              <div className="agent-section-grid">
+                                <section className="agent-section">
+                                  <div className="agent-section-header">
+                                    <div>
+                                      <div className="agent-section-kicker">Identity</div>
+                                      <div className="agent-section-title">Who this agent is</div>
                                     </div>
+                                    <label className="agent-inline-toggle">
+                                      <input
+                                        type="checkbox"
+                                        checked={!!agent.is_manager}
+                                        onChange={(e) => updateAgent(index, { is_manager: e.target.checked })}
+                                      />
+                                      Manager
+                                    </label>
+                                  </div>
 
-                                    <div className="agent-field-grid">
-                                      <label className="agent-field agent-field-wide">
-                                        <span className="w98-label">Name</span>
-                                        <input
-                                          className="w98-input"
-                                          onChange={(e) => updateAgent(index, { name: e.target.value })}
-                                          value={agent.name}
-                                        />
-                                      </label>
-
-                                      <label className="agent-field">
-                                        <span className="w98-label">Model</span>
-                                        <select
-                                          className="w98-select"
-                                          onChange={(e) => {
-                                            const selected = availableModels.find((model) => model.key === e.target.value);
-                                            updateAgent(index, {
-                                              model_key: e.target.value,
-                                              model_type: selected?.model_type ?? "llm",
-                                            });
-                                          }}
-                                          value={agent.model_key ?? ""}
-                                        >
-                                          {!availableModels.length && <option value="">No model available</option>}
-                                          {availableModels.map((model) => (
-                                            <option key={model.key} value={model.key}>
-                                              {model.display_name || model.key}
-                                            </option>
-                                          ))}
-                                        </select>
-                                        <span className="agent-field-hint">
-                                          {info?.model_type?.toUpperCase() || "LLM"} · {info?.params_string || "unknown size"}
-                                        </span>
-                                      </label>
-
-                                      <div className="agent-field">
-                                        <span className="w98-label">Mode</span>
-                                        <div className="agent-mode-row">
-                                          {["stay_awake", "on_the_fly"].map((mode) => (
-                                            <button
-                                              key={mode}
-                                              className="w98-btn w98-btn-sm"
-                                              style={{
-                                                background: selectedMode === mode ? "var(--w98-navy)" : undefined,
-                                                color: selectedMode === mode ? "var(--w98-white)" : undefined,
-                                              }}
-                                              onClick={() => updateAgent(index, { mode })}
-                                              type="button"
-                                            >
-                                              {mode === "stay_awake" ? "Active" : "On demand"}
-                                            </button>
-                                          ))}
-                                        </div>
-                                      </div>
-                                    </div>
-                                  </section>
-
-                                  <section className="agent-section">
-                                    <div className="agent-section-header">
-                                      <div>
-                                        <div className="agent-section-kicker">Prompt</div>
-                                        <div className="agent-section-title">Role and instructions</div>
-                                      </div>
-                                    </div>
-                                    <label className="agent-field">
-                                      <span className="w98-label">System prompt</span>
-                                      <textarea
-                                        className="w98-textarea w98-textarea-sans"
-                                        style={{ minHeight: "120px" }}
-                                        onChange={(e) => updateAgent(index, { role: e.target.value })}
-                                        value={agent.role ?? ""}
+                                  <div className="agent-field-grid">
+                                    <label className="agent-field agent-field-wide">
+                                      <span className="w98-label">Name</span>
+                                      <input
+                                        className="w98-input"
+                                        onChange={(e) => updateAgent(index, { name: e.target.value })}
+                                        value={agent.name}
                                       />
                                     </label>
-                                  </section>
-                                </div>
+
+                                    <label className="agent-field">
+                                      <span className="w98-label">Model</span>
+                                      <select
+                                        className="w98-select"
+                                        onChange={(e) => {
+                                          const selected = availableModels.find((model) => model.key === e.target.value);
+                                          updateAgent(index, {
+                                            model_key: e.target.value,
+                                            model_type: selected?.model_type ?? "llm",
+                                          });
+                                        }}
+                                        value={agent.model_key ?? ""}
+                                      >
+                                        {!availableModels.length && <option value="">No model available</option>}
+                                        {availableModels.map((model) => (
+                                          <option key={model.key} value={model.key}>
+                                            {model.display_name || model.key}
+                                          </option>
+                                        ))}
+                                      </select>
+                                      <span className="agent-field-hint">
+                                        {info?.model_type?.toUpperCase() || "LLM"} · {info?.params_string || "unknown size"}
+                                      </span>
+                                    </label>
+
+                                    <div className="agent-field">
+                                      <span className="w98-label">Mode</span>
+                                      <div className="agent-mode-row">
+                                        {["stay_awake", "on_the_fly"].map((mode) => (
+                                          <button
+                                            key={mode}
+                                            className="w98-btn w98-btn-sm"
+                                            style={{
+                                              background: selectedMode === mode ? "var(--w98-navy)" : undefined,
+                                              color: selectedMode === mode ? "var(--w98-white)" : undefined,
+                                            }}
+                                            onClick={() => updateAgent(index, { mode })}
+                                            type="button"
+                                          >
+                                            {mode === "stay_awake" ? "Active" : "On demand"}
+                                          </button>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  </div>
+                                </section>
 
                                 <section className="agent-section">
                                   <div className="agent-section-header">
                                     <div>
-                                      <div className="agent-section-kicker">Load profile</div>
-                                      <div className="agent-section-title">Memory and acceleration</div>
+                                      <div className="agent-section-kicker">Prompt</div>
+                                      <div className="agent-section-title">Role and instructions</div>
                                     </div>
                                   </div>
-
-                                  <div className="agent-load-grid">
-                                    <label className="agent-field">
-                                      <span className="w98-label">Context</span>
-                                      <input
-                                        className="w98-input"
-                                        type="number"
-                                        value={agent.load_config?.context_length ?? ""}
-                                        onChange={(e) =>
-                                          updateAgent(index, {
-                                            load_config: {
-                                              ...(agent.load_config ?? {}),
-                                              context_length: e.target.value ? Number(e.target.value) : null,
-                                            },
-                                          })
-                                        }
-                                      />
-                                    </label>
-                                    <label className="agent-field">
-                                      <span className="w98-label">Eval batch</span>
-                                      <input
-                                        className="w98-input"
-                                        type="number"
-                                        value={agent.load_config?.eval_batch_size ?? ""}
-                                        onChange={(e) =>
-                                          updateAgent(index, {
-                                            load_config: {
-                                              ...(agent.load_config ?? {}),
-                                              eval_batch_size: e.target.value ? Number(e.target.value) : null,
-                                            },
-                                          })
-                                        }
-                                      />
-                                    </label>
-                                    <label className="agent-field">
-                                      <span className="w98-label">Experts</span>
-                                      <input
-                                        className="w98-input"
-                                        type="number"
-                                        value={agent.load_config?.num_experts ?? ""}
-                                        onChange={(e) =>
-                                          updateAgent(index, {
-                                            load_config: {
-                                              ...(agent.load_config ?? {}),
-                                              num_experts: e.target.value ? Number(e.target.value) : null,
-                                            },
-                                          })
-                                        }
-                                      />
-                                    </label>
-                                  </div>
-
-                                  <div className="agent-toggle-grid">
-                                    <label className="agent-inline-toggle">
-                                      <input
-                                        type="checkbox"
-                                        checked={!!agent.load_config?.flash_attention}
-                                        onChange={(e) =>
-                                          updateAgent(index, {
-                                            load_config: { ...(agent.load_config ?? {}), flash_attention: e.target.checked },
-                                          })
-                                        }
-                                      />
-                                      Flash attention
-                                    </label>
-                                    <label className="agent-inline-toggle">
-                                      <input
-                                        type="checkbox"
-                                        checked={!!agent.load_config?.offload_kv_cache_to_gpu}
-                                        onChange={(e) =>
-                                          updateAgent(index, {
-                                            load_config: { ...(agent.load_config ?? {}), offload_kv_cache_to_gpu: e.target.checked },
-                                          })
-                                        }
-                                      />
-                                      GPU KV offload
-                                    </label>
-                                  </div>
+                                  <label className="agent-field">
+                                    <span className="w98-label">System prompt</span>
+                                    <textarea
+                                      className="w98-textarea w98-textarea-sans"
+                                      style={{ minHeight: "120px" }}
+                                      onChange={(e) => updateAgent(index, { role: e.target.value })}
+                                      value={agent.role ?? ""}
+                                    />
+                                  </label>
                                 </section>
+                              </div>
 
-                                <div className="agent-action-row">
-                                  <button
-                                    className="w98-btn w98-btn-sm"
-                                    disabled={!tauriAvailable || !agent.model_key}
-                                    onClick={() => void loadModelForAgent(agent)}
-                                    type="button"
-                                  >
-                                    Load now
-                                  </button>
-                                  <button
-                                    className="w98-btn w98-btn-sm"
-                                    onClick={() => updateAgent(index, { armed: !(agent.armed !== false) })}
-                                    type="button"
-                                  >
-                                    {agent.armed === false ? "Arm" : "Disarm"}
-                                  </button>
-                                  <button
-                                    className="w98-btn w98-btn-sm"
-                                    disabled={agent.armed !== false}
-                                    onClick={() =>
-                                      setAgentConfig((config) => ({
-                                        ...config,
-                                        agents: config.agents.filter((entry) => entry.id !== agent.id),
-                                        connections: config.connections.filter(
-                                          (connection) => connection.from !== agent.id && connection.to !== agent.id,
-                                        ),
-                                      }))
-                                    }
-                                    style={{ color: agent.armed !== false ? undefined : "#CC0000" }}
-                                    type="button"
-                                  >
-                                    Delete
-                                  </button>
+                              <section className="agent-section">
+                                <div className="agent-section-header">
+                                  <div>
+                                    <div className="agent-section-kicker">Load profile</div>
+                                    <div className="agent-section-title">Memory and acceleration</div>
+                                  </div>
                                 </div>
-                              </>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
 
-                  <div className="agents-sidebar">
-                    <div className="w98-window agents-panel-window">
+                                <div className="agent-load-grid">
+                                  <label className="agent-field">
+                                    <span className="w98-label">Context</span>
+                                    <input
+                                      className="w98-input"
+                                      type="number"
+                                      value={agent.load_config?.context_length ?? ""}
+                                      onChange={(e) =>
+                                        updateAgent(index, {
+                                          load_config: {
+                                            ...(agent.load_config ?? {}),
+                                            context_length: e.target.value ? Number(e.target.value) : null,
+                                          },
+                                        })
+                                      }
+                                    />
+                                  </label>
+                                  <label className="agent-field">
+                                    <span className="w98-label">Eval batch</span>
+                                    <input
+                                      className="w98-input"
+                                      type="number"
+                                      value={agent.load_config?.eval_batch_size ?? ""}
+                                      onChange={(e) =>
+                                        updateAgent(index, {
+                                          load_config: {
+                                            ...(agent.load_config ?? {}),
+                                            eval_batch_size: e.target.value ? Number(e.target.value) : null,
+                                          },
+                                        })
+                                      }
+                                    />
+                                  </label>
+                                  <label className="agent-field">
+                                    <span className="w98-label">Experts</span>
+                                    <input
+                                      className="w98-input"
+                                      type="number"
+                                      value={agent.load_config?.num_experts ?? ""}
+                                      onChange={(e) =>
+                                        updateAgent(index, {
+                                          load_config: {
+                                            ...(agent.load_config ?? {}),
+                                            num_experts: e.target.value ? Number(e.target.value) : null,
+                                          },
+                                        })
+                                      }
+                                    />
+                                  </label>
+                                </div>
+
+                                <div className="agent-toggle-grid">
+                                  <label className="agent-inline-toggle">
+                                    <input
+                                      type="checkbox"
+                                      checked={!!agent.load_config?.flash_attention}
+                                      onChange={(e) =>
+                                        updateAgent(index, {
+                                          load_config: { ...(agent.load_config ?? {}), flash_attention: e.target.checked },
+                                        })
+                                      }
+                                    />
+                                    Flash attention
+                                  </label>
+                                  <label className="agent-inline-toggle">
+                                    <input
+                                      type="checkbox"
+                                      checked={!!agent.load_config?.offload_kv_cache_to_gpu}
+                                      onChange={(e) =>
+                                        updateAgent(index, {
+                                          load_config: { ...(agent.load_config ?? {}), offload_kv_cache_to_gpu: e.target.checked },
+                                        })
+                                      }
+                                    />
+                                    GPU KV offload
+                                  </label>
+                                </div>
+                              </section>
+
+                              <div className="agent-action-row">
+                                <button
+                                  className="w98-btn w98-btn-sm"
+                                  disabled={!tauriAvailable || !agent.model_key}
+                                  onClick={() => void loadModelForAgent(agent)}
+                                  type="button"
+                                >
+                                  Load now
+                                </button>
+                                <button
+                                  className="w98-btn w98-btn-sm"
+                                  onClick={() => updateAgent(index, { armed: !(agent.armed !== false) })}
+                                  type="button"
+                                >
+                                  {agent.armed === false ? "Arm" : "Disarm"}
+                                </button>
+                                <button
+                                  className="w98-btn w98-btn-sm"
+                                  disabled={agent.armed !== false}
+                                  onClick={() =>
+                                    setAgentConfig((config) => ({
+                                      ...config,
+                                      agents: config.agents.filter((entry) => entry.id !== agent.id),
+                                      connections: config.connections.filter(
+                                        (connection) => connection.from !== agent.id && connection.to !== agent.id,
+                                      ),
+                                    }))
+                                  }
+                                  style={{ color: agent.armed !== false ? undefined : "#CC0000" }}
+                                  type="button"
+                                >
+                                  Delete
+                                </button>
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+
+                  <div className="w98-window agents-panel-window">
                       <div className="w98-titlebar">Command sandbox</div>
                       <div className="agents-panel-body">
                         <p className="agents-copy" style={{ marginTop: 0 }}>
@@ -1722,7 +1719,7 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="w98-window agents-panel-window">
+                  <div className="w98-window agents-panel-window">
                       <div className="w98-titlebar">Redundancy detection</div>
                       <div className="agents-panel-body">
                         <label className="agent-inline-toggle">
@@ -1780,7 +1777,7 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="w98-window agents-panel-window">
+                  <div className="w98-window agents-panel-window">
                       <div className="w98-titlebar">Run budgets</div>
                       <div className="agents-panel-body">
                         <label className="agent-inline-toggle">
@@ -1921,7 +1918,7 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="w98-window agents-panel-window">
+                  <div className="w98-window agents-panel-window">
                       <div className="w98-titlebar">Behavior triggers</div>
                       <div className="agents-panel-body">
                         <div className="agents-panel-header">
@@ -2006,7 +2003,6 @@ export default function App() {
                         </div>
                       </div>
                     </div>
-                  </div>
                 </div>
               </div>
             </section>
