@@ -1,4 +1,6 @@
-export type TabKey = "chat" | "agents" | "routing";
+export type AppTheme = "win98" | "ubuntu" | "macos";
+
+export type TabKey = "chat" | "agents" | "routing" | "settings";
 
 export interface ModelInstance {
   instance_id: string;
@@ -165,6 +167,7 @@ export interface BehaviorTriggersConfig {
 }
 
 export interface AgentConfig {
+  theme: AppTheme;
   agents: Agent[];
   connections: RoutingRule[];
   command_policy: CommandPolicy;

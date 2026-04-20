@@ -6,9 +6,9 @@ use std::time::Instant;
 use tauri::ipc::Channel;
 
 use crate::agent_config::{
-    resolve_audit_behavior_config, AuditEvidenceGrade, RedundancyDetectionConfig,
-    ResolvedAuditBehaviorConfig, MAX_SEMANTIC_SIMILARITY_THRESHOLD,
-    MIN_SEMANTIC_SIMILARITY_THRESHOLD, BudgetHitSummarizationConfig,
+    resolve_audit_behavior_config, AuditEvidenceGrade, BudgetHitSummarizationConfig,
+    RedundancyDetectionConfig, ResolvedAuditBehaviorConfig, MAX_SEMANTIC_SIMILARITY_THRESHOLD,
+    MIN_SEMANTIC_SIMILARITY_THRESHOLD,
 };
 use crate::helpers::{
     audit_response_acknowledges_refs, compute_context_budget, extract_explicit_audit_refs,
@@ -449,7 +449,11 @@ pub(crate) const RUN_PAUSED_ERROR: &str = "__run_paused__";
 /// Returned when a budget-hit summary was generated and streamed: routing must stop without re-routing the summary text.
 pub(crate) const RUN_BUDGET_ENDED_ERROR: &str = "__run_budget_ended__";
 
-fn sync_active_run_behaviors(tool_state: &McpState, run_id: &str, active_behaviors: &HashSet<String>) {
+fn sync_active_run_behaviors(
+    tool_state: &McpState,
+    run_id: &str,
+    active_behaviors: &HashSet<String>,
+) {
     if let Some(run) = tool_state.active_runs.lock().unwrap().get_mut(run_id) {
         run.active_behaviors = active_behaviors.clone();
     }
@@ -609,12 +613,8 @@ fn pause_run_for_confirmation(
 fn emit_usage_update(tool_state: &McpState, run_id: &str, on_event: &Channel<StreamEvent>) {
     let snapshot = {
         let runs = tool_state.active_runs.lock().unwrap();
-        runs.get(run_id).map(|run| {
-            (
-                run.usage.clone(),
-                run.window_started_at.elapsed().as_secs(),
-            )
-        })
+        runs.get(run_id)
+            .map(|run| (run.usage.clone(), run.window_started_at.elapsed().as_secs()))
     };
     if let Some((usage, wall_clock_seconds)) = snapshot {
         let _ = on_event.send(StreamEvent::RunUsageUpdate {
@@ -691,13 +691,23 @@ async fn force_budget_summary(
         let runs = tool_state.active_runs.lock().unwrap();
         if let Some(run) = runs.get(run_id) {
             match (&run.manager_agent_id, &run.manager_model_key) {
-                (Some(mid), Some(mmodel)) if !run.manager_messages.is_empty() => {
-                    (Some(mmodel.clone()), run.manager_messages.clone(), mid.clone())
-                }
-                _ => (None, fallback_messages.to_vec(), fallback_agent_id.to_string()),
+                (Some(mid), Some(mmodel)) if !run.manager_messages.is_empty() => (
+                    Some(mmodel.clone()),
+                    run.manager_messages.clone(),
+                    mid.clone(),
+                ),
+                _ => (
+                    None,
+                    fallback_messages.to_vec(),
+                    fallback_agent_id.to_string(),
+                ),
             }
         } else {
-            (None, fallback_messages.to_vec(), fallback_agent_id.to_string())
+            (
+                None,
+                fallback_messages.to_vec(),
+                fallback_agent_id.to_string(),
+            )
         }
     };
     // Priority: explicit config override > manager model > current agent model
@@ -753,7 +763,8 @@ async fn resolve_budget_limit(
                 run_id,
                 tool_state,
                 on_event,
-            ).await;
+            )
+            .await;
             Ok(BudgetLimitOutcome::Summarized)
         }
         "stop" => Ok(BudgetLimitOutcome::Stopped),
@@ -859,8 +870,13 @@ pub(crate) async fn call_chat_with_tools(
         tool_overhead,
     );
     let effective_system_prompt = with_context_budget(system_prompt, budget);
-    let trimmed_history =
-        trim_history_to_budget(system_prompt, history, message, context_limit, tool_overhead);
+    let trimmed_history = trim_history_to_budget(
+        system_prompt,
+        history,
+        message,
+        context_limit,
+        tool_overhead,
+    );
     if !effective_system_prompt.is_empty() {
         messages.push(json!({"role": "system", "content": effective_system_prompt}));
     }
@@ -968,7 +984,17 @@ pub(crate) async fn call_chat_with_tools(
                 usage: capture_run_usage(tool_state, run_id),
                 limit_hit,
             };
-            match resolve_budget_limit(tool_state, run_id, model_key, &messages, agent_id, paused_state, on_event).await? {
+            match resolve_budget_limit(
+                tool_state,
+                run_id,
+                model_key,
+                &messages,
+                agent_id,
+                paused_state,
+                on_event,
+            )
+            .await?
+            {
                 BudgetLimitOutcome::Summarized => return Err(RUN_BUDGET_ENDED_ERROR.to_string()),
                 BudgetLimitOutcome::Stopped => return Err(RUN_BUDGET_ENDED_ERROR.to_string()),
                 BudgetLimitOutcome::Paused => return Err(RUN_PAUSED_ERROR.to_string()),
@@ -1016,7 +1042,17 @@ pub(crate) async fn call_chat_with_tools(
                 usage: capture_run_usage(tool_state, run_id),
                 limit_hit,
             };
-            match resolve_budget_limit(tool_state, run_id, model_key, &messages, agent_id, paused_state, on_event).await? {
+            match resolve_budget_limit(
+                tool_state,
+                run_id,
+                model_key,
+                &messages,
+                agent_id,
+                paused_state,
+                on_event,
+            )
+            .await?
+            {
                 BudgetLimitOutcome::Summarized => return Err(RUN_BUDGET_ENDED_ERROR.to_string()),
                 BudgetLimitOutcome::Stopped => return Err(RUN_BUDGET_ENDED_ERROR.to_string()),
                 BudgetLimitOutcome::Paused => return Err(RUN_PAUSED_ERROR.to_string()),
@@ -1072,9 +1108,23 @@ pub(crate) async fn call_chat_with_tools(
                         usage: capture_run_usage(tool_state, run_id),
                         limit_hit,
                     };
-                    match resolve_budget_limit(tool_state, run_id, model_key, &messages, agent_id, paused_state, on_event).await? {
-                        BudgetLimitOutcome::Summarized => return Err(RUN_BUDGET_ENDED_ERROR.to_string()),
-                        BudgetLimitOutcome::Stopped => return Err(RUN_BUDGET_ENDED_ERROR.to_string()),
+                    match resolve_budget_limit(
+                        tool_state,
+                        run_id,
+                        model_key,
+                        &messages,
+                        agent_id,
+                        paused_state,
+                        on_event,
+                    )
+                    .await?
+                    {
+                        BudgetLimitOutcome::Summarized => {
+                            return Err(RUN_BUDGET_ENDED_ERROR.to_string())
+                        }
+                        BudgetLimitOutcome::Stopped => {
+                            return Err(RUN_BUDGET_ENDED_ERROR.to_string())
+                        }
                         BudgetLimitOutcome::Paused => return Err(RUN_PAUSED_ERROR.to_string()),
                     }
                 }
@@ -1543,25 +1593,13 @@ pub(crate) enum StreamEvent {
         observed: u64,
     },
     #[serde(rename = "run_waiting_confirmation")]
-    RunWaitingConfirmation {
-        run_id: String,
-        message: String,
-    },
+    RunWaitingConfirmation { run_id: String, message: String },
     #[serde(rename = "run_resumed")]
-    RunResumed {
-        run_id: String,
-        message: String,
-    },
+    RunResumed { run_id: String, message: String },
     #[serde(rename = "run_cancelled")]
-    RunCancelled {
-        run_id: String,
-        message: String,
-    },
+    RunCancelled { run_id: String, message: String },
     #[serde(rename = "run_checkpoint_saved")]
-    RunCheckpointSaved {
-        run_id: String,
-        checkpoint: String,
-    },
+    RunCheckpointSaved { run_id: String, checkpoint: String },
     #[serde(rename = "run_usage_update")]
     RunUsageUpdate {
         run_id: String,

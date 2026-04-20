@@ -113,8 +113,8 @@ pub(crate) fn append_journal_entry(path: &PathBuf, record: &Value) -> Result<(),
         .append(true)
         .open(path)
         .map_err(|e| format!("Failed to open run journal: {}", e))?;
-    let line =
-        serde_json::to_string(record).map_err(|e| format!("Failed to encode run journal: {}", e))?;
+    let line = serde_json::to_string(record)
+        .map_err(|e| format!("Failed to encode run journal: {}", e))?;
     writeln!(file, "{}", line).map_err(|e| format!("Failed to write run journal: {}", e))
 }
 

@@ -7,6 +7,11 @@ use crate::helpers::{default_priority, default_true};
 pub(crate) const MIN_SEMANTIC_SIMILARITY_THRESHOLD: f32 = 0.85;
 pub(crate) const MAX_SEMANTIC_SIMILARITY_THRESHOLD: f32 = 0.99;
 pub(crate) const GROUNDED_AUDIT_BEHAVIOR_ID: &str = "grounded_audit";
+pub(crate) const DEFAULT_THEME: &str = "win98";
+
+fn default_theme() -> String {
+    DEFAULT_THEME.to_string()
+}
 
 fn default_redundancy_enabled() -> bool {
     true
@@ -959,6 +964,8 @@ impl Default for BehaviorTriggersConfig {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct AgentConfig {
+    #[serde(default = "default_theme")]
+    pub(crate) theme: String,
     pub(crate) agents: Vec<Agent>,
     pub(crate) connections: Vec<RoutingRule>,
     #[serde(default)]
@@ -974,6 +981,7 @@ pub(crate) struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         AgentConfig {
+            theme: default_theme(),
             agents: vec![Agent {
                 id: "user".to_string(),
                 name: "User".to_string(),

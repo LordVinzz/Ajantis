@@ -36,7 +36,7 @@ The backend connects to LM Studio at `http://localhost:1234` by default. Overrid
 
 ## Configuration
 
-Agents and routing rules are stored in `~/.ajantis/ajantis-config.json` and edited from the app's **Agents** tab.
+Agents, routing rules, and the selected UI theme are stored in `~/.ajantis/ajantis-config.json` and edited from the app's **Agents** and **Settings** tabs.
 
 Runtime config files under `~/.ajantis/` are also reachable through the MCP file tools.
 

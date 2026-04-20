@@ -1121,7 +1121,8 @@ pub(crate) async fn handle_tool_call(
             };
 
             let maybe_ch = state.event_channel.lock().unwrap().clone();
-            let run_id = primary_run_id(&state.active_runs).unwrap_or_else(|| "detached-run".to_string());
+            let run_id =
+                primary_run_id(&state.active_runs).unwrap_or_else(|| "detached-run".to_string());
             if let Some(ref ch) = maybe_ch {
                 let budget =
                     compute_context_budget(&sys_prompt, &history, &content, context_limit, 0);
@@ -1416,7 +1417,8 @@ pub(crate) async fn handle_tool_call(
                 return mcp_error("Error: message is required.");
             }
             let maybe_ch = state.event_channel.lock().unwrap().clone();
-            let run_id = primary_run_id(&state.active_runs).unwrap_or_else(|| "detached-run".to_string());
+            let run_id =
+                primary_run_id(&state.active_runs).unwrap_or_else(|| "detached-run".to_string());
             if let Some(ref ch) = maybe_ch {
                 let _ = ch.send(StreamEvent::AgentStart {
                     run_id: run_id.clone(),

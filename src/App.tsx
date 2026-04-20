@@ -19,6 +19,7 @@ import type {
   ActiveRunUiState,
   Agent,
   AgentConfig,
+  AppTheme,
   BehaviorTriggerConfig,
   CommandExecution,
   LoadedModel,
@@ -39,10 +40,36 @@ const MAX_SEMANTIC_REDUNDANCY_THRESHOLD = 0.99;
 const MIN_BEHAVIOR_TRIGGER_THRESHOLD = 0.0;
 const MAX_BEHAVIOR_TRIGGER_THRESHOLD = 1.0;
 const COLLAPSED_THREAD_RENDER_LIMIT = 150;
+const CONFIG_FILE_HINT = "~/.ajantis/ajantis-config.json";
+const APP_THEMES: Array<{
+  id: AppTheme;
+  label: string;
+  blurb: string;
+}> = [
+  {
+    id: "win98",
+    label: "Windows 98",
+    blurb: "Classic beveled controls, blue title bars, and the current default shell.",
+  },
+  {
+    id: "ubuntu",
+    label: "Ubuntu",
+    blurb: "Warm brown and orange chrome inspired by the old Human-era Ubuntu desktop.",
+  },
+  {
+    id: "macos",
+    label: "Classic Mac OS",
+    blurb: "Old-school Platinum styling with crisp grayscale chrome and no glass effects.",
+  },
+];
 const MESSAGE_CARD_STYLE: CSSProperties = {
   contentVisibility: "auto",
   containIntrinsicSize: "240px",
 };
+
+function normalizeTheme(theme?: string | null): AppTheme {
+  return APP_THEMES.some((entry) => entry.id === theme) ? (theme as AppTheme) : "win98";
+}
 
 function defaultGroundedAuditBehavior(): BehaviorTriggerConfig {
   return {
@@ -127,6 +154,7 @@ function defaultGroundedAuditBehavior(): BehaviorTriggerConfig {
 
 function defaultAgentConfig(): AgentConfig {
   return {
+    theme: "win98",
     agents: [
       {
         id: "user",
@@ -333,6 +361,7 @@ export default function App() {
   const tokenFlushFrameRef = useRef<number | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
   const [showFullThreadHistory, setShowFullThreadHistory] = useState(false);
+  const activeTheme = normalizeTheme(agentConfig.theme);
 
   const modelDetails = useMemo<Record<string, ModelInfo>>(
     () => Object.fromEntries(availableModels.map((model) => [model.key, model])),
@@ -426,32 +455,61 @@ export default function App() {
 
   async function loadConfig() {
     const config = await invoke<AgentConfig>("load_agent_config");
-    startTransition(() => setAgentConfig({ ...defaultAgentConfig(), ...config }));
+    startTransition(() =>
+      setAgentConfig({ ...defaultAgentConfig(), ...config, theme: normalizeTheme(config.theme) }),
+    );
   }
 
-  async function saveConfig() {
-    const cleaned: AgentConfig = {
-      ...agentConfig,
+  function flashNotice(message: string) {
+    setSaveNotice(message);
+    window.setTimeout(() => setSaveNotice(""), 1500);
+  }
+
+  function sanitizeConfig(config: AgentConfig): AgentConfig {
+    return {
+      ...config,
+      theme: normalizeTheme(config.theme),
       command_policy: {
-        denylist: agentConfig.command_policy.denylist.map((s) => s.trim()).filter(Boolean),
-        allowlist: agentConfig.command_policy.allowlist.map((s) => s.trim()).filter(Boolean),
+        denylist: config.command_policy.denylist.map((s) => s.trim()).filter(Boolean),
+        allowlist: config.command_policy.allowlist.map((s) => s.trim()).filter(Boolean),
       },
       run_budgets: {
-        ...agentConfig.run_budgets,
-        applies_to_behaviors: agentConfig.run_budgets.applies_to_behaviors.map((s) => s.trim()).filter(Boolean),
+        ...config.run_budgets,
+        applies_to_behaviors: config.run_budgets.applies_to_behaviors.map((s) => s.trim()).filter(Boolean),
       },
       behavior_triggers: {
-        ...agentConfig.behavior_triggers,
-        behaviors: agentConfig.behavior_triggers.behaviors.map((b) => ({
+        ...config.behavior_triggers,
+        behaviors: config.behavior_triggers.behaviors.map((b) => ({
           ...b,
           keyword_triggers: b.keyword_triggers.map((s) => s.trim()).filter(Boolean),
         })),
       },
     };
-    await invoke("save_agent_config", { config: stripNullish(cleaned) });
-    setSaveNotice("Configuration saved.");
-    window.setTimeout(() => setSaveNotice(""), 1500);
   }
+
+  async function persistConfig(config: AgentConfig, notice = "Configuration saved.") {
+    const cleaned = sanitizeConfig(config);
+    await invoke("save_agent_config", { config: stripNullish(cleaned) });
+    flashNotice(notice);
+  }
+
+  async function saveConfig() {
+    await persistConfig(agentConfig);
+  }
+
+  function updateTheme(theme: AppTheme) {
+    const nextConfig = { ...agentConfig, theme };
+    setAgentConfig(nextConfig);
+    if (!tauriAvailable) {
+      flashNotice("Theme preview updated. Config persistence requires Tauri.");
+      return;
+    }
+    void persistConfig(nextConfig, "Theme saved.");
+  }
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = activeTheme;
+  }, [activeTheme]);
 
   async function loadWorkspaceIndex() {
     const config = await invoke<{ workspaces: WorkspaceEntry[] }>("load_workspace_config");
@@ -998,7 +1056,7 @@ export default function App() {
   /* ── JSX ───────────────────────────────────────────────── */
 
   return (
-    <div style={{ display: "flex", height: "100vh", overflow: "hidden", background: "var(--w98-gray)" }}>
+    <div className="app-shell" style={{ display: "flex", height: "100vh", overflow: "hidden", background: "var(--w98-gray)" }}>
 
       {/* ── Sidebar ── */}
       <aside
@@ -1089,7 +1147,7 @@ export default function App() {
 
         {/* Tab bar */}
         <div className="w98-tabbar">
-          {(["chat", "agents", "routing"] as TabKey[]).map((tab) => (
+          {(["chat", "agents", "routing", "settings"] as TabKey[]).map((tab) => (
             <button
               key={tab}
               className={activeTab === tab ? "w98-tab-active" : "w98-tab"}
@@ -1099,8 +1157,11 @@ export default function App() {
               {tab[0].toUpperCase() + tab.slice(1)}
             </button>
           ))}
+          <span className="w98-badge" style={{ marginLeft: "auto", alignSelf: "center" }}>
+            Theme: {APP_THEMES.find((theme) => theme.id === activeTheme)?.label ?? "Windows 98"}
+          </span>
           {saveNotice && (
-            <span className="w98-notice" style={{ marginLeft: "auto", alignSelf: "center" }}>
+            <span className="w98-notice" style={{ alignSelf: "center" }}>
               {saveNotice}
             </span>
           )}
@@ -2135,6 +2196,71 @@ export default function App() {
                         </label>
                       </div>
                     ))}
+                  </div>
+                </div>
+              </div>
+            </section>
+          )}
+
+          {activeTab === "settings" && (
+            <section className="settings-shell">
+              <div className="settings-page">
+                <div className="w98-window settings-window">
+                  <div className="w98-titlebar">Settings</div>
+                  <div className="settings-body">
+                    <div className="settings-hero">
+                      <div>
+                        <div className="agents-kicker">Appearance</div>
+                        <h2 className="settings-title">Choose the shell chrome.</h2>
+                        <p className="agents-copy settings-copy">
+                          Theme changes apply immediately and are stored in <code>{CONFIG_FILE_HINT}</code>.
+                        </p>
+                      </div>
+                      <span className="w98-badge">
+                        Current theme: {APP_THEMES.find((theme) => theme.id === activeTheme)?.label ?? "Windows 98"}
+                      </span>
+                    </div>
+
+                    <div className="theme-grid">
+                      {APP_THEMES.map((theme) => {
+                        const selected = activeTheme === theme.id;
+                        return (
+                          <button
+                            key={theme.id}
+                            className={`theme-card${selected ? " theme-card-active" : ""}`}
+                            onClick={() => updateTheme(theme.id)}
+                            type="button"
+                          >
+                            <div className={`theme-card-preview theme-card-preview-${theme.id}`}>
+                              <div className="theme-card-preview-title" />
+                              <div className="theme-card-preview-tabs">
+                                <span />
+                                <span />
+                                <span />
+                              </div>
+                              <div className="theme-card-preview-body">
+                                <span />
+                                <span />
+                              </div>
+                            </div>
+
+                            <div className="theme-card-body">
+                              <div className="theme-card-header">
+                                <strong>{theme.label}</strong>
+                                <span className="w98-badge">{selected ? "Active" : "Apply"}</span>
+                              </div>
+                              <p className="theme-card-copy">{theme.blurb}</p>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {!tauriAvailable && (
+                      <div className="w98-notice">
+                        Browser mode: theme preview works here, but writing to the config file requires the Tauri app.
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>

@@ -18,7 +18,11 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 { 0.0 } else { dot / (norm_a * norm_b) }
+    if norm_a == 0.0 || norm_b == 0.0 {
+        0.0
+    } else {
+        dot / (norm_a * norm_b)
+    }
 }
 
 fn jaccard_word_similarity(a: &str, b: &str) -> f32 {
@@ -26,7 +30,11 @@ fn jaccard_word_similarity(a: &str, b: &str) -> f32 {
     let words_b: HashSet<&str> = b.split_whitespace().collect();
     let intersection = words_a.intersection(&words_b).count();
     let union = words_a.union(&words_b).count();
-    if union == 0 { 0.0 } else { intersection as f32 / union as f32 }
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f32 / union as f32
+    }
 }
 
 /// Returns true if `response` is semantically close to any of the agent's recent responses.
@@ -100,7 +108,6 @@ async fn is_repetitive_response(
         }
     }
     max_sim > 0.72
-
 }
 
 #[tauri::command]
@@ -142,7 +149,14 @@ pub(crate) async fn route_message(
             run_id: run_id.clone(),
             workspace_id,
             thread_id,
-            workspace_path: Some(state.active_workspace.lock().unwrap().to_string_lossy().to_string()),
+            workspace_path: Some(
+                state
+                    .active_workspace
+                    .lock()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+            ),
             journal_path,
             channel: on_event.clone(),
             budgets: config.run_budgets.clone(),
@@ -539,7 +553,8 @@ pub(crate) async fn continue_route_run(
         paused
     };
 
-    let result = crate::chat::resume_paused_tool_loop(state.mcp_state.clone(), &run_id, paused).await;
+    let result =
+        crate::chat::resume_paused_tool_loop(state.mcp_state.clone(), &run_id, paused).await;
     if state.active_runs.lock().unwrap().get(&run_id).is_none() {
         *state.event_channel.lock().unwrap() = None;
     }

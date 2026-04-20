@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::agent_config::{
-    AgentConfig, BehaviorTriggerConfig, GROUNDED_AUDIT_BEHAVIOR_ID,
+    AgentConfig, BehaviorTriggerConfig, DEFAULT_THEME, GROUNDED_AUDIT_BEHAVIOR_ID,
     MAX_SEMANTIC_SIMILARITY_THRESHOLD, MIN_SEMANTIC_SIMILARITY_THRESHOLD,
 };
 use crate::helpers::{canonical_manager_role_prompt, manager_prompt_needs_grounding};
@@ -29,6 +29,7 @@ pub(crate) fn load_agent_config_from_disk(workspace_root: &PathBuf) -> AgentConf
     let mut missing_redundancy_config = false;
     let mut missing_behavior_triggers = false;
     let mut missing_run_budgets = false;
+    let mut missing_theme = false;
     let mut parsed_config = None;
     let config = if path.exists() {
         fs::read_to_string(&path)
@@ -42,6 +43,7 @@ pub(crate) fn load_agent_config_from_disk(workspace_root: &PathBuf) -> AgentConf
                 missing_redundancy_config = !parsed.contains_key("redundancy_detection");
                 missing_behavior_triggers = !parsed.contains_key("behavior_triggers");
                 missing_run_budgets = !parsed.contains_key("run_budgets");
+                missing_theme = !parsed.contains_key("theme");
                 serde_json::from_str(&content).unwrap_or_default()
             })
             .unwrap_or_default()
@@ -55,12 +57,12 @@ pub(crate) fn load_agent_config_from_disk(workspace_root: &PathBuf) -> AgentConf
         .map(|parsed| hydrate_grounded_audit_behavior(&mut config, parsed))
         .unwrap_or(false);
     let (normalized, normalized_changed) = normalize_agent_config(config);
-    changed =
-        changed
-            || normalized_changed
-            || missing_redundancy_config
-            || missing_behavior_triggers
-            || missing_run_budgets;
+    changed = changed
+        || normalized_changed
+        || missing_redundancy_config
+        || missing_behavior_triggers
+        || missing_run_budgets
+        || missing_theme;
     if changed {
         let _ = write_agent_config_to_disk(workspace_root, &normalized);
     }
@@ -69,6 +71,14 @@ pub(crate) fn load_agent_config_from_disk(workspace_root: &PathBuf) -> AgentConf
 
 fn normalize_agent_config(mut config: AgentConfig) -> (AgentConfig, bool) {
     let mut changed = false;
+    let normalized_theme = match config.theme.as_str() {
+        "win98" | "ubuntu" | "macos" => config.theme.clone(),
+        _ => DEFAULT_THEME.to_string(),
+    };
+    if config.theme != normalized_theme {
+        config.theme = normalized_theme;
+        changed = true;
+    }
     let threshold = config.redundancy_detection.semantic_similarity_threshold;
     let normalized_threshold = threshold.clamp(
         MIN_SEMANTIC_SIMILARITY_THRESHOLD,
