@@ -31,8 +31,8 @@ use crate::models::{
 use crate::routing::{cancel_route_run, continue_route_run, route_message};
 use crate::state::{AppState, BehaviorTriggerCache};
 use crate::workspace::{
-    load_thread_snapshot, load_workspace_config, pick_folder, save_thread_snapshot,
-    save_workspace_config, set_active_workspace,
+    delete_thread, load_thread_snapshot, load_workspace_config, pick_folder,
+    save_thread_snapshot, save_workspace_config, set_active_workspace,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -133,6 +133,7 @@ pub fn run() {
             pick_folder,
             load_workspace_config,
             save_workspace_config,
+            delete_thread,
             load_thread_snapshot,
             save_thread_snapshot,
             set_active_workspace,

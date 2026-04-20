@@ -339,6 +339,7 @@ export default function App() {
   const [chatInput, setChatInput] = useState("");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [threadSearch, setThreadSearch] = useState("");
+  const [pendingDeleteThreadKey, setPendingDeleteThreadKey] = useState<string | null>(null);
   const [liveAgentState, setLiveAgentState] = useState<Record<string, RuntimeState>>({});
   const [backendStatus, setBackendStatus] = useState({
     activeAgents: new Set<string>(),
@@ -1040,6 +1041,44 @@ export default function App() {
     await saveWorkspaceIndex(nextConfig);
   }
 
+  async function deleteThread(workspaceId: string, threadId: string) {
+    if (!tauriAvailable) {
+      return;
+    }
+    const workspace = workspaceConfig.workspaces.find((entry) => entry.id === workspaceId);
+    const threadIndex = workspace?.threads.findIndex((entry) => entry.id === threadId) ?? -1;
+    const thread = threadIndex >= 0 ? workspace?.threads[threadIndex] : null;
+    if (!workspace || !thread) {
+      return;
+    }
+
+    try {
+      await invoke("delete_thread", { workspaceId, threadId });
+    } catch (error) {
+      setPendingDeleteThreadKey(null);
+      flashNotice(String(error));
+      return;
+    }
+
+    const remainingThreads = workspace.threads.filter((entry) => entry.id !== threadId);
+    const replacementThreadId =
+      remainingThreads[threadIndex]?.id ?? remainingThreads[threadIndex - 1]?.id ?? null;
+    const nextConfig = {
+      workspaces: workspaceConfig.workspaces.map((entry) =>
+        entry.id === workspaceId
+          ? { ...entry, threads: entry.threads.filter((threadEntry) => threadEntry.id !== threadId) }
+          : entry,
+      ),
+    };
+
+    setWorkspaceConfig(nextConfig);
+    setPendingDeleteThreadKey(null);
+    if (activeWorkspaceId === workspaceId && activeThreadId === threadId) {
+      setActiveThreadId(replacementThreadId);
+    }
+    flashNotice("Thread deleted.");
+  }
+
   async function loadModelForAgent(agent: Agent) {
     if (!tauriAvailable || !agent.model_key) {
       return;
@@ -1121,20 +1160,61 @@ export default function App() {
                   <div style={{ fontSize: "10px", color: "var(--w98-dark)", paddingLeft: "14px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     {workspace.path}
                   </div>
-                  {workspace.threads.map((thread) => (
-                    <div
-                      key={thread.id}
-                      className={`w98-tree-item${thread.id === activeThreadId && workspace.id === activeWorkspaceId ? " selected" : ""}`}
-                      style={{ paddingLeft: "12px" }}
-                      onClick={() => {
-                        setActiveWorkspaceId(workspace.id);
-                        setActiveThreadId(thread.id);
-                      }}
-                    >
-                      <span style={{ fontSize: "9px", flexShrink: 0 }}>⎇</span>
-                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{thread.name}</span>
-                    </div>
-                  ))}
+                  {workspace.threads.map((thread) => {
+                    const threadKey = `${workspace.id}:${thread.id}`;
+                    const deletePending = pendingDeleteThreadKey === threadKey;
+                    return (
+                      <div
+                        key={thread.id}
+                        style={{ display: "flex", alignItems: "center", gap: "4px" }}
+                      >
+                        <div
+                          className={`w98-tree-item${thread.id === activeThreadId && workspace.id === activeWorkspaceId ? " selected" : ""}`}
+                          style={{ paddingLeft: "12px", gap: "4px", flex: 1, minWidth: 0 }}
+                          onClick={() => {
+                            setPendingDeleteThreadKey(null);
+                            setActiveWorkspaceId(workspace.id);
+                            setActiveThreadId(thread.id);
+                          }}
+                        >
+                          <span style={{ fontSize: "9px", flexShrink: 0 }}>⎇</span>
+                          <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{thread.name}</span>
+                        </div>
+                        {deletePending ? (
+                          <>
+                            <button
+                              className="w98-btn w98-btn-sm"
+                              style={{ minWidth: "28px", padding: "0 4px", flexShrink: 0 }}
+                              onClick={() => void deleteThread(workspace.id, thread.id)}
+                              type="button"
+                              title={`Confirm delete ${thread.name}`}
+                            >
+                              Del
+                            </button>
+                            <button
+                              className="w98-btn w98-btn-sm"
+                              style={{ minWidth: "18px", padding: "0 4px", flexShrink: 0 }}
+                              onClick={() => setPendingDeleteThreadKey(null)}
+                              type="button"
+                              title="Cancel delete"
+                            >
+                              No
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            className="w98-btn w98-btn-sm"
+                            style={{ minWidth: "18px", padding: "0 4px", flexShrink: 0 }}
+                            onClick={() => setPendingDeleteThreadKey(threadKey)}
+                            type="button"
+                            title={`Delete ${thread.name}`}
+                          >
+                            x
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               ))}
             </div>

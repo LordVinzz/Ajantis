@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::memory::{CommandExecution, MemoryEntry};
-use crate::runs::snapshot_path;
+use crate::runs::{snapshot_path, thread_data_root};
 use crate::state::AppState;
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -103,6 +103,37 @@ pub(crate) fn workspace_config_path(_workspace: &PathBuf) -> PathBuf {
     crate::config_persistence::ajantis_dir().join("workspace_config.json")
 }
 
+fn load_workspace_config_from_disk(workspace_root: &PathBuf) -> Result<WorkspaceConfig, String> {
+    let path = workspace_config_path(workspace_root);
+    if !path.exists() {
+        return Ok(WorkspaceConfig::default());
+    }
+    let content =
+        fs::read_to_string(&path).map_err(|e| format!("Failed to read workspace config: {}", e))?;
+    let mut config: WorkspaceConfig = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse workspace config: {}", e))?;
+    if maybe_migrate_inline_thread_payloads(&mut config)? {
+        save_workspace_config_to_disk(workspace_root, &config)?;
+    }
+    Ok(config)
+}
+
+fn save_workspace_config_to_disk(
+    workspace_root: &PathBuf,
+    config: &WorkspaceConfig,
+) -> Result<(), String> {
+    let path = workspace_config_path(workspace_root);
+    let mut stripped = config.clone();
+    for workspace in &mut stripped.workspaces {
+        for thread in &mut workspace.threads {
+            clear_inline_thread_payload(thread);
+        }
+    }
+    let json = serde_json::to_string_pretty(&stripped)
+        .map_err(|e| format!("Serialization failed: {}", e))?;
+    fs::write(&path, json).map_err(|e| format!("Failed to write workspace config: {}", e))
+}
+
 fn clear_inline_thread_payload(thread: &mut WorkspaceThread) {
     thread.messages.clear();
     thread.message_items.clear();
@@ -168,21 +199,7 @@ pub(crate) async fn pick_folder() -> Result<Option<String>, String> {
 pub(crate) async fn load_workspace_config(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<WorkspaceConfig, String> {
-    let path = workspace_config_path(&state.workspace_root);
-    if !path.exists() {
-        return Ok(WorkspaceConfig::default());
-    }
-    let content =
-        fs::read_to_string(&path).map_err(|e| format!("Failed to read workspace config: {}", e))?;
-    let mut config: WorkspaceConfig = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse workspace config: {}", e))?;
-    if maybe_migrate_inline_thread_payloads(&mut config)? {
-        let stripped = serde_json::to_string_pretty(&config)
-            .map_err(|e| format!("Failed to serialize migrated workspace config: {}", e))?;
-        fs::write(&path, stripped)
-            .map_err(|e| format!("Failed to write migrated workspace config: {}", e))?;
-    }
-    Ok(config)
+    load_workspace_config_from_disk(&state.workspace_root)
 }
 
 #[tauri::command]
@@ -190,16 +207,58 @@ pub(crate) async fn save_workspace_config(
     state: tauri::State<'_, Arc<AppState>>,
     config: WorkspaceConfig,
 ) -> Result<(), String> {
-    let path = workspace_config_path(&state.workspace_root);
-    let mut stripped = config.clone();
-    for workspace in &mut stripped.workspaces {
-        for thread in &mut workspace.threads {
-            clear_inline_thread_payload(thread);
+    save_workspace_config_to_disk(&state.workspace_root, &config)
+}
+
+#[tauri::command]
+pub(crate) async fn delete_thread(
+    state: tauri::State<'_, Arc<AppState>>,
+    workspace_id: String,
+    thread_id: String,
+) -> Result<(), String> {
+    {
+        let runs = state.active_runs.lock().unwrap();
+        let has_active_run = runs.values().any(|run| {
+            run.workspace_id.as_deref() == Some(workspace_id.as_str())
+                && run.thread_id.as_deref() == Some(thread_id.as_str())
+        });
+        if has_active_run {
+            return Err("Stop the active run for this thread before deleting it.".to_string());
         }
     }
-    let json = serde_json::to_string_pretty(&stripped)
-        .map_err(|e| format!("Serialization failed: {}", e))?;
-    fs::write(&path, json).map_err(|e| format!("Failed to write workspace config: {}", e))
+
+    let mut config = load_workspace_config_from_disk(&state.workspace_root)?;
+    let workspace = config
+        .workspaces
+        .iter_mut()
+        .find(|workspace| workspace.id == workspace_id)
+        .ok_or_else(|| format!("Workspace '{}' not found.", workspace_id))?;
+
+    let original_len = workspace.threads.len();
+    workspace.threads.retain(|thread| thread.id != thread_id);
+    if workspace.threads.len() == original_len {
+        return Err(format!("Thread '{}' not found.", thread_id));
+    }
+
+    save_workspace_config_to_disk(&state.workspace_root, &config)?;
+
+    let thread_dir = thread_data_root().join(&workspace_id).join(&thread_id);
+    if thread_dir.exists() {
+        fs::remove_dir_all(&thread_dir)
+            .map_err(|e| format!("Failed to delete thread data: {}", e))?;
+    }
+
+    let workspace_threads_dir = thread_data_root().join(&workspace_id);
+    if workspace_threads_dir.exists()
+        && fs::read_dir(&workspace_threads_dir)
+            .map_err(|e| format!("Failed to inspect workspace thread data: {}", e))?
+            .next()
+            .is_none()
+    {
+        let _ = fs::remove_dir(&workspace_threads_dir);
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
