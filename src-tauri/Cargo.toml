@@ -30,3 +30,13 @@ async-recursion = "1"
 chrono = { version = "0.4", features = ["serde"] }
 rfd = "0.15"
 dirs-next = "2"
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", optional = true }
+
+[[bin]]
+name = "ajantis-tui"
+path = "src/bin/tui.rs"
+required-features = ["tui"]
+
+[features]
+tui = ["ratatui", "crossterm"]

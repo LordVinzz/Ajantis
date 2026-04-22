@@ -1,10 +1,12 @@
 mod agent_config;
 mod chat;
 mod config_persistence;
+mod event_sink;
 mod helpers;
 mod mcp;
 mod memory;
 mod models;
+pub mod runtime;
 mod routing;
 mod runs;
 mod state;
@@ -13,10 +15,8 @@ mod workspace;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use tauri::ipc::Channel;
-
 use crate::agent_config::AgentConfig;
-use crate::chat::{send_message, StreamEvent};
+use crate::chat::send_message;
 use crate::config_persistence::{
     load_agent_config, load_agent_config_from_disk, save_agent_config,
 };
@@ -32,7 +32,7 @@ use crate::routing::{cancel_route_run, continue_route_run, route_message};
 use crate::state::{AppState, BehaviorTriggerCache};
 use crate::workspace::{
     delete_thread, load_thread_snapshot, load_workspace_config, pick_folder,
-    save_thread_snapshot, save_workspace_config, set_active_workspace,
+    queue_thread_snapshot_save, save_thread_snapshot, save_workspace_config, set_active_workspace,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -49,13 +49,16 @@ pub fn run() {
     let memory_pool_arc = Arc::new(Mutex::new(MemoryPool::default()));
     let command_history_arc = Arc::new(Mutex::new(CommandHistory::default()));
     let todo_list_arc = Arc::new(Mutex::new(vec![]));
-    let event_channel_arc: Arc<Mutex<Option<Channel<StreamEvent>>>> = Arc::new(Mutex::new(None));
+    let event_channel_arc = Arc::new(Mutex::new(None));
     // Starts as workspace_root; updated by set_active_workspace when the user picks a workspace.
     let active_workspace_arc = Arc::new(Mutex::new(workspace_root.clone()));
     let glob_cache_arc = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let behavior_trigger_cache_arc = Arc::new(Mutex::new(BehaviorTriggerCache::default()));
     let active_behavior_contexts_arc = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let active_runs_arc = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let pending_thread_snapshots_arc = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let pending_thread_snapshot_versions_arc =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
 
     let mcp_state = Arc::new(McpState {
         tools: mcp_tools,
@@ -92,6 +95,8 @@ pub fn run() {
         mcp_state: mcp_state.clone(),
         event_channel: mcp_state.event_channel.clone(),
         active_runs: active_runs_arc,
+        pending_thread_snapshots: pending_thread_snapshots_arc,
+        pending_thread_snapshot_versions: pending_thread_snapshot_versions_arc,
     });
 
     tauri::Builder::default()
@@ -135,6 +140,7 @@ pub fn run() {
             save_workspace_config,
             delete_thread,
             load_thread_snapshot,
+            queue_thread_snapshot_save,
             save_thread_snapshot,
             set_active_workspace,
         ])

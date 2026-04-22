@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::agent_config::{
-    AgentConfig, BehaviorTriggerConfig, DEFAULT_THEME, GROUNDED_AUDIT_BEHAVIOR_ID,
+    AgentConfig, BehaviorTriggerConfig, FinalizerConfig, DEFAULT_THEME, GROUNDED_AUDIT_BEHAVIOR_ID,
     MAX_SEMANTIC_SIMILARITY_THRESHOLD, MIN_SEMANTIC_SIMILARITY_THRESHOLD,
 };
 use crate::helpers::{canonical_manager_role_prompt, manager_prompt_needs_grounding};
@@ -29,6 +29,7 @@ pub(crate) fn load_agent_config_from_disk(workspace_root: &PathBuf) -> AgentConf
     let mut missing_redundancy_config = false;
     let mut missing_behavior_triggers = false;
     let mut missing_run_budgets = false;
+    let mut missing_finalizer = false;
     let mut missing_theme = false;
     let mut parsed_config = None;
     let config = if path.exists() {
@@ -43,6 +44,7 @@ pub(crate) fn load_agent_config_from_disk(workspace_root: &PathBuf) -> AgentConf
                 missing_redundancy_config = !parsed.contains_key("redundancy_detection");
                 missing_behavior_triggers = !parsed.contains_key("behavior_triggers");
                 missing_run_budgets = !parsed.contains_key("run_budgets");
+                missing_finalizer = !parsed.contains_key("finalizer");
                 missing_theme = !parsed.contains_key("theme");
                 serde_json::from_str(&content).unwrap_or_default()
             })
@@ -62,6 +64,7 @@ pub(crate) fn load_agent_config_from_disk(workspace_root: &PathBuf) -> AgentConf
         || missing_redundancy_config
         || missing_behavior_triggers
         || missing_run_budgets
+        || missing_finalizer
         || missing_theme;
     if changed {
         let _ = write_agent_config_to_disk(workspace_root, &normalized);
@@ -69,10 +72,12 @@ pub(crate) fn load_agent_config_from_disk(workspace_root: &PathBuf) -> AgentConf
     normalized
 }
 
-fn normalize_agent_config(mut config: AgentConfig) -> (AgentConfig, bool) {
+pub(crate) fn normalize_agent_config(mut config: AgentConfig) -> (AgentConfig, bool) {
     let mut changed = false;
     let normalized_theme = match config.theme.as_str() {
-        "win98" | "ubuntu" | "macos" => config.theme.clone(),
+        "win98" | "ubuntu" | "macos" | "classic" | "high-contrast-dark" | "high-contrast-light" => {
+            config.theme.clone()
+        }
         _ => DEFAULT_THEME.to_string(),
     };
     if config.theme != normalized_theme {
@@ -114,6 +119,42 @@ fn normalize_agent_config(mut config: AgentConfig) -> (AgentConfig, bool) {
                 changed = true;
             }
         }
+    }
+    let finalizer_defaults = FinalizerConfig::default();
+    if config.finalizer.agent_name.trim().is_empty() {
+        config.finalizer.agent_name = finalizer_defaults.agent_name.clone();
+        changed = true;
+    }
+    if config.finalizer.prompt_completion.trim().is_empty() {
+        config.finalizer.prompt_completion = finalizer_defaults.prompt_completion.clone();
+        changed = true;
+    }
+    if config.finalizer.prompt_budget_stop.trim().is_empty() {
+        config.finalizer.prompt_budget_stop = finalizer_defaults.prompt_budget_stop.clone();
+        changed = true;
+    }
+    if config.finalizer.max_transcript_chars == 0 {
+        config.finalizer.max_transcript_chars = finalizer_defaults.max_transcript_chars;
+        changed = true;
+    }
+    if let Some(legacy_prompt) = config.finalizer.prompt.take() {
+        if config.finalizer.prompt_completion == finalizer_defaults.prompt_completion {
+            config.finalizer.prompt_completion = legacy_prompt;
+            changed = true;
+        }
+    }
+    if config.finalizer.model_key.is_none() && config.run_budgets.summarization.model_key.is_some()
+    {
+        config.finalizer.model_key = config.run_budgets.summarization.model_key.clone();
+        changed = true;
+    }
+    if config.finalizer.prompt_budget_stop == finalizer_defaults.prompt_budget_stop
+        && !config.run_budgets.summarization.prompt.trim().is_empty()
+        && config.run_budgets.summarization.prompt
+            != crate::agent_config::BudgetHitSummarizationConfig::default().prompt
+    {
+        config.finalizer.prompt_budget_stop = config.run_budgets.summarization.prompt.clone();
+        changed = true;
     }
     for agent in &mut config.agents {
         if agent.is_manager {
@@ -192,7 +233,7 @@ fn hydrate_grounded_audit_behavior(
     changed
 }
 
-fn write_agent_config_to_disk(
+pub(crate) fn write_agent_config_to_disk(
     workspace_root: &PathBuf,
     config: &AgentConfig,
 ) -> Result<(), String> {
@@ -202,9 +243,8 @@ fn write_agent_config_to_disk(
     fs::write(&path, json).map_err(|e| format!("Failed to write config: {}", e))
 }
 
-#[tauri::command]
-pub(crate) async fn save_agent_config(
-    state: tauri::State<'_, Arc<AppState>>,
+pub(crate) fn save_agent_config_for_state(
+    state: &Arc<AppState>,
     config: AgentConfig,
 ) -> Result<(), String> {
     let (normalized, _) = normalize_agent_config(config);
@@ -225,13 +265,25 @@ pub(crate) async fn save_agent_config(
     write_agent_config_to_disk(&state.workspace_root, &normalized)
 }
 
+pub(crate) fn load_agent_config_for_state(state: &Arc<AppState>) -> AgentConfig {
+    let config = load_agent_config_from_disk(&state.workspace_root);
+    *state.agent_config.lock().unwrap() = config.clone();
+    config
+}
+
+#[tauri::command]
+pub(crate) async fn save_agent_config(
+    state: tauri::State<'_, Arc<AppState>>,
+    config: AgentConfig,
+) -> Result<(), String> {
+    save_agent_config_for_state(&state.inner().clone(), config)
+}
+
 #[tauri::command]
 pub(crate) async fn load_agent_config(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<AgentConfig, String> {
-    let config = load_agent_config_from_disk(&state.workspace_root);
-    *state.agent_config.lock().unwrap() = config.clone();
-    Ok(config)
+    Ok(load_agent_config_for_state(&state.inner().clone()))
 }
 
 #[cfg(test)]
@@ -281,5 +333,26 @@ mod tests {
             ]
         );
         assert_eq!(behavior.non_progress.limit, Some(4));
+    }
+
+    #[test]
+    fn migrates_legacy_finalizer_prompt_into_completion_prompt() {
+        let mut config = AgentConfig::default();
+        config.finalizer.prompt = Some("legacy finalizer prompt".to_string());
+        config.finalizer.prompt_completion = FinalizerConfig::default().prompt_completion;
+        config.run_budgets.summarization.prompt = "legacy budget prompt".to_string();
+
+        let (normalized, changed) = normalize_agent_config(config);
+
+        assert!(changed);
+        assert_eq!(
+            normalized.finalizer.prompt_completion,
+            "legacy finalizer prompt"
+        );
+        assert_eq!(
+            normalized.finalizer.prompt_budget_stop,
+            "legacy budget prompt"
+        );
+        assert!(normalized.finalizer.prompt.is_none());
     }
 }

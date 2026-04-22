@@ -3,7 +3,7 @@
   "tools": [
     {
       "function": {
-        "description": "Execute a shell command in the current workspace.",
+        "description": "Run a targeted workspace shell command; prefer `rg`/`rg --files` and pruned `find`, not `ls -R` or broad tree scans.",
         "name": "bash",
         "parameters": {
           "additionalProperties": false,
@@ -55,7 +55,7 @@
     },
     {
       "function": {
-        "description": "Read a text file from the workspace or ~/.ajantis after locating it with glob_search. Returns at most about 4000 chars and supports scoped reads.",
+        "description": "Read a scoped slice of a known text file; prefer narrow scopes and avoid full-file reads on large files.",
         "name": "read_file",
         "parameters": {
           "additionalProperties": false,
@@ -140,7 +140,7 @@
     },
     {
       "function": {
-        "description": "Find files by glob pattern. Use this before read_file or grep_search; subsequent file reads must match a returned path.",
+        "description": "Find likely paths first; keep patterns narrow and skip dependency/build/generated directories unless they are in scope.",
         "name": "glob_search",
         "parameters": {
           "additionalProperties": false,
@@ -162,7 +162,7 @@
     },
     {
       "function": {
-        "description": "Search file contents with a regex pattern. Directory searches must include a glob filter.",
+        "description": "Search within a narrowed path or glob; prefer targeted filters and avoid sweeping dependency/build/generated trees.",
         "name": "grep_search",
         "parameters": {
           "additionalProperties": false,

@@ -188,16 +188,62 @@ pub(crate) fn apply_runtime_agent_context(
 ) -> String {
     let base = apply_runtime_agent_rules(system_prompt, is_manager);
     let recent_commands = command_history.summarize_recent(COMMAND_HISTORY_CONTEXT_LIMIT);
+    let recovery_note = weak_exploration_recovery_note(command_history);
 
-    if recent_commands.is_empty() {
-        base
-    } else {
-        format!(
-            "{}\n\nRecent command executions in this thread:\n{}\n\nReuse these results instead of re-running the same command unless the situation has materially changed.",
-            base,
+    let mut parts = vec![base];
+    if !recent_commands.is_empty() {
+        parts.push(format!(
+            "Recent command executions in this thread:\n{}\n\nReuse these results instead of re-running the same command unless the situation has materially changed.",
             recent_commands
-        )
+        ));
     }
+    if let Some(note) = recovery_note {
+        parts.push(note);
+    }
+    parts.join("\n\n")
+}
+
+fn weak_exploration_recovery_note(command_history: &CommandHistory) -> Option<String> {
+    let recent = command_history
+        .entries
+        .iter()
+        .rev()
+        .take(COMMAND_HISTORY_CONTEXT_LIMIT)
+        .collect::<Vec<_>>();
+    if recent.is_empty() {
+        return None;
+    }
+
+    let broad_reads = recent
+        .iter()
+        .filter(|entry| entry.classification == "broad_full_file_read")
+        .count();
+    let broad_scans = recent
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.classification.as_str(),
+                "broad_directory_scan" | "dependency_or_generated_scan"
+            )
+        })
+        .count();
+    let targeted = recent
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.classification.as_str(),
+                "targeted_read" | "targeted_search"
+            )
+        })
+        .count();
+
+    if broad_reads + broad_scans < 3 || targeted >= 2 {
+        return None;
+    }
+
+    Some(
+        "Methodology recovery note:\n- Recent exploration skewed broad rather than targeted.\n- Summarize what is actually known from the inspected evidence.\n- Choose the smallest next targeted read or search instead of another broad scan.\n- Avoid dependency/build/generated directories unless they are directly in scope.".to_string(),
+    )
 }
 
 pub(crate) fn is_manager_only_tool(name: &str) -> bool {
@@ -240,7 +286,7 @@ pub(crate) fn is_manager_blocked_tool(name: &str) -> bool {
 }
 
 pub(crate) fn canonical_manager_role_prompt() -> &'static str {
-    "You are the manager agent responsible for completing the user’s task end-to-end.\n\nCore rules:\n- Finish the task; do not stop at an information plan, status update, or delegation summary.\n- Prefer targeted reads and concrete inspection over broad exploration.\n- Validate subagent outputs before trusting them.\n- If the task requires creating or modifying workspace files, delegate to a worker with file tools and require it to materialize the changes on disk; a chat-only code block is not a completed file task unless the user explicitly asked for chat-only output.\n- If a worker is vague, blocked, speculative, fails to add new useful evidence, or answers a file task without actually writing the file, redirect it once with a narrower evidence-seeking task, then stop delegating and synthesize locally from verified evidence.\n- If repeated work starts circling around the same file, function, or question, stop delegating and synthesize from the current verified evidence.\n\nOutput discipline:\n- Return the requested result, not progress toward it.\n- Prefer concise, evidence-first conclusions with file references when available."
+    "You are the manager agent responsible for completing the user’s task end-to-end.\n\nCore rules:\n- Finish the task; do not stop at an information plan, status update, or delegation summary.\n- Prefer targeted reads, relevant entrypoints, and concrete inspection over broad exploration.\n- Do not ask workers for full repo listings or exhaustive tree dumps unless the user explicitly asked for them.\n- Exclude dependency, build, and generated directories by default (`node_modules`, `dist`, `target`, `.git`, caches) unless the task is specifically about them.\n- Validate subagent outputs before trusting them.\n- If the task requires creating or modifying workspace files, delegate to a worker with file tools and require it to materialize the changes on disk; a chat-only code block is not a completed file task unless the user explicitly asked for chat-only output.\n- If a worker is vague, blocked, speculative, fails to add new useful evidence, or answers a file task without actually writing the file, redirect it once with a narrower evidence-seeking task, then stop delegating and synthesize locally from verified evidence.\n- If repeated work starts circling around the same file, function, or question, stop delegating and synthesize from the current verified evidence.\n- If multiple worker reports overlap, synthesize them into one final answer instead of merging drafts.\n- Before the user-facing answer is finalized, produce a compact internal synthesis that captures inspected evidence, recommendations, and coverage gaps.\n\nOutput discipline:\n- Return the requested result, not progress toward it.\n- Prefer concise, evidence-first conclusions with file references when available.\n- Deliver a single synthesized answer rather than repeated sections or stitched subreports."
 }
 
 #[cfg(test)]
@@ -260,6 +306,15 @@ mod tests {
         let prompt = canonical_manager_role_prompt();
         assert!(prompt.contains("materialize the changes on disk"));
         assert!(prompt.contains("chat-only code block"));
+    }
+
+    #[test]
+    fn manager_prompt_requires_targeted_and_deduplicated_synthesis() {
+        let prompt = canonical_manager_role_prompt();
+        assert!(prompt.contains("full repo listings"));
+        assert!(prompt.contains("Exclude dependency, build, and generated directories"));
+        assert!(prompt.contains("relevant entrypoints"));
+        assert!(prompt.contains("single synthesized answer"));
     }
 }
 

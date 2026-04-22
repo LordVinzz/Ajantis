@@ -7,11 +7,56 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::ipc::Channel;
 
 use crate::agent_config::RunBudgetsConfig;
 use crate::chat::StreamEvent;
 use crate::config_persistence::ajantis_dir;
+use crate::event_sink::SharedEventSink;
+use crate::memory::CommandExecution;
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct RunDossierCounts {
+    pub(crate) targeted_reads: u32,
+    pub(crate) targeted_searches: u32,
+    pub(crate) broad_full_file_reads: u32,
+    pub(crate) broad_directory_scans: u32,
+    pub(crate) dependency_or_generated_scans: u32,
+    pub(crate) blocked_commands: u32,
+    pub(crate) tool_failures: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct RunDossierWorkerOutcome {
+    pub(crate) agent_id: String,
+    pub(crate) agent_name: String,
+    pub(crate) summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) observed_evidence: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) inferences: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) coverage_gaps: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct RunDossier {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) inspected_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) worker_outcomes: Vec<RunDossierWorkerOutcome>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) coverage_gaps: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) caution_flags: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) manager_draft_summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) finalizer_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) finalizer_input_summary: Vec<String>,
+    #[serde(default)]
+    pub(crate) counts: RunDossierCounts,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub(crate) struct RunWindowUsage {
@@ -51,7 +96,7 @@ pub(crate) struct ActiveRunState {
     pub(crate) thread_id: Option<String>,
     pub(crate) workspace_path: Option<String>,
     pub(crate) journal_path: PathBuf,
-    pub(crate) channel: Channel<StreamEvent>,
+    pub(crate) channel: SharedEventSink,
     pub(crate) budgets: RunBudgetsConfig,
     pub(crate) active_behaviors: HashSet<String>,
     pub(crate) usage: RunWindowUsage,
@@ -69,6 +114,7 @@ pub(crate) struct ActiveRunState {
     pub(crate) manager_agent_id: Option<String>,
     pub(crate) manager_model_key: Option<String>,
     pub(crate) manager_messages: Vec<Value>,
+    pub(crate) dossier: RunDossier,
 }
 
 pub(crate) type ActiveRuns = Arc<Mutex<HashMap<String, ActiveRunState>>>;
@@ -166,4 +212,62 @@ pub(crate) fn reset_run_window(run: &mut ActiveRunState) {
 
 pub(crate) fn primary_run_id(active_runs: &ActiveRuns) -> Option<String> {
     active_runs.lock().unwrap().keys().next().cloned()
+}
+
+pub(crate) fn record_dossier_command(
+    active_runs: &ActiveRuns,
+    run_id: &str,
+    entry: &CommandExecution,
+) {
+    let mut runs = active_runs.lock().unwrap();
+    let Some(run) = runs.get_mut(run_id) else {
+        return;
+    };
+
+    for path in &entry.touched_paths {
+        if !run
+            .dossier
+            .inspected_paths
+            .iter()
+            .any(|existing| existing == path)
+        {
+            run.dossier.inspected_paths.push(path.clone());
+        }
+    }
+
+    match entry.classification.as_str() {
+        "targeted_read" => run.dossier.counts.targeted_reads += 1,
+        "targeted_search" => run.dossier.counts.targeted_searches += 1,
+        "broad_full_file_read" => run.dossier.counts.broad_full_file_reads += 1,
+        "broad_directory_scan" => run.dossier.counts.broad_directory_scans += 1,
+        "dependency_or_generated_scan" => {
+            run.dossier.counts.dependency_or_generated_scans += 1;
+        }
+        _ => {}
+    }
+
+    if !entry.success {
+        run.dossier.counts.tool_failures += 1;
+    }
+}
+
+pub(crate) fn record_dossier_blocked_command(active_runs: &ActiveRuns, run_id: &str, reason: &str) {
+    let mut runs = active_runs.lock().unwrap();
+    let Some(run) = runs.get_mut(run_id) else {
+        return;
+    };
+    run.dossier.counts.blocked_commands += 1;
+    if !run
+        .dossier
+        .caution_flags
+        .iter()
+        .any(|flag| flag == "Blocked commands occurred during this run.")
+    {
+        run.dossier
+            .caution_flags
+            .push("Blocked commands occurred during this run.".to_string());
+    }
+    if !reason.trim().is_empty() && !run.dossier.coverage_gaps.iter().any(|gap| gap == reason) {
+        run.dossier.coverage_gaps.push(reason.to_string());
+    }
 }

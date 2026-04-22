@@ -1,11 +1,17 @@
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 use tauri::ipc::Channel;
 
 use crate::agent_config::{AgentConfig, AgentLoadConfig};
-use crate::chat::{call_chat_with_tools, send_chat_completion_streaming, StreamEvent};
+use crate::chat::{
+    call_chat_with_tools, emit_run_dossier_update, finalize_cancelled_run,
+    record_agent_output_in_dossier, run_cancel_requested, run_finalizer,
+    send_chat_completion_streaming, StreamEvent,
+};
+use crate::event_sink::{channel_event_sink, SharedEventSink};
 use crate::helpers::{apply_runtime_agent_context, compute_context_budget, is_manager_only_tool};
 use crate::memory::{CommandHistory, MemoryPool};
 use crate::models::{create_embeddings, fetch_models, load_model_internal, unload_model_internal};
@@ -13,6 +19,23 @@ use crate::runs::{
     emit_run_event, generate_run_id, journal_path, reset_run_window, ActiveRunState,
 };
 use crate::state::{AppState, McpTool};
+use crate::workspace::{load_workspace_config_from_disk, set_active_workspace_path};
+
+fn configured_workspace_path(state: &Arc<AppState>, workspace_id: &str) -> Result<String, String> {
+    let config = load_workspace_config_from_disk(&state.workspace_root)?;
+    let workspace = config
+        .workspaces
+        .into_iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .ok_or_else(|| format!("Workspace '{}' is not configured.", workspace_id))?;
+    let canonical = fs::canonicalize(&workspace.path).map_err(|error| {
+        format!(
+            "Workspace '{}' path is invalid or inaccessible: {}",
+            workspace.path, error
+        )
+    })?;
+    Ok(canonical.to_string_lossy().to_string())
+}
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
@@ -119,6 +142,30 @@ pub(crate) async fn route_message(
     thread_id: Option<String>,
     on_event: Channel<StreamEvent>,
 ) -> Result<String, String> {
+    route_message_for_state(
+        state.inner().clone(),
+        from_agent_id,
+        message,
+        workspace_id,
+        thread_id,
+        channel_event_sink(on_event),
+    )
+    .await
+}
+
+pub(crate) async fn route_message_for_state(
+    state: Arc<AppState>,
+    from_agent_id: String,
+    message: String,
+    workspace_id: Option<String>,
+    thread_id: Option<String>,
+    on_event: SharedEventSink,
+) -> Result<String, String> {
+    if let Some(workspace_id) = workspace_id.as_deref() {
+        let workspace_path = configured_workspace_path(&state, workspace_id)?;
+        set_active_workspace_path(&state, Some(workspace_path))?;
+    }
+
     let config = state.agent_config.lock().unwrap().clone();
     let memory = state.memory_pool.clone();
     let command_history = state.command_history.clone();
@@ -171,6 +218,7 @@ pub(crate) async fn route_message(
             manager_agent_id: None,
             manager_model_key: None,
             manager_messages: Vec::new(),
+            dossier: crate::runs::RunDossier::default(),
         },
     );
 
@@ -189,14 +237,18 @@ pub(crate) async fn route_message(
         tools_arc,
     )
     .await;
-    let waiting_confirmation = state
+    let run_state = state
         .active_runs
         .lock()
         .unwrap()
         .get(&run_id)
-        .map(|run| run.waiting_confirmation)
-        .unwrap_or(false);
+        .map(|run| (run.waiting_confirmation, run.cancelled));
+    let waiting_confirmation = run_state.map(|(waiting, _)| waiting).unwrap_or(false);
     if waiting_confirmation {
+        return Ok(run_id);
+    }
+    if run_state.is_none() {
+        *state.event_channel.lock().unwrap() = None;
         return Ok(run_id);
     }
 
@@ -221,7 +273,7 @@ pub(crate) async fn route_recursive(
     run_id: &str,
     from_id: &str,
     message: &str,
-    on_event: &Channel<StreamEvent>,
+    on_event: &SharedEventSink,
     visited: &mut HashSet<String>,
     memory: &Arc<Mutex<MemoryPool>>,
     command_history: &Arc<Mutex<CommandHistory>>,
@@ -230,6 +282,11 @@ pub(crate) async fn route_recursive(
     model_info_map: &HashMap<String, (String, Option<u64>)>,
     tools: Arc<Vec<McpTool>>,
 ) {
+    if run_cancel_requested(mcp_state.as_ref(), run_id) {
+        let _ = finalize_cancelled_run(mcp_state.as_ref(), run_id);
+        return;
+    }
+
     // Collect enabled targets sorted by priority (lower = first)
     let mut targets: Vec<(String, u8)> = config
         .connections
@@ -457,9 +514,54 @@ pub(crate) async fn route_recursive(
                     });
                     let _ = unload_model_internal(&model_key).await;
                 }
+                if run_cancel_requested(mcp_state.as_ref(), run_id) {
+                    let _ = on_event.send(StreamEvent::AgentEnd {
+                        run_id: run_id.to_string(),
+                        agent_id: target_id.clone(),
+                    });
+                    let _ = finalize_cancelled_run(mcp_state.as_ref(), run_id);
+                    return;
+                }
                 if is_repetitive_response(&full_response, run_id, mcp_state).await {
                     // Agent is looping — stop routing without re-routing the repeated response.
                     return;
+                }
+                record_agent_output_in_dossier(
+                    mcp_state.as_ref(),
+                    run_id,
+                    &target_id,
+                    &agent_name,
+                    is_manager,
+                    &full_response,
+                );
+                emit_run_dossier_update(mcp_state.as_ref(), run_id, on_event);
+                if is_manager && agent_routes_to_user(config, &target_id, &full_response) {
+                    let (final_text, final_model_key) =
+                        if config.finalizer.enabled && config.finalizer.run_on_completion {
+                            run_finalizer(
+                                mcp_state.as_ref(),
+                                run_id,
+                                &target_id,
+                                &model_key,
+                                &full_response,
+                                &config.finalizer,
+                                "completion",
+                            )
+                            .await
+                        } else {
+                            (full_response.clone(), Some(model_key.clone()))
+                        };
+                    emit_run_dossier_update(mcp_state.as_ref(), run_id, on_event);
+                    let _ = on_event.send(StreamEvent::FinalizerOutput {
+                        run_id: run_id.to_string(),
+                        agent_id: format!("finalizer::{}", target_id),
+                        agent_name: config.finalizer.agent_name.clone(),
+                        source_agent_id: target_id.clone(),
+                        source_agent_name: agent_name.clone(),
+                        content: final_text,
+                        mode: Some("completion".to_string()),
+                        model_key: final_model_key,
+                    });
                 }
                 route_recursive(
                     config,
@@ -478,11 +580,19 @@ pub(crate) async fn route_recursive(
                 .await;
             }
             Err(e) => {
+                if e == crate::chat::RUN_CANCELLED_ERROR {
+                    let _ = on_event.send(StreamEvent::AgentEnd {
+                        run_id: run_id.to_string(),
+                        agent_id: target_id.clone(),
+                    });
+                    let _ = finalize_cancelled_run(mcp_state.as_ref(), run_id);
+                    return;
+                }
                 if e == crate::chat::RUN_PAUSED_ERROR {
                     return;
                 }
                 if e == crate::chat::RUN_BUDGET_ENDED_ERROR {
-                    // Summary was already streamed as tokens; emit AgentEnd and stop routing.
+                    // Finalizer or stop handling already ran inside the budget-limit path.
                     let _ = on_event.send(StreamEvent::AgentEnd {
                         run_id: run_id.to_string(),
                         agent_id: target_id.clone(),
@@ -509,29 +619,55 @@ pub(crate) async fn route_recursive(
     }
 }
 
+fn agent_routes_to_user(config: &AgentConfig, from_id: &str, message: &str) -> bool {
+    config.connections.iter().any(|connection| {
+        connection.from == from_id
+            && connection.enabled
+            && match &connection.condition {
+                Some(cond) if !cond.is_empty() => {
+                    message.to_lowercase().contains(&cond.to_lowercase())
+                }
+                _ => true,
+            }
+            && config
+                .agents
+                .iter()
+                .any(|agent| agent.id == connection.to && agent.agent_type == "user")
+    })
+}
+
 #[tauri::command]
 pub(crate) async fn cancel_route_run(
     state: tauri::State<'_, Arc<AppState>>,
     run_id: String,
 ) -> Result<(), String> {
-    let maybe_run = state.active_runs.lock().unwrap().remove(&run_id);
-    let Some(run) = maybe_run else {
+    cancel_route_run_for_state(state.inner().clone(), run_id).await
+}
+
+pub(crate) async fn cancel_route_run_for_state(
+    state: Arc<AppState>,
+    run_id: String,
+) -> Result<(), String> {
+    let mut runs = state.active_runs.lock().unwrap();
+    let Some(run) = runs.get_mut(&run_id) else {
         return Err(format!("Run '{}' not found.", run_id));
     };
-    let _ = run.channel.send(StreamEvent::RunCancelled {
-        run_id: run_id.clone(),
-        message: "Run cancelled by user.".to_string(),
-    });
-    let _ = run.channel.send(StreamEvent::Done {
-        run_id: run_id.clone(),
-    });
-    *state.event_channel.lock().unwrap() = None;
+    run.cancelled = true;
+    run.waiting_confirmation = false;
+    run.paused = None;
     Ok(())
 }
 
 #[tauri::command]
 pub(crate) async fn continue_route_run(
     state: tauri::State<'_, Arc<AppState>>,
+    run_id: String,
+) -> Result<(), String> {
+    continue_route_run_for_state(state.inner().clone(), run_id).await
+}
+
+pub(crate) async fn continue_route_run_for_state(
+    state: Arc<AppState>,
     run_id: String,
 ) -> Result<(), String> {
     let paused = {
@@ -543,6 +679,9 @@ pub(crate) async fn continue_route_run(
             .paused
             .clone()
             .ok_or_else(|| format!("Run '{}' is not waiting for confirmation.", run_id))?;
+        if let Some(workspace_path) = run.workspace_path.clone() {
+            set_active_workspace_path(&state, Some(workspace_path))?;
+        }
         run.waiting_confirmation = false;
         run.paused = None;
         reset_run_window(run);

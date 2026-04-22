@@ -3,13 +3,13 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tauri::ipc::Channel;
 
 use crate::agent_config::AgentConfig;
-use crate::chat::StreamEvent;
+use crate::event_sink::SharedEventSink;
 use crate::mcp::McpState;
 use crate::memory::{CommandHistory, MemoryPool};
 use crate::runs::ActiveRuns;
+use crate::workspace::ThreadSnapshot;
 
 #[derive(Default)]
 pub(crate) struct BehaviorTriggerCache {
@@ -32,9 +32,12 @@ pub(crate) struct AppState {
     pub(crate) glob_cache:
         Arc<Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>>,
     pub(crate) mcp_state: Arc<McpState>,
-    /// Shared with McpState so MCP tool handlers can emit stream events to the frontend.
-    pub(crate) event_channel: Arc<Mutex<Option<Channel<StreamEvent>>>>,
+    /// Shared with McpState so MCP tool handlers can emit stream events to the frontend or TUI.
+    pub(crate) event_channel: Arc<Mutex<Option<SharedEventSink>>>,
     pub(crate) active_runs: ActiveRuns,
+    pub(crate) pending_thread_snapshots:
+        Arc<Mutex<std::collections::HashMap<String, ThreadSnapshot>>>,
+    pub(crate) pending_thread_snapshot_versions: Arc<Mutex<std::collections::HashMap<String, u64>>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

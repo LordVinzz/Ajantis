@@ -3,13 +3,12 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
-use tauri::ipc::Channel;
-
 use crate::agent_config::{
-    resolve_audit_behavior_config, AuditEvidenceGrade, BudgetHitSummarizationConfig,
-    RedundancyDetectionConfig, ResolvedAuditBehaviorConfig, MAX_SEMANTIC_SIMILARITY_THRESHOLD,
+    resolve_audit_behavior_config, AuditEvidenceGrade, FinalizerConfig, RedundancyDetectionConfig,
+    ResolvedAuditBehaviorConfig, MAX_SEMANTIC_SIMILARITY_THRESHOLD,
     MIN_SEMANTIC_SIMILARITY_THRESHOLD,
 };
+use crate::event_sink::SharedEventSink;
 use crate::helpers::{
     audit_response_acknowledges_refs, compute_context_budget, extract_explicit_audit_refs,
     has_file_reference, is_manager_blocked_tool, is_manager_only_tool, is_path_like_audit_ref,
@@ -19,7 +18,8 @@ use crate::helpers::{
 use crate::mcp::{handle_tool_call, McpState};
 use crate::models::create_embeddings;
 use crate::runs::{
-    emit_run_event, run_budget_applies, PausedRunState, RunLimitHit, RunWindowUsage,
+    emit_run_event, run_budget_applies, PausedRunState, RunDossier, RunDossierWorkerOutcome,
+    RunLimitHit, RunWindowUsage,
 };
 use crate::state::{AppState, McpTool};
 
@@ -169,7 +169,7 @@ fn parse_stream_usage(chunk: &Value) -> StreamUsage {
 }
 
 fn emit_generation_metrics(
-    on_event: &Channel<StreamEvent>,
+    on_event: &SharedEventSink,
     run_id: &str,
     agent_id: &str,
     stage: &str,
@@ -203,7 +203,7 @@ async fn stream_chat_completion_turn(
     body: &Value,
     run_id: &str,
     agent_id: &str,
-    on_event: &Channel<StreamEvent>,
+    on_event: &SharedEventSink,
 ) -> Result<StreamedAssistantTurn, String> {
     let mut resp = client
         .post(url)
@@ -448,6 +448,33 @@ impl Drop for ActiveBehaviorContextGuard<'_> {
 pub(crate) const RUN_PAUSED_ERROR: &str = "__run_paused__";
 /// Returned when a budget-hit summary was generated and streamed: routing must stop without re-routing the summary text.
 pub(crate) const RUN_BUDGET_ENDED_ERROR: &str = "__run_budget_ended__";
+/// Returned when a user-requested cancellation should stop routing after the current turn/tool step.
+pub(crate) const RUN_CANCELLED_ERROR: &str = "__run_cancelled__";
+
+pub(crate) fn run_cancel_requested(tool_state: &McpState, run_id: &str) -> bool {
+    tool_state
+        .active_runs
+        .lock()
+        .unwrap()
+        .get(run_id)
+        .map(|run| run.cancelled)
+        .unwrap_or(true)
+}
+
+pub(crate) fn finalize_cancelled_run(tool_state: &McpState, run_id: &str) -> Result<(), String> {
+    let maybe_run = tool_state.active_runs.lock().unwrap().remove(run_id);
+    let Some(run) = maybe_run else {
+        return Ok(());
+    };
+    let _ = run.channel.send(StreamEvent::RunCancelled {
+        run_id: run_id.to_string(),
+        message: "Run cancelled by user.".to_string(),
+    });
+    let _ = run.channel.send(StreamEvent::Done {
+        run_id: run_id.to_string(),
+    });
+    Ok(())
+}
 
 fn sync_active_run_behaviors(
     tool_state: &McpState,
@@ -610,7 +637,7 @@ fn pause_run_for_confirmation(
     )
 }
 
-fn emit_usage_update(tool_state: &McpState, run_id: &str, on_event: &Channel<StreamEvent>) {
+fn emit_usage_update(tool_state: &McpState, run_id: &str, on_event: &SharedEventSink) {
     let snapshot = {
         let runs = tool_state.active_runs.lock().unwrap();
         runs.get(run_id)
@@ -646,6 +673,211 @@ fn update_manager_context(
     }
 }
 
+fn truncate_for_summary(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        trimmed.to_string()
+    } else {
+        let head: String = trimmed.chars().take(max_chars).collect();
+        format!("{}...", head)
+    }
+}
+
+fn dedupe_preserve_order(items: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for item in items {
+        let normalized = item.trim().to_lowercase();
+        if normalized.is_empty() || !seen.insert(normalized) {
+            continue;
+        }
+        deduped.push(item.trim().to_string());
+    }
+    deduped
+}
+
+fn extract_path_like_snippets(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|token| {
+            token.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    ',' | '.' | ':' | ';' | '(' | ')' | '[' | ']' | '`' | '"' | '\''
+                )
+            })
+        })
+        .filter(|token| {
+            token.contains('/')
+                && !token.starts_with("http")
+                && token.len() <= 160
+                && token.chars().any(|ch| ch.is_ascii_alphabetic())
+        })
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn extract_coverage_gap_candidates(text: &str) -> Vec<String> {
+    dedupe_preserve_order(
+        text.lines()
+            .map(str::trim)
+            .filter(|line| {
+                let lower = line.to_lowercase();
+                lower.contains("coverage gap")
+                    || lower.contains("not inspect")
+                    || lower.contains("uninspected")
+                    || lower.contains("insufficient evidence")
+                    || lower.contains("did not inspect")
+            })
+            .map(ToString::to_string)
+            .collect(),
+    )
+}
+
+fn build_worker_outcome(
+    agent_id: &str,
+    agent_name: &str,
+    content: &str,
+) -> RunDossierWorkerOutcome {
+    let paragraphs = content
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let summary = paragraphs
+        .iter()
+        .find(|paragraph| !paragraph.starts_with('#') && !paragraph.starts_with('*'))
+        .copied()
+        .unwrap_or_else(|| paragraphs.first().copied().unwrap_or(""))
+        .to_string();
+
+    let observed_evidence = dedupe_preserve_order(
+        content
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                let lower = line.to_lowercase();
+                lower.starts_with("observed")
+                    || lower.starts_with("- ") && extract_path_like_snippets(line).len() > 0
+            })
+            .map(ToString::to_string)
+            .chain(extract_path_like_snippets(content))
+            .take(8)
+            .collect(),
+    );
+
+    let inferences = dedupe_preserve_order(
+        content
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                let lower = line.to_lowercase();
+                lower.starts_with("inference")
+                    || lower.contains("recommend")
+                    || lower.contains("should ")
+            })
+            .map(ToString::to_string)
+            .take(6)
+            .collect(),
+    );
+
+    let coverage_gaps = extract_coverage_gap_candidates(content);
+
+    RunDossierWorkerOutcome {
+        agent_id: agent_id.to_string(),
+        agent_name: agent_name.to_string(),
+        summary: truncate_for_summary(&summary, 320),
+        observed_evidence,
+        inferences,
+        coverage_gaps,
+    }
+}
+
+fn compact_manager_draft(content: &str) -> String {
+    let paragraphs = content
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .filter(|segment| !segment.starts_with("###") && !segment.starts_with("####"))
+        .take(6)
+        .map(|segment| truncate_for_summary(segment, 240))
+        .collect::<Vec<_>>();
+    paragraphs.join("\n\n")
+}
+
+fn refresh_dossier_caution_flags(dossier: &mut RunDossier) {
+    let mut flags = dossier
+        .caution_flags
+        .iter()
+        .filter(|flag| flag.as_str() == "Blocked commands occurred during this run.")
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let inspected_count = dossier.inspected_paths.len();
+    if inspected_count <= 3 {
+        flags.push("Inspected scope is narrow.".to_string());
+    }
+    if dossier.counts.broad_full_file_reads + dossier.counts.broad_directory_scans >= 3 {
+        flags.push("Exploration leaned broad rather than targeted.".to_string());
+    }
+    if dossier.counts.dependency_or_generated_scans > 0 {
+        flags.push("Dependency/build/generated paths were touched.".to_string());
+    }
+    if !dossier.coverage_gaps.is_empty() {
+        flags.push("Coverage gaps remain.".to_string());
+    }
+    dossier.caution_flags = dedupe_preserve_order(flags);
+}
+
+pub(crate) fn record_agent_output_in_dossier(
+    tool_state: &McpState,
+    run_id: &str,
+    agent_id: &str,
+    agent_name: &str,
+    is_manager: bool,
+    content: &str,
+) {
+    let mut runs = tool_state.active_runs.lock().unwrap();
+    let Some(run) = runs.get_mut(run_id) else {
+        return;
+    };
+    if is_manager {
+        run.dossier.manager_draft_summary = compact_manager_draft(content);
+        run.dossier
+            .coverage_gaps
+            .extend(extract_coverage_gap_candidates(content));
+    } else {
+        let outcome = build_worker_outcome(agent_id, agent_name, content);
+        run.dossier
+            .coverage_gaps
+            .extend(outcome.coverage_gaps.clone());
+        run.dossier.worker_outcomes.push(outcome);
+    }
+    run.dossier.coverage_gaps = dedupe_preserve_order(run.dossier.coverage_gaps.clone());
+    refresh_dossier_caution_flags(&mut run.dossier);
+}
+
+fn current_run_dossier(tool_state: &McpState, run_id: &str) -> Option<RunDossier> {
+    tool_state
+        .active_runs
+        .lock()
+        .unwrap()
+        .get(run_id)
+        .map(|run| run.dossier.clone())
+}
+
+pub(crate) fn emit_run_dossier_update(
+    tool_state: &McpState,
+    run_id: &str,
+    on_event: &SharedEventSink,
+) {
+    if let Some(dossier) = current_run_dossier(tool_state, run_id) {
+        let _ = on_event.send(StreamEvent::RunDossierUpdated {
+            run_id: run_id.to_string(),
+            dossier,
+        });
+    }
+}
+
 fn record_embedding_calls(tool_state: &McpState, run_id: &str, count: u32) {
     if count == 0 {
         return;
@@ -657,7 +889,7 @@ fn record_embedding_calls(tool_state: &McpState, run_id: &str, count: u32) {
 }
 
 enum BudgetLimitOutcome {
-    /// A final summary was streamed as tokens — routing must stop without re-routing the text.
+    /// A finalizer response was emitted — routing must stop without re-routing text.
     Summarized,
     /// Stop immediately — routing must stop.
     Stopped,
@@ -665,112 +897,58 @@ enum BudgetLimitOutcome {
     Paused,
 }
 
-/// Reads `on_limit` from the current agent config and decides what to do on a budget hit.
-fn budget_limit_action(tool_state: &McpState) -> (String, BudgetHitSummarizationConfig) {
-    let cfg = tool_state.agent_config.lock().unwrap();
-    (
-        cfg.run_budgets.on_limit.clone(),
-        cfg.run_budgets.summarization.clone(),
-    )
+fn finalizer_enabled_for_mode(config: &FinalizerConfig, mode: &str) -> bool {
+    if !config.enabled {
+        return false;
+    }
+    match mode {
+        "budget_stop" => config.run_on_budget_stop,
+        _ => config.run_on_completion,
+    }
 }
 
-/// One-shot LLM call that produces a synthesis without tools.
-/// Always uses the manager agent's context (messages + agent_id) so the summary
-/// covers all sub-agent tool results. Model priority: config override > manager model > current agent model.
-async fn force_budget_summary(
-    fallback_model_key: &str,
-    fallback_messages: &[Value],
-    fallback_agent_id: &str,
-    summary_prompt: &str,
-    model_override: Option<&str>,
-    run_id: &str,
-    tool_state: &McpState,
-    on_event: &Channel<StreamEvent>,
-) {
-    let (manager_model, messages, agent_id) = {
-        let runs = tool_state.active_runs.lock().unwrap();
-        if let Some(run) = runs.get(run_id) {
-            match (&run.manager_agent_id, &run.manager_model_key) {
-                (Some(mid), Some(mmodel)) if !run.manager_messages.is_empty() => (
-                    Some(mmodel.clone()),
-                    run.manager_messages.clone(),
-                    mid.clone(),
-                ),
-                _ => (
-                    None,
-                    fallback_messages.to_vec(),
-                    fallback_agent_id.to_string(),
-                ),
-            }
-        } else {
-            (
-                None,
-                fallback_messages.to_vec(),
-                fallback_agent_id.to_string(),
-            )
-        }
-    };
-    // Priority: explicit config override > manager model > current agent model
-    let model_key = model_override
-        .or(manager_model.as_deref())
-        .unwrap_or(fallback_model_key);
-
-    let url = format!("{}/v1/chat/completions", lm_base_url());
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()
-        .unwrap_or_default();
-
-    let mut summary_messages = messages;
-    summary_messages.push(json!({"role": "user", "content": summary_prompt}));
-
-    let body = json!({
-        "model": model_key,
-        "messages": summary_messages,
-        "stream": true,
-        "stream_options": { "include_usage": true },
-    });
-
-    let _ = on_event.send(StreamEvent::AgentStatus {
-        run_id: run_id.to_string(),
-        agent_id: agent_id.clone(),
-        stage: "thinking".to_string(),
-        detail: "Generating budget-limit summary".to_string(),
-    });
-
-    let _ = stream_chat_completion_turn(&client, &url, &body, run_id, &agent_id, on_event).await;
-}
-
-/// Handles a budget limit hit: summarize, stop, or pause based on config.
+/// Handles a budget limit hit: finalize, stop, or pause based on config.
 async fn resolve_budget_limit(
     tool_state: &McpState,
     run_id: &str,
     model_key: &str,
-    messages: &[Value],
+    _messages: &[Value],
     agent_id: &str,
     paused_state: PausedRunState,
-    on_event: &Channel<StreamEvent>,
+    on_event: &SharedEventSink,
 ) -> Result<BudgetLimitOutcome, String> {
-    let (on_limit, sum_cfg) = budget_limit_action(tool_state);
+    let cfg = tool_state.agent_config.lock().unwrap().clone();
+    let on_limit = cfg.run_budgets.on_limit.clone();
     match on_limit.as_str() {
-        "summarize" if sum_cfg.enabled => {
-            force_budget_summary(
-                model_key,
-                messages,
-                agent_id,
-                &sum_cfg.prompt,
-                sum_cfg.model_key.as_deref(),
-                run_id,
+        "summarize" if finalizer_enabled_for_mode(&cfg.finalizer, "budget_stop") => {
+            let (final_text, final_model_key) = run_finalizer(
                 tool_state,
-                on_event,
+                run_id,
+                agent_id,
+                model_key,
+                "",
+                &cfg.finalizer,
+                "budget_stop",
             )
             .await;
+            emit_run_dossier_update(tool_state, run_id, on_event);
+            let _ = on_event.send(StreamEvent::FinalizerOutput {
+                run_id: run_id.to_string(),
+                agent_id: format!("finalizer::{}", agent_id),
+                agent_name: cfg.finalizer.agent_name.clone(),
+                source_agent_id: agent_id.to_string(),
+                source_agent_name: agent_id.to_string(),
+                content: final_text,
+                mode: Some("budget_stop".to_string()),
+                model_key: final_model_key,
+            });
             Ok(BudgetLimitOutcome::Summarized)
         }
         "stop" => Ok(BudgetLimitOutcome::Stopped),
         _ => {
-            // "pause" or "summarize" with disabled summarization
+            // "pause" or "summarize" with disabled finalization
             pause_run_for_confirmation(tool_state, run_id, paused_state)?;
+            emit_run_dossier_update(tool_state, run_id, on_event);
             Ok(BudgetLimitOutcome::Paused)
         }
     }
@@ -794,7 +972,7 @@ pub(crate) async fn call_chat_with_tools(
     glob_ready: bool,
     tool_state: &McpState,
     inherited_behaviors: Option<&HashSet<String>>,
-    on_event: &Channel<StreamEvent>,
+    on_event: &SharedEventSink,
     history: &[Value],
 ) -> Result<String, String> {
     let url = format!("{}/v1/chat/completions", lm_base_url());
@@ -1012,6 +1190,9 @@ pub(crate) async fn call_chat_with_tools(
         let streamed_turn =
             stream_chat_completion_turn(&llm_client, &url, &body, run_id, agent_id, on_event)
                 .await?;
+        if run_cancel_requested(tool_state, run_id) {
+            return Err(RUN_CANCELLED_ERROR.to_string());
+        }
         let assistant_msg = streamed_turn.assistant_message.clone();
 
         emit_generation_metrics(
@@ -1072,6 +1253,9 @@ pub(crate) async fn call_chat_with_tools(
             messages.push(assistant_msg.clone());
             let mut iteration_progress = false;
             for tc in tool_calls_arr {
+                if run_cancel_requested(tool_state, run_id) {
+                    return Err(RUN_CANCELLED_ERROR.to_string());
+                }
                 let call_id = tc["id"].as_str().unwrap_or("").to_string();
                 let fn_name = tc["function"]["name"].as_str().unwrap_or("").to_string();
                 let fn_args: Value =
@@ -1182,6 +1366,9 @@ pub(crate) async fn call_chat_with_tools(
                 } else {
                     dispatch_tool_call(tool_state, &fn_name, &fn_args, agent_id).await
                 };
+                if run_cancel_requested(tool_state, run_id) {
+                    return Err(RUN_CANCELLED_ERROR.to_string());
+                }
 
                 // Notify frontend: tool result received (truncate very long results)
                 let char_count = tool_text.chars().count();
@@ -1410,6 +1597,9 @@ pub(crate) async fn call_chat_with_tools(
                 .await);
             }
         } else {
+            if run_cancel_requested(tool_state, run_id) {
+                return Err(RUN_CANCELLED_ERROR.to_string());
+            }
             if require_delegation && !delegated {
                 messages.push(json!({
                     "role": "user",
@@ -1437,6 +1627,21 @@ pub(crate) async fn call_chat_with_tools(
                     )
                     .await;
                 }
+            }
+            if allow_manager_tools
+                && messages
+                    .iter()
+                    .any(|message| message["role"].as_str() == Some("tool"))
+                && manager_response_needs_compaction(&final_content)
+            {
+                final_content = rewrite_manager_response_compactly(
+                    &llm_client,
+                    &url,
+                    model_key,
+                    &messages,
+                    &final_content,
+                )
+                .await;
             }
 
             let missing_scope_refs = if audit_config
@@ -1517,7 +1722,7 @@ pub(crate) async fn call_chat_with_tools(
 
 #[derive(Clone, Serialize)]
 #[serde(tag = "event")]
-pub(crate) enum StreamEvent {
+pub enum StreamEvent {
     #[serde(rename = "agent_start")]
     AgentStart {
         run_id: String,
@@ -1562,6 +1767,21 @@ pub(crate) enum StreamEvent {
     },
     #[serde(rename = "agent_end")]
     AgentEnd { run_id: String, agent_id: String },
+    #[serde(rename = "run_dossier_updated")]
+    RunDossierUpdated { run_id: String, dossier: RunDossier },
+    #[serde(rename = "finalizer_output")]
+    FinalizerOutput {
+        run_id: String,
+        agent_id: String,
+        agent_name: String,
+        source_agent_id: String,
+        source_agent_name: String,
+        content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model_key: Option<String>,
+    },
     #[serde(rename = "error")]
     Error {
         run_id: String,
@@ -2117,11 +2337,7 @@ fn render_required_sections_csv(config: &ResolvedAuditBehaviorConfig) -> String 
 }
 
 fn render_audit_template(template: &str, replacements: &[(&str, String)]) -> String {
-    let mut rendered = template.to_string();
-    for (key, value) in replacements {
-        rendered = rendered.replace(&format!("{{{}}}", key), value);
-    }
-    rendered
+    render_prompt_template(template, replacements)
 }
 
 fn audit_runtime_note(
@@ -3065,6 +3281,407 @@ async fn rewrite_grounded_audit_response(
     }
 }
 
+fn normalize_compaction_fingerprint(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn markdown_heading_fingerprints(response: &str) -> Vec<String> {
+    response
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('#'))
+        .map(normalize_compaction_fingerprint)
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn markdown_table_header_fingerprints(response: &str) -> Vec<String> {
+    let lines = response.lines().map(str::trim).collect::<Vec<_>>();
+    lines
+        .windows(2)
+        .filter_map(|window| {
+            let header = window[0];
+            let divider = window[1];
+            if header.starts_with('|')
+                && header.ends_with('|')
+                && divider.contains("---")
+                && divider.contains('|')
+            {
+                Some(normalize_compaction_fingerprint(header))
+            } else {
+                None
+            }
+        })
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn long_paragraph_fingerprints(response: &str) -> Vec<String> {
+    response
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|paragraph| paragraph.len() >= 120)
+        .filter(|paragraph| {
+            !paragraph
+                .lines()
+                .all(|line| line.trim_start().starts_with('#'))
+        })
+        .map(normalize_compaction_fingerprint)
+        .filter(|paragraph| paragraph.len() >= 80)
+        .collect()
+}
+
+fn count_duplicate_fingerprints(items: &[String]) -> usize {
+    let mut seen = HashSet::new();
+    let mut duplicates = 0usize;
+    for item in items {
+        if !seen.insert(item.clone()) {
+            duplicates += 1;
+        }
+    }
+    duplicates
+}
+
+fn manager_response_needs_compaction(response: &str) -> bool {
+    let trimmed = response.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let heading_fingerprints = markdown_heading_fingerprints(trimmed);
+    let table_fingerprints = markdown_table_header_fingerprints(trimmed);
+    let paragraph_fingerprints = long_paragraph_fingerprints(trimmed);
+    let heading_count = heading_fingerprints.len();
+
+    count_duplicate_fingerprints(&heading_fingerprints) > 0
+        || count_duplicate_fingerprints(&table_fingerprints) > 0
+        || count_duplicate_fingerprints(&paragraph_fingerprints) > 0
+        || (heading_count >= 8 && trimmed.len() >= 3_000)
+}
+
+async fn rewrite_manager_response_compactly(
+    client: &reqwest::Client,
+    url: &str,
+    model_key: &str,
+    messages: &[Value],
+    candidate: &str,
+) -> String {
+    let rewrite_messages = {
+        let mut copy = messages.to_vec();
+        copy.push(json!({
+            "role": "user",
+            "content": format!(
+                "Rewrite the draft answer below into one final answer for the user using only the evidence already present in this conversation.\n\nRules:\n- Answer the user's request directly.\n- Collapse overlapping worker reports into one synthesis.\n- Remove repeated headings, repeated tables, duplicated recommendations, and stitched draft structure.\n- Preserve only claims supported by evidence already in the conversation.\n- Keep uncertainty explicit where evidence is incomplete.\n- Do not invent new evidence, tool calls, or follow-up work.\n- Keep the answer concise but complete.\n\nDraft answer:\n{}",
+                candidate
+            )
+        }));
+        copy
+    };
+
+    match client
+        .post(url)
+        .json(&json!({
+            "model": model_key,
+            "messages": rewrite_messages,
+            "stream": false,
+        }))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(data) => data["choices"][0]["message"]["content"]
+                .as_str()
+                .map(|text| text.trim().to_string())
+                .filter(|text| !text.is_empty())
+                .unwrap_or_else(|| candidate.to_string()),
+            Err(_) => candidate.to_string(),
+        },
+        _ => candidate.to_string(),
+    }
+}
+
+fn render_prompt_template(template: &str, replacements: &[(&str, String)]) -> String {
+    let mut rendered = template.to_string();
+    for (key, value) in replacements {
+        rendered = rendered.replace(&format!("{{{}}}", key), value);
+    }
+    rendered
+}
+
+fn format_internal_transcript(messages: &[Value], max_chars: usize) -> String {
+    if messages.is_empty() || max_chars == 0 {
+        return "[omitted]".to_string();
+    }
+    let mut transcript = messages
+        .iter()
+        .filter_map(|message| {
+            let role = message["role"].as_str()?;
+            let content = message["content"].as_str().unwrap_or("").trim();
+            if content.is_empty() {
+                None
+            } else {
+                Some(format!("{}: {}", role, content.replace('\n', " ")))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if transcript.chars().count() > max_chars {
+        transcript = transcript
+            .chars()
+            .rev()
+            .take(max_chars)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        transcript = format!("...[truncated]\n{}", transcript);
+    }
+    transcript
+}
+
+fn format_worker_outcomes_excerpt(dossier: &RunDossier) -> String {
+    if dossier.worker_outcomes.is_empty() {
+        return "[none]".to_string();
+    }
+    dossier
+        .worker_outcomes
+        .iter()
+        .map(|outcome| {
+            format!(
+                "- {} ({})\n  summary: {}\n  observed evidence: {}\n  inferences: {}\n  coverage gaps: {}",
+                outcome.agent_name,
+                outcome.agent_id,
+                outcome.summary,
+                if outcome.observed_evidence.is_empty() {
+                    "[none]".to_string()
+                } else {
+                    outcome.observed_evidence.join(" | ")
+                },
+                if outcome.inferences.is_empty() {
+                    "[none]".to_string()
+                } else {
+                    outcome.inferences.join(" | ")
+                },
+                if outcome.coverage_gaps.is_empty() {
+                    "[none]".to_string()
+                } else {
+                    outcome.coverage_gaps.join(" | ")
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn build_claim_calibration(dossier: &RunDossier) -> String {
+    let breadth = dossier.inspected_paths.len();
+    let caution = if breadth <= 3 {
+        "Inspected scope is shallow. Narrow claims to the inspected entrypoints and state the missing areas explicitly."
+    } else if breadth <= 8 {
+        "Inspected scope is moderate. Prefer calibrated conclusions and note remaining gaps where they affect confidence."
+    } else {
+        "Inspected scope is broad enough for stronger conclusions, but still respect any recorded coverage gaps."
+    };
+
+    let methodology = if dossier.counts.broad_full_file_reads + dossier.counts.broad_directory_scans
+        >= 3
+    {
+        "Recent methodology included broad reads/scans. Do not overstate confidence from those steps alone."
+    } else {
+        "Methodology was mostly targeted. You may rely more directly on the observed evidence."
+    };
+
+    format!(
+        "{}\n{}\nCurrent caution flags: {}",
+        caution,
+        methodology,
+        if dossier.caution_flags.is_empty() {
+            "[none]".to_string()
+        } else {
+            dossier.caution_flags.join(" | ")
+        }
+    )
+}
+
+fn build_run_dossier_json(dossier: &RunDossier) -> String {
+    serde_json::to_string_pretty(dossier).unwrap_or_else(|_| "{}".to_string())
+}
+
+pub(crate) async fn run_finalizer(
+    tool_state: &crate::mcp::McpState,
+    run_id: &str,
+    manager_agent_id: &str,
+    fallback_model_key: &str,
+    manager_response: &str,
+    config: &FinalizerConfig,
+    mode: &str,
+) -> (String, Option<String>) {
+    let (manager_messages, manager_model, mut dossier) = {
+        let runs = tool_state.active_runs.lock().unwrap();
+        runs.get(run_id)
+            .map(|run| {
+                (
+                    run.manager_messages.clone(),
+                    run.manager_model_key.clone(),
+                    run.dossier.clone(),
+                )
+            })
+            .unwrap_or_default()
+    };
+
+    let model_key = config.model_key.clone().or(manager_model).or_else(|| {
+        (!fallback_model_key.trim().is_empty()).then(|| fallback_model_key.to_string())
+    });
+
+    let Some(model_key) = model_key else {
+        return (manager_response.to_string(), None);
+    };
+
+    if dossier.manager_draft_summary.trim().is_empty() {
+        dossier.manager_draft_summary = compact_manager_draft(manager_response);
+    }
+    dossier.finalizer_mode = Some(mode.to_string());
+    dossier.finalizer_input_summary = dedupe_preserve_order(vec![
+        if config.include_run_dossier {
+            "Run dossier included.".to_string()
+        } else {
+            "Run dossier omitted.".to_string()
+        },
+        if config.include_worker_outputs {
+            "Worker outcomes included.".to_string()
+        } else {
+            "Worker outcomes omitted.".to_string()
+        },
+        if config.include_command_history {
+            "Command history excerpt included.".to_string()
+        } else {
+            "Command history excerpt omitted.".to_string()
+        },
+        if config.include_internal_transcript {
+            format!(
+                "Internal transcript excerpt included (max {} chars).",
+                config.max_transcript_chars
+            )
+        } else {
+            "Internal transcript excerpt omitted.".to_string()
+        },
+    ]);
+    refresh_dossier_caution_flags(&mut dossier);
+    {
+        let mut runs = tool_state.active_runs.lock().unwrap();
+        if let Some(run) = runs.get_mut(run_id) {
+            run.dossier = dossier.clone();
+        }
+    }
+
+    let prompt_template = if mode == "budget_stop" {
+        &config.prompt_budget_stop
+    } else {
+        &config.prompt_completion
+    };
+    let prompt = render_prompt_template(
+        prompt_template,
+        &[
+            ("manager_response", manager_response.to_string()),
+            ("manager_agent_id", manager_agent_id.to_string()),
+            ("finalizer_agent_name", config.agent_name.clone()),
+            ("finalizer_mode", mode.to_string()),
+            (
+                "run_dossier_json",
+                if config.include_run_dossier {
+                    build_run_dossier_json(&dossier)
+                } else {
+                    "[omitted]".to_string()
+                },
+            ),
+            (
+                "manager_draft_summary",
+                if dossier.manager_draft_summary.trim().is_empty() {
+                    "[none]".to_string()
+                } else {
+                    dossier.manager_draft_summary.clone()
+                },
+            ),
+            (
+                "worker_outcomes_excerpt",
+                if config.include_worker_outputs {
+                    format_worker_outcomes_excerpt(&dossier)
+                } else {
+                    "[omitted]".to_string()
+                },
+            ),
+            (
+                "command_history_excerpt",
+                if config.include_command_history {
+                    tool_state
+                        .command_history
+                        .lock()
+                        .unwrap()
+                        .summarize_recent(12)
+                } else {
+                    "[omitted]".to_string()
+                },
+            ),
+            (
+                "internal_transcript",
+                if config.include_internal_transcript {
+                    format_internal_transcript(&manager_messages, config.max_transcript_chars)
+                } else {
+                    "[omitted]".to_string()
+                },
+            ),
+            ("claim_calibration", build_claim_calibration(&dossier)),
+        ],
+    );
+
+    let request_messages = vec![json!({
+        "role": "user",
+        "content": prompt,
+    })];
+
+    let url = format!("{}/v1/chat/completions", lm_base_url());
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .unwrap_or_default();
+
+    match client
+        .post(&url)
+        .json(&json!({
+            "model": model_key,
+            "messages": request_messages,
+            "stream": false,
+        }))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(data) => {
+                let text = data["choices"][0]["message"]["content"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| manager_response.to_string());
+                (text, Some(model_key))
+            }
+            Err(_) => (manager_response.to_string(), Some(model_key)),
+        },
+        _ => (manager_response.to_string(), Some(model_key)),
+    }
+}
+
 fn extract_audit_section(response: &str, start: &str, end_markers: &[&str]) -> String {
     let lower = response.to_lowercase();
     let start_lower = start.to_lowercase();
@@ -3521,7 +4138,7 @@ pub(crate) async fn send_chat_completion_streaming(
     message: &str,
     run_id: &str,
     agent_id: &str,
-    on_event: &Channel<StreamEvent>,
+    on_event: &SharedEventSink,
     history: &[Value],
     context_limit: Option<u64>,
 ) -> Result<String, String> {
@@ -3738,5 +4355,83 @@ mod tests {
             &config
         )
         .is_err());
+    }
+
+    #[test]
+    fn manager_compaction_detects_repeated_headings() {
+        let repeated = "### Summary\nalpha\n\n### Summary\nbeta\n\n### Summary\ngamma";
+        assert!(manager_response_needs_compaction(repeated));
+    }
+
+    #[test]
+    fn manager_compaction_detects_duplicate_long_paragraphs() {
+        let paragraph = "The backend state manager currently aggregates multiple responsibilities into one coordination layer, which makes changes ripple across unrelated subsystems and encourages repeated restatements in the final answer.";
+        let repeated = format!("{0}\n\n{0}", paragraph);
+        assert!(manager_response_needs_compaction(&repeated));
+    }
+
+    #[test]
+    fn manager_compaction_skips_short_coherent_answers() {
+        let coherent = "The repo has partial Rust tests, no frontend tests, and no CI. The next step is to add targeted coverage and automate the checks.";
+        assert!(!manager_response_needs_compaction(coherent));
+    }
+
+    #[test]
+    fn lexical_redundancy_detection_works_without_embeddings() {
+        let config = RedundancyDetectionConfig {
+            enabled: true,
+            embedding_model_key: None,
+            semantic_similarity_threshold: 0.9,
+            max_redundant_audit_retries: 1,
+        };
+        let existing = CoveredAuditTopic {
+            lexical_signature: "read_file | src-tauri/src/chat.rs".to_string(),
+            summary: "chat.rs".to_string(),
+            refs: HashSet::from(["src-tauri/src/chat.rs".to_string()]),
+            target_refs: HashSet::from(["src-tauri/src/chat.rs".to_string()]),
+            inspection_depth: AuditInspectionDepth::Targeted,
+            embedding: None,
+        };
+        let candidate = CoveredAuditTopic {
+            lexical_signature: "read_file | src-tauri/src/chat.rs".to_string(),
+            summary: "chat.rs again".to_string(),
+            refs: HashSet::from(["src-tauri/src/chat.rs".to_string()]),
+            target_refs: HashSet::from(["src-tauri/src/chat.rs".to_string()]),
+            inspection_depth: AuditInspectionDepth::Targeted,
+            embedding: None,
+        };
+
+        let reason = detect_redundant_audit_topic(&candidate, &[existing], &config);
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("same lexical topic"));
+    }
+
+    #[test]
+    fn lexical_redundancy_still_applies_when_embeddings_are_missing() {
+        let config = RedundancyDetectionConfig {
+            enabled: true,
+            embedding_model_key: Some("embedding-model".to_string()),
+            semantic_similarity_threshold: 0.9,
+            max_redundant_audit_retries: 1,
+        };
+        let existing = CoveredAuditTopic {
+            lexical_signature: "grep_search | src/App.tsx".to_string(),
+            summary: "App.tsx".to_string(),
+            refs: HashSet::from(["src/App.tsx".to_string()]),
+            target_refs: HashSet::from(["src/App.tsx".to_string()]),
+            inspection_depth: AuditInspectionDepth::EvidenceBacked,
+            embedding: None,
+        };
+        let candidate = CoveredAuditTopic {
+            lexical_signature: "grep_search | src/App.tsx".to_string(),
+            summary: "App.tsx follow-up".to_string(),
+            refs: HashSet::from(["src/App.tsx".to_string()]),
+            target_refs: HashSet::from(["src/App.tsx".to_string()]),
+            inspection_depth: AuditInspectionDepth::Targeted,
+            embedding: None,
+        };
+
+        let reason = detect_redundant_audit_topic(&candidate, &[existing], &config);
+        assert!(reason.is_some());
     }
 }

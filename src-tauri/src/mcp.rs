@@ -11,19 +11,21 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use tauri::ipc::Channel;
 use tower_http::cors::CorsLayer;
 
 use crate::agent_config::{resolve_audit_behavior_config, Agent, AgentConfig, AgentLoadConfig};
 use crate::chat::{call_chat_blocking, validate_audit_worker_response, StreamEvent};
 use crate::config_persistence::ajantis_dir;
+use crate::event_sink::SharedEventSink;
 use crate::helpers::{
     apply_runtime_agent_context, compute_context_budget, extract_explicit_audit_refs,
     is_manager_blocked_tool, is_manager_only_tool, resolve_active_behaviors,
 };
 use crate::memory::{CommandExecution, CommandHistory, MemoryEntry, MemoryPool};
 use crate::models::fetch_models;
-use crate::runs::{primary_run_id, ActiveRuns};
+use crate::runs::{
+    primary_run_id, record_dossier_blocked_command, record_dossier_command, ActiveRuns,
+};
 use crate::state::{BehaviorTriggerCache, McpTool};
 
 // ── Background task tracking ───────────────────────────────────────
@@ -54,7 +56,7 @@ pub(crate) struct McpState {
     /// Self-reference port so manager tools can call other MCP tools.
     pub(crate) mcp_port: u16,
     /// Shared with AppState — allows MCP tool handlers to emit stream events.
-    pub(crate) event_channel: Arc<Mutex<Option<Channel<StreamEvent>>>>,
+    pub(crate) event_channel: Arc<Mutex<Option<SharedEventSink>>>,
     /// Background tasks spawned via TaskCreate.
     pub(crate) tasks: Arc<Mutex<HashMap<String, AjantisTask>>>,
     /// Active thread-scoped command execution history.
@@ -184,6 +186,9 @@ pub(crate) async fn handle_tool_call(
     // Resolve the active sandbox root: selected workspace if set, fallback to workspace_root.
     let sandbox: PathBuf = state.active_workspace.lock().unwrap().clone();
     if let Err(reason) = enforce_tool_policy(name, caller_agent_id, state) {
+        if let Some(run_id) = primary_run_id(&state.active_runs) {
+            record_dossier_blocked_command(&state.active_runs, &run_id, &reason);
+        }
         return mcp_error(&reason);
     }
 
@@ -195,6 +200,9 @@ pub(crate) async fn handle_tool_call(
                 return mcp_error("Error: command is required.");
             }
             if let Err(reason) = check_command_sandbox(&command, &sandbox, state) {
+                if let Some(run_id) = primary_run_id(&state.active_runs) {
+                    record_dossier_blocked_command(&state.active_runs, &run_id, &reason);
+                }
                 return mcp_error(&reason);
             }
             let cwd = sandbox.to_string_lossy().to_string();
@@ -282,6 +290,15 @@ pub(crate) async fn handle_tool_call(
                         char_count,
                         slice,
                     );
+                    remember_command_result(
+                        state,
+                        "read_file",
+                        &format!("read_file {}", abs.to_string_lossy()),
+                        &format!("read_file {} {}", abs.to_string_lossy(), scope_label),
+                        &sandbox.to_string_lossy(),
+                        true,
+                        &payload,
+                    );
                     mcp_ok(&payload)
                 }
                 Err(e) => mcp_error(&format!("Error reading file: {}", e)),
@@ -360,6 +377,15 @@ pub(crate) async fn handle_tool_call(
                         seen.extend(results.iter().cloned());
                     }
                     if results.is_empty() {
+                        remember_command_result(
+                            state,
+                            "glob_search",
+                            &format!("glob_search {} {}", base.to_string_lossy(), pattern),
+                            &format!("glob_search {} {}", base.to_string_lossy(), pattern),
+                            &sandbox.to_string_lossy(),
+                            true,
+                            "No files matched.",
+                        );
                         mcp_ok("No files matched.")
                     } else {
                         let truncated: Vec<String> = results.iter().take(200).cloned().collect();
@@ -372,6 +398,15 @@ pub(crate) async fn handle_tool_call(
                         } else {
                             truncated.join("\n")
                         };
+                        remember_command_result(
+                            state,
+                            "glob_search",
+                            &format!("glob_search {} {}", base.to_string_lossy(), pattern),
+                            &format!("glob_search {} {}", base.to_string_lossy(), pattern),
+                            &sandbox.to_string_lossy(),
+                            true,
+                            &body,
+                        );
                         mcp_ok(&body)
                     }
                 }
@@ -443,6 +478,15 @@ pub(crate) async fn handle_tool_call(
                 Ok(out) => {
                     let text = String::from_utf8_lossy(&out.stdout).to_string();
                     if text.trim().is_empty() {
+                        remember_command_result(
+                            state,
+                            "grep_search",
+                            &format!("grep_search {} {}", search_path.to_string_lossy(), pattern),
+                            &format!("grep_search {} {}", search_path.to_string_lossy(), pattern),
+                            &sandbox.to_string_lossy(),
+                            out.status.success(),
+                            "No matches found.",
+                        );
                         mcp_ok("No matches found.")
                     } else {
                         let offset = args["offset"].as_u64().unwrap_or(0) as usize;
@@ -454,6 +498,15 @@ pub(crate) async fn handle_tool_call(
                         } else {
                             lines.join("\n")
                         };
+                        remember_command_result(
+                            state,
+                            "grep_search",
+                            &format!("grep_search {} {}", search_path.to_string_lossy(), pattern),
+                            &format!("grep_search {} {}", search_path.to_string_lossy(), pattern),
+                            &sandbox.to_string_lossy(),
+                            out.status.success(),
+                            &body,
+                        );
                         mcp_ok(&body)
                     }
                 }
@@ -1772,13 +1825,13 @@ fn build_compat_agent_prompt(role_hint: &str, caller_prompt: &str) -> String {
     let normalized_role = normalize_role_hint(role_hint);
     let specialization = match normalized_role.as_str() {
         "explorer" => {
-            "Focus on identifying the minimum relevant files, directories, and entry points needed for the task. Do not stop at a blocked summary if the next obvious file to inspect is already implied."
+            "Focus on identifying the minimum relevant files, directories, and entry points needed for the task, not whole-tree inventories. Return a compact result with `Entry points`, `Relevant paths`, and `Coverage gaps`. Do not stop at a blocked summary if the next obvious file to inspect is already implied."
         }
         "executor" => {
             "Prefer direct execution with concise evidence. If asked to show command output, run the command and report the actual result."
         }
         "analyst" | "analyzer" => {
-            "Read the relevant sources and produce a factual summary grounded in the files you inspected. Every substantive conclusion must cite the file or observed code/config behavior behind it. If the caller names a broad scope, treat it as a coverage checklist and explicitly call out anything still uninspected."
+            "Read the relevant sources and produce a factual, deduplicated summary grounded in the files you inspected. Return `Observed evidence`, `Inferences`, and `Coverage gaps`. Every substantive conclusion must cite the file or observed code/config behavior behind it. If the caller names a broad scope, treat it as a coverage checklist and explicitly call out anything still uninspected."
         }
         "security_auditor" => {
             "Look for concrete vulnerabilities, risky configurations, and unsafe patterns. Prefer verified findings over speculation. Do not assign severity without direct code/config evidence. If a concern is plausible but unproven, label it as a lower-confidence hypothesis only if you can cite a concrete file/config or observed behavior and state what proof is still missing. If the caller names a broad scope, treat it as a coverage checklist and explicitly call out anything still uninspected."
@@ -1793,7 +1846,7 @@ fn build_compat_agent_prompt(role_hint: &str, caller_prompt: &str) -> String {
     };
 
     format!(
-        "You are a specialized {} subagent working inside a local repository.\n\n{}\n\nGeneral rules:\n- Execute the assigned sub-task directly.\n- Prefer targeted tool calls and narrow reads.\n- If the task is to build, implement, create, or modify workspace files, use the file tools to materialize the result on disk; a chat-only code block does not count as completion unless the caller explicitly asked for chat-only output.\n- If no target path is specified for a file task, choose a sensible path and state it in your result.\n- For audit/review work, prefer direct file or config inspection over speculation.\n- Treat explicitly requested files, directories, file classes, and subsystems as a coverage checklist; if you did not inspect one, call it out explicitly as a coverage gap.\n- Quote the file/path and the specific observed behavior behind each conclusion.\n- Do not emit generic or dependency-only risk templates.\n- Do not ask the user follow-up questions in this environment.\n- Do not stop at a plan, status update, or statement of intent.\n- If a tool is blocked, adapt and try another minimal approach.\n- If evidence is insufficient, say `insufficient evidence` instead of inventing a finding.\n- Return the concrete result requested by the caller.\n\nSupplementary guidance from the caller:\n{}",
+        "You are a specialized {} subagent working inside a local repository.\n\n{}\n\nGeneral rules:\n- Execute the assigned sub-task directly.\n- Prefer targeted tool calls, narrow reads, and relevant entrypoints over exhaustive scans.\n- Avoid dependency, build, and generated directories by default (`node_modules`, `dist`, `target`, `.git`, caches) unless the task is specifically about them.\n- If the task is to build, implement, create, or modify workspace files, use the file tools to materialize the result on disk; a chat-only code block does not count as completion unless the caller explicitly asked for chat-only output.\n- If no target path is specified for a file task, choose a sensible path and state it in your result.\n- For audit/review work, prefer direct file or config inspection over speculation.\n- Treat explicitly requested files, directories, file classes, and subsystems as a coverage checklist; if you did not inspect one, call it out explicitly as a coverage gap.\n- Quote the file/path and the specific observed behavior behind each conclusion.\n- Do not emit generic or dependency-only risk templates.\n- Do not ask the user follow-up questions in this environment.\n- Do not stop at a plan, status update, or statement of intent.\n- If a tool is blocked or too broad, immediately adapt to a narrower command or read.\n- If evidence is insufficient, say `insufficient evidence` instead of inventing a finding.\n- Return the concrete result requested by the caller as one deduplicated answer.\n\nSupplementary guidance from the caller:\n{}",
         role_hint,
         specialization,
         if caller_prompt.trim().is_empty() {
@@ -1814,6 +1867,22 @@ mod tests {
         assert!(prompt.contains("materialize the result on disk"));
         assert!(prompt.contains("chat-only code block does not count as completion"));
         assert!(prompt.contains("choose a sensible path"));
+    }
+
+    #[test]
+    fn compat_prompt_steers_targeted_reads_and_deduplicated_summaries() {
+        let explorer = build_compat_agent_prompt("explorer", "Inspect the repo");
+        assert!(explorer.contains("minimum relevant files"));
+        assert!(explorer.contains("not whole-tree inventories"));
+
+        let analyzer = build_compat_agent_prompt("analyzer", "Summarize findings");
+        assert!(analyzer.contains("deduplicated summary"));
+        assert!(analyzer.contains("coverage checklist"));
+
+        let general = build_compat_agent_prompt("executor", "Run checks");
+        assert!(general.contains("Avoid dependency, build, and generated directories"));
+        assert!(general.contains("blocked or too broad"));
+        assert!(general.contains("one deduplicated answer"));
     }
 }
 
@@ -1858,14 +1927,13 @@ fn remember_command_result(
     success: bool,
     result: &str,
 ) {
-    state.command_history.lock().unwrap().push(
-        tool_name,
-        command,
-        normalized_command,
-        cwd,
-        success,
-        result,
-    );
+    let mut history = state.command_history.lock().unwrap();
+    history.push(tool_name, command, normalized_command, cwd, success, result);
+    let last_entry = history.entries.last().cloned();
+    drop(history);
+    if let (Some(run_id), Some(entry)) = (primary_run_id(&state.active_runs), last_entry.as_ref()) {
+        record_dossier_command(&state.active_runs, &run_id, entry);
+    }
 }
 
 fn caller_active_behaviors(

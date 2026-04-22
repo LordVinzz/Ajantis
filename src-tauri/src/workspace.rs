@@ -1,109 +1,114 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::memory::{CommandExecution, MemoryEntry};
-use crate::runs::{snapshot_path, thread_data_root};
+use crate::runs::{snapshot_path, thread_data_root, RunDossier};
 use crate::state::AppState;
 
 #[derive(Clone, Serialize, Deserialize, Default)]
-pub(crate) struct WorkspaceToolCall {
-    pub(crate) tool_name: String,
+pub struct WorkspaceToolCall {
+    pub tool_name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub(crate) args: String,
+    pub args: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub(crate) result: String,
+    pub result: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub(crate) status: String,
+    pub status: String,
     #[serde(default)]
-    pub(crate) semantic: bool,
+    pub semantic: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
-pub(crate) struct WorkspaceMessageSignal {
+pub struct WorkspaceMessageSignal {
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub(crate) kind: String,
+    pub kind: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub(crate) text: String,
+    pub text: String,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
-pub(crate) struct WorkspaceThreadMessage {
+pub struct WorkspaceThreadMessage {
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub(crate) kind: String,
+    pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) agent_id: Option<String>,
+    pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub(crate) agent_name: String,
+    pub agent_name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub(crate) content: String,
+    pub content: String,
     #[serde(default)]
-    pub(crate) is_sent: bool,
+    pub is_sent: bool,
     #[serde(default)]
-    pub(crate) is_error: bool,
+    pub is_error: bool,
     #[serde(default)]
-    pub(crate) for_user: bool,
+    pub for_user: bool,
     #[serde(default)]
-    pub(crate) internal: bool,
+    pub internal: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) tools: Vec<WorkspaceToolCall>,
+    pub tools: Vec<WorkspaceToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) signal: Option<WorkspaceMessageSignal>,
+    pub signal: Option<WorkspaceMessageSignal>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct WorkspaceThread {
-    pub(crate) id: String,
-    pub(crate) name: String,
+pub struct WorkspaceThread {
+    pub id: String,
+    pub name: String,
     /// Legacy persisted HTML snapshot of the thread conversation.
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub(crate) messages: String,
+    pub messages: String,
     /// Structured thread messages used to reconstruct the UI.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) message_items: Vec<WorkspaceThreadMessage>,
+    pub message_items: Vec<WorkspaceThreadMessage>,
     /// Persisted backend conversation state for the thread.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) memory_entries: Vec<MemoryEntry>,
+    pub memory_entries: Vec<MemoryEntry>,
     /// Persisted thread-scoped command execution history.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) command_history: Vec<CommandExecution>,
+    pub command_history: Vec<CommandExecution>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
-pub(crate) struct ThreadSnapshot {
+pub struct ThreadSnapshot {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) message_items: Vec<WorkspaceThreadMessage>,
+    pub message_items: Vec<WorkspaceThreadMessage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) memory_entries: Vec<MemoryEntry>,
+    pub memory_entries: Vec<MemoryEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) command_history: Vec<CommandExecution>,
+    pub command_history: Vec<CommandExecution>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) active_run_id: Option<String>,
+    pub run_dossier: Option<RunDossier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_run_id: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub(crate) updated_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct Workspace {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) path: String,
+pub struct Workspace {
+    pub id: String,
+    pub name: String,
+    pub path: String,
     #[serde(default)]
-    pub(crate) threads: Vec<WorkspaceThread>,
+    pub threads: Vec<WorkspaceThread>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
-pub(crate) struct WorkspaceConfig {
-    workspaces: Vec<Workspace>,
+pub struct WorkspaceConfig {
+    pub workspaces: Vec<Workspace>,
 }
 
-pub(crate) fn workspace_config_path(_workspace: &PathBuf) -> PathBuf {
+pub fn workspace_config_path(_workspace: &PathBuf) -> PathBuf {
     crate::config_persistence::ajantis_dir().join("workspace_config.json")
 }
 
-fn load_workspace_config_from_disk(workspace_root: &PathBuf) -> Result<WorkspaceConfig, String> {
+pub fn load_workspace_config_from_disk(
+    workspace_root: &PathBuf,
+) -> Result<WorkspaceConfig, String> {
     let path = workspace_config_path(workspace_root);
     if !path.exists() {
         return Ok(WorkspaceConfig::default());
@@ -118,7 +123,7 @@ fn load_workspace_config_from_disk(workspace_root: &PathBuf) -> Result<Workspace
     Ok(config)
 }
 
-fn save_workspace_config_to_disk(
+pub fn save_workspace_config_to_disk(
     workspace_root: &PathBuf,
     config: &WorkspaceConfig,
 ) -> Result<(), String> {
@@ -132,6 +137,24 @@ fn save_workspace_config_to_disk(
     let json = serde_json::to_string_pretty(&stripped)
         .map_err(|e| format!("Serialization failed: {}", e))?;
     fs::write(&path, json).map_err(|e| format!("Failed to write workspace config: {}", e))
+}
+
+fn write_thread_snapshot_atomic(
+    workspace_id: &str,
+    thread_id: &str,
+    snapshot: &ThreadSnapshot,
+) -> Result<(), String> {
+    let path = snapshot_path(workspace_id, thread_id);
+    let json = serde_json::to_string_pretty(snapshot)
+        .map_err(|e| format!("Failed to serialize thread snapshot: {}", e))?;
+    let tmp_path = path.with_extension(format!(
+        "json.tmp-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    fs::write(&tmp_path, json)
+        .map_err(|e| format!("Failed to write temp thread snapshot: {}", e))?;
+    fs::rename(&tmp_path, &path)
+        .map_err(|e| format!("Failed to replace thread snapshot atomically: {}", e))
 }
 
 fn clear_inline_thread_payload(thread: &mut WorkspaceThread) {
@@ -156,6 +179,7 @@ fn maybe_migrate_inline_thread_payloads(config: &mut WorkspaceConfig) -> Result<
                 message_items: thread.message_items.clone(),
                 memory_entries: thread.memory_entries.clone(),
                 command_history: thread.command_history.clone(),
+                run_dossier: None,
                 active_run_id: None,
                 updated_at: chrono::Utc::now().to_rfc3339(),
             };
@@ -173,9 +197,8 @@ fn maybe_migrate_inline_thread_payloads(config: &mut WorkspaceConfig) -> Result<
 
 /// Called by the frontend when the user selects a workspace.
 /// Updates the shared active_workspace path used by MCP tool sandboxing.
-#[tauri::command]
-pub(crate) async fn set_active_workspace(
-    state: tauri::State<'_, Arc<AppState>>,
+pub fn set_active_workspace_path(
+    state: &Arc<AppState>,
     path: Option<String>,
 ) -> Result<(), String> {
     let new_path = match path {
@@ -187,23 +210,34 @@ pub(crate) async fn set_active_workspace(
 }
 
 #[tauri::command]
-pub(crate) async fn pick_folder() -> Result<Option<String>, String> {
-    let handle = rfd::AsyncFileDialog::new()
+pub async fn set_active_workspace(
+    state: tauri::State<'_, Arc<AppState>>,
+    path: Option<String>,
+) -> Result<(), String> {
+    set_active_workspace_path(&state.inner().clone(), path)
+}
+
+pub fn pick_folder_blocking() -> Result<Option<String>, String> {
+    let handle = rfd::FileDialog::new()
         .set_title("Choose a workspace folder")
-        .pick_folder()
-        .await;
-    Ok(handle.map(|f| f.path().to_string_lossy().to_string()))
+        .pick_folder();
+    Ok(handle.map(|path| path.to_string_lossy().to_string()))
 }
 
 #[tauri::command]
-pub(crate) async fn load_workspace_config(
+pub async fn pick_folder() -> Result<Option<String>, String> {
+    pick_folder_blocking()
+}
+
+#[tauri::command]
+pub async fn load_workspace_config(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<WorkspaceConfig, String> {
     load_workspace_config_from_disk(&state.workspace_root)
 }
 
 #[tauri::command]
-pub(crate) async fn save_workspace_config(
+pub async fn save_workspace_config(
     state: tauri::State<'_, Arc<AppState>>,
     config: WorkspaceConfig,
 ) -> Result<(), String> {
@@ -211,7 +245,7 @@ pub(crate) async fn save_workspace_config(
 }
 
 #[tauri::command]
-pub(crate) async fn delete_thread(
+pub async fn delete_thread(
     state: tauri::State<'_, Arc<AppState>>,
     workspace_id: String,
     thread_id: String,
@@ -262,27 +296,113 @@ pub(crate) async fn delete_thread(
 }
 
 #[tauri::command]
-pub(crate) async fn load_thread_snapshot(
+pub async fn load_thread_snapshot(
     workspace_id: String,
     thread_id: String,
 ) -> Result<ThreadSnapshot, String> {
-    let path = snapshot_path(&workspace_id, &thread_id);
+    load_thread_snapshot_from_disk(&workspace_id, &thread_id)
+}
+
+#[tauri::command]
+pub async fn save_thread_snapshot(
+    workspace_id: String,
+    thread_id: String,
+    snapshot: ThreadSnapshot,
+) -> Result<(), String> {
+    save_thread_snapshot_to_disk(&workspace_id, &thread_id, snapshot)
+}
+
+pub fn queue_thread_snapshot_save_for_state(
+    state: &Arc<AppState>,
+    workspace_id: String,
+    thread_id: String,
+    snapshot: ThreadSnapshot,
+) -> Result<(), String> {
+    let key = format!("{}/{}", workspace_id, thread_id);
+    let version = {
+        state
+            .pending_thread_snapshots
+            .lock()
+            .unwrap()
+            .insert(key.clone(), snapshot);
+        let mut versions = state.pending_thread_snapshot_versions.lock().unwrap();
+        let entry = versions.entry(key.clone()).or_insert(0);
+        *entry += 1;
+        *entry
+    };
+
+    let pending = state.pending_thread_snapshots.clone();
+    let versions = state.pending_thread_snapshot_versions.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let should_flush = versions
+            .lock()
+            .unwrap()
+            .get(&key)
+            .copied()
+            .map(|current| current == version)
+            .unwrap_or(false);
+        if !should_flush {
+            return;
+        }
+        let latest = pending.lock().unwrap().remove(&key);
+        if let Some(snapshot) = latest {
+            let _ = write_thread_snapshot_atomic(&workspace_id, &thread_id, &snapshot);
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn queue_thread_snapshot_save(
+    state: tauri::State<'_, Arc<AppState>>,
+    workspace_id: String,
+    thread_id: String,
+    snapshot: ThreadSnapshot,
+) -> Result<(), String> {
+    queue_thread_snapshot_save_for_state(&state.inner().clone(), workspace_id, thread_id, snapshot)
+}
+pub fn load_thread_snapshot_from_disk(
+    workspace_id: &str,
+    thread_id: &str,
+) -> Result<ThreadSnapshot, String> {
+    let path = snapshot_path(workspace_id, thread_id);
     if !path.exists() {
         return Ok(ThreadSnapshot::default());
     }
     let content =
         fs::read_to_string(&path).map_err(|e| format!("Failed to read thread snapshot: {}", e))?;
-    serde_json::from_str(&content).map_err(|e| format!("Failed to parse thread snapshot: {}", e))
+    match serde_json::from_str(&content) {
+        Ok(snapshot) => Ok(snapshot),
+        Err(error) => Ok(ThreadSnapshot {
+            message_items: vec![WorkspaceThreadMessage {
+                kind: "text".to_string(),
+                agent_id: None,
+                agent_name: "System".to_string(),
+                content: format!(
+                    "Thread snapshot could not be fully parsed and was recovered as empty state. Parse error: {}",
+                    error
+                ),
+                is_sent: false,
+                is_error: true,
+                for_user: true,
+                internal: false,
+                tools: vec![],
+                signal: None,
+            }],
+            memory_entries: vec![],
+            command_history: vec![],
+            run_dossier: None,
+            active_run_id: None,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }),
+    }
 }
 
-#[tauri::command]
-pub(crate) async fn save_thread_snapshot(
-    workspace_id: String,
-    thread_id: String,
+pub fn save_thread_snapshot_to_disk(
+    workspace_id: &str,
+    thread_id: &str,
     snapshot: ThreadSnapshot,
 ) -> Result<(), String> {
-    let path = snapshot_path(&workspace_id, &thread_id);
-    let json = serde_json::to_string_pretty(&snapshot)
-        .map_err(|e| format!("Failed to serialize thread snapshot: {}", e))?;
-    fs::write(&path, json).map_err(|e| format!("Failed to write thread snapshot: {}", e))
+    write_thread_snapshot_atomic(workspace_id, thread_id, &snapshot)
 }

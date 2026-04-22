@@ -7,13 +7,13 @@ use crate::helpers::lm_base_url;
 use crate::state::AppState;
 
 #[derive(Serialize)]
-pub(crate) struct ModelInfo {
-    pub(crate) key: String,
-    pub(crate) display_name: String,
+pub struct ModelInfo {
+    pub key: String,
+    pub display_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) model_type: Option<String>,
+    pub model_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) max_context_length: Option<u64>,
+    pub max_context_length: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     format: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -27,21 +27,21 @@ pub(crate) struct ModelInfo {
 }
 
 #[derive(Serialize)]
-pub(crate) struct LoadedInstance {
+pub struct LoadedInstance {
     instance_id: String,
     context_length: Option<u64>,
     flash_attention: Option<bool>,
 }
 
 #[derive(Serialize)]
-pub(crate) struct LoadedModelInfo {
+pub struct LoadedModelInfo {
     key: String,
     display_name: String,
     instances: Vec<LoadedInstance>,
 }
 
 #[tauri::command]
-pub(crate) async fn fetch_models() -> Result<Vec<ModelInfo>, String> {
+pub async fn fetch_models() -> Result<Vec<ModelInfo>, String> {
     let base = lm_base_url();
     let client = reqwest::Client::new();
     let resp = client
@@ -90,7 +90,7 @@ pub(crate) async fn fetch_models() -> Result<Vec<ModelInfo>, String> {
 }
 
 #[tauri::command]
-pub(crate) async fn fetch_loaded_models() -> Result<Vec<LoadedModelInfo>, String> {
+pub async fn fetch_loaded_models() -> Result<Vec<LoadedModelInfo>, String> {
     let base = lm_base_url();
     let client = reqwest::Client::new();
     let resp = client
@@ -138,7 +138,7 @@ pub(crate) async fn fetch_loaded_models() -> Result<Vec<LoadedModelInfo>, String
 }
 
 #[tauri::command]
-pub(crate) async fn set_model(
+pub async fn set_model(
     state: tauri::State<'_, Arc<AppState>>,
     model: String,
 ) -> Result<bool, String> {
@@ -149,21 +149,21 @@ pub(crate) async fn set_model(
 }
 
 #[derive(Deserialize)]
-pub(crate) struct LoadConfig {
-    model: String,
+pub struct LoadConfig {
+    pub model: String,
     #[serde(default)]
-    context_length: Option<u64>,
+    pub context_length: Option<u64>,
     #[serde(default)]
-    eval_batch_size: Option<u64>,
+    pub eval_batch_size: Option<u64>,
     #[serde(default)]
-    flash_attention: Option<bool>,
+    pub flash_attention: Option<bool>,
     #[serde(default)]
-    num_experts: Option<u64>,
+    pub num_experts: Option<u64>,
     #[serde(default)]
-    offload_kv_cache_to_gpu: Option<bool>,
+    pub offload_kv_cache_to_gpu: Option<bool>,
 }
 
-pub(crate) async fn load_model_internal(
+pub async fn load_model_internal(
     config: &AgentLoadConfig,
     model_key: &str,
 ) -> Result<(), String> {
@@ -200,7 +200,7 @@ pub(crate) async fn load_model_internal(
     Ok(())
 }
 
-pub(crate) async fn unload_model_internal(instance_id: &str) -> Result<(), String> {
+pub async fn unload_model_internal(instance_id: &str) -> Result<(), String> {
     let url = format!("{}/api/v1/models/unload", lm_base_url());
     let client = reqwest::Client::new();
     let resp = client
@@ -218,7 +218,7 @@ pub(crate) async fn unload_model_internal(instance_id: &str) -> Result<(), Strin
     Ok(())
 }
 
-pub(crate) async fn create_embeddings(
+pub async fn create_embeddings(
     model_key: &str,
     inputs: &[String],
 ) -> Result<Vec<Vec<f32>>, String> {
@@ -279,7 +279,7 @@ pub(crate) async fn create_embeddings(
 }
 
 #[tauri::command]
-pub(crate) async fn load_model(config: LoadConfig) -> Result<(), String> {
+pub async fn load_model(config: LoadConfig) -> Result<(), String> {
     load_model_internal(
         &AgentLoadConfig {
             context_length: config.context_length,
@@ -294,12 +294,12 @@ pub(crate) async fn load_model(config: LoadConfig) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub(crate) async fn unload_model(instance_id: String) -> Result<(), String> {
+pub async fn unload_model(instance_id: String) -> Result<(), String> {
     unload_model_internal(&instance_id).await
 }
 
 #[tauri::command]
-pub(crate) async fn download_model(model: String) -> Result<(), String> {
+pub async fn download_model(model: String) -> Result<(), String> {
     let url = format!("{}/api/v1/models/download", lm_base_url());
     let client = reqwest::Client::new();
     let resp = client

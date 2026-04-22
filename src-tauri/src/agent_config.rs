@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::helpers::{default_priority, default_true};
 
-pub(crate) const MIN_SEMANTIC_SIMILARITY_THRESHOLD: f32 = 0.85;
-pub(crate) const MAX_SEMANTIC_SIMILARITY_THRESHOLD: f32 = 0.99;
-pub(crate) const GROUNDED_AUDIT_BEHAVIOR_ID: &str = "grounded_audit";
-pub(crate) const DEFAULT_THEME: &str = "win98";
+pub const MIN_SEMANTIC_SIMILARITY_THRESHOLD: f32 = 0.85;
+pub const MAX_SEMANTIC_SIMILARITY_THRESHOLD: f32 = 0.99;
+pub const GROUNDED_AUDIT_BEHAVIOR_ID: &str = "grounded_audit";
+pub const DEFAULT_THEME: &str = "win98";
 
 fn default_theme() -> String {
     DEFAULT_THEME.to_string()
@@ -71,6 +71,50 @@ fn default_budget_summarization_enabled() -> bool {
 
 fn default_budget_summarization_prompt() -> String {
     "The run has hit its configured soft budget limit. Using only the evidence already present in this conversation, produce a final concise summary of:\n1. What was accomplished and key findings so far.\n2. What remains incomplete or uncertain.\n3. The next concrete step if the task were to continue.\n\nDo not call any tools. Do not apologize. Be direct and factual.".to_string()
+}
+
+fn default_finalizer_enabled() -> bool {
+    true
+}
+
+fn default_finalizer_agent_name() -> String {
+    "Finalizer".to_string()
+}
+
+fn default_finalizer_prompt_completion() -> String {
+    "Using the run dossier first, then the manager draft summary, then the internal transcript excerpt only if needed, produce the final user-facing answer.\n\nRules:\n- Answer the user's request directly.\n- Base the answer on inspected evidence and clearly state when the inspected scope is narrow.\n- Separate observations from recommendations in concise prose.\n- Mention material coverage gaps when they affect confidence.\n- Avoid repo-wide prescriptions when the dossier shows shallow inspection.\n- Do not expose raw chain-of-thought.\n- Do not call any tools.\n\nFinalizer mode: {finalizer_mode}\n\nClaim calibration:\n{claim_calibration}\n\nRun dossier:\n{run_dossier_json}\n\nCommand history excerpt:\n{command_history_excerpt}\n\nWorker outcomes:\n{worker_outcomes_excerpt}\n\nManager draft summary:\n{manager_draft_summary}\n\nManager draft:\n{manager_response}\n\nInternal transcript excerpt:\n{internal_transcript}".to_string()
+}
+
+fn default_finalizer_prompt_budget_stop() -> String {
+    "Using the run dossier first, then the manager draft summary, then the internal transcript excerpt only if needed, produce the final user-facing budget-stop answer.\n\nRules:\n- Do not call any tools.\n- Do not expose raw chain-of-thought.\n- Keep the answer bounded to: what was established, what remains uncertain or incomplete, and the next concrete step.\n- Mention inspected scope and coverage gaps when they affect confidence.\n- Prefer evidence already present in the dossier over freeform reasoning.\n\nFinalizer mode: {finalizer_mode}\n\nClaim calibration:\n{claim_calibration}\n\nRun dossier:\n{run_dossier_json}\n\nCommand history excerpt:\n{command_history_excerpt}\n\nWorker outcomes:\n{worker_outcomes_excerpt}\n\nManager draft summary:\n{manager_draft_summary}\n\nManager draft:\n{manager_response}\n\nInternal transcript excerpt:\n{internal_transcript}".to_string()
+}
+
+fn default_finalizer_run_on_completion() -> bool {
+    true
+}
+
+fn default_finalizer_run_on_budget_stop() -> bool {
+    true
+}
+
+fn default_finalizer_include_internal_transcript() -> bool {
+    true
+}
+
+fn default_finalizer_include_worker_outputs() -> bool {
+    true
+}
+
+fn default_finalizer_include_command_history() -> bool {
+    true
+}
+
+fn default_finalizer_include_run_dossier() -> bool {
+    true
+}
+
+fn default_finalizer_max_transcript_chars() -> usize {
+    12_000
 }
 
 fn default_runtime_note_enabled() -> bool {
@@ -297,60 +341,60 @@ fn default_grounded_audit_stall_prompt() -> Option<String> {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct AgentLoadConfig {
+pub struct AgentLoadConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) context_length: Option<u64>,
+    pub context_length: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) eval_batch_size: Option<u64>,
+    pub eval_batch_size: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) flash_attention: Option<bool>,
+    pub flash_attention: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) num_experts: Option<u64>,
+    pub num_experts: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) offload_kv_cache_to_gpu: Option<bool>,
+    pub offload_kv_cache_to_gpu: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct Agent {
-    pub(crate) id: String,
-    pub(crate) name: String,
+pub struct Agent {
+    pub id: String,
+    pub name: String,
     #[serde(rename = "type")]
-    pub(crate) agent_type: String,
+    pub agent_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) model_key: Option<String>,
+    pub model_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) model_type: Option<String>,
+    pub model_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) role: Option<String>,
+    pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) load_config: Option<AgentLoadConfig>,
+    pub load_config: Option<AgentLoadConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) mode: Option<String>,
+    pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) allowed_tools: Option<Vec<String>>,
+    pub allowed_tools: Option<Vec<String>>,
     #[serde(default = "default_true")]
-    pub(crate) armed: bool,
+    pub armed: bool,
     /// Enables MCP tool-call loop path (spawn_agent, send_message, etc.)
     #[serde(default)]
-    pub(crate) is_manager: bool,
+    pub is_manager: bool,
     /// Runtime pause flag — not persisted to config.
     #[serde(default, skip_serializing)]
-    pub(crate) paused: bool,
+    pub paused: bool,
 }
 
 /// Replaces Connection. Backward-compatible via #[serde(default)].
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct RoutingRule {
-    pub(crate) from: String,
-    pub(crate) to: String,
+pub struct RoutingRule {
+    pub from: String,
+    pub to: String,
     /// Execution order among siblings: lower = called first. Default 128.
     #[serde(default = "default_priority")]
-    pub(crate) priority: u8,
+    pub priority: u8,
     /// Optional substring that must appear in the outgoing message for this route to fire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) condition: Option<String>,
+    pub condition: Option<String>,
     #[serde(default = "default_true")]
-    pub(crate) enabled: bool,
+    pub enabled: bool,
 }
 
 /// Sandbox policy for command-executing tools (bash, REPL, PowerShell, TaskCreate).
@@ -363,25 +407,25 @@ pub(crate) struct RoutingRule {
 /// Matching is prefix-based (the command starts with the entry string).
 /// An empty `allowlist` means "allow all" (unless the denylist says otherwise).
 #[derive(Clone, Serialize, Deserialize, Default)]
-pub(crate) struct CommandPolicy {
+pub struct CommandPolicy {
     /// Commands (or prefixes) that are always blocked.
     #[serde(default)]
-    pub(crate) denylist: Vec<String>,
+    pub denylist: Vec<String>,
     /// If non-empty, only commands matching one of these prefixes are allowed.
     #[serde(default)]
-    pub(crate) allowlist: Vec<String>,
+    pub allowlist: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct RedundancyDetectionConfig {
+pub struct RedundancyDetectionConfig {
     #[serde(default = "default_redundancy_enabled")]
-    pub(crate) enabled: bool,
+    pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) embedding_model_key: Option<String>,
+    pub embedding_model_key: Option<String>,
     #[serde(default = "default_semantic_similarity_threshold")]
-    pub(crate) semantic_similarity_threshold: f32,
+    pub semantic_similarity_threshold: f32,
     #[serde(default = "default_max_redundant_audit_retries")]
-    pub(crate) max_redundant_audit_retries: u8,
+    pub max_redundant_audit_retries: u8,
 }
 
 impl Default for RedundancyDetectionConfig {
@@ -396,13 +440,13 @@ impl Default for RedundancyDetectionConfig {
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct BudgetHitSummarizationConfig {
+pub struct BudgetHitSummarizationConfig {
     #[serde(default = "default_budget_summarization_enabled")]
-    pub(crate) enabled: bool,
+    pub enabled: bool,
     #[serde(default = "default_budget_summarization_prompt")]
-    pub(crate) prompt: String,
+    pub prompt: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) model_key: Option<String>,
+    pub model_key: Option<String>,
 }
 
 impl Default for BudgetHitSummarizationConfig {
@@ -416,26 +460,76 @@ impl Default for BudgetHitSummarizationConfig {
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct RunBudgetsConfig {
+pub struct FinalizerConfig {
+    #[serde(default = "default_finalizer_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_finalizer_agent_name")]
+    pub agent_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_key: Option<String>,
+    #[serde(default = "default_finalizer_prompt_completion")]
+    pub prompt_completion: String,
+    #[serde(default = "default_finalizer_prompt_budget_stop")]
+    pub prompt_budget_stop: String,
+    #[serde(default = "default_finalizer_run_on_completion")]
+    pub run_on_completion: bool,
+    #[serde(default = "default_finalizer_run_on_budget_stop")]
+    pub run_on_budget_stop: bool,
+    #[serde(default = "default_finalizer_include_internal_transcript")]
+    pub include_internal_transcript: bool,
+    #[serde(default = "default_finalizer_include_worker_outputs")]
+    pub include_worker_outputs: bool,
+    #[serde(default = "default_finalizer_include_command_history")]
+    pub include_command_history: bool,
+    #[serde(default = "default_finalizer_include_run_dossier")]
+    pub include_run_dossier: bool,
+    #[serde(default = "default_finalizer_max_transcript_chars")]
+    pub max_transcript_chars: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+}
+
+impl Default for FinalizerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            agent_name: default_finalizer_agent_name(),
+            model_key: None,
+            prompt_completion: default_finalizer_prompt_completion(),
+            prompt_budget_stop: default_finalizer_prompt_budget_stop(),
+            run_on_completion: default_finalizer_run_on_completion(),
+            run_on_budget_stop: default_finalizer_run_on_budget_stop(),
+            include_internal_transcript: default_finalizer_include_internal_transcript(),
+            include_worker_outputs: default_finalizer_include_worker_outputs(),
+            include_command_history: default_finalizer_include_command_history(),
+            include_run_dossier: default_finalizer_include_run_dossier(),
+            max_transcript_chars: default_finalizer_max_transcript_chars(),
+            prompt: None,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunBudgetsConfig {
     #[serde(default = "default_run_budgets_enabled")]
-    pub(crate) enabled: bool,
+    pub enabled: bool,
     #[serde(default = "default_run_budget_llm_calls")]
-    pub(crate) llm_calls_per_window: u32,
+    pub llm_calls_per_window: u32,
     #[serde(default = "default_run_budget_tool_calls")]
-    pub(crate) tool_calls_per_window: u32,
+    pub tool_calls_per_window: u32,
     #[serde(default = "default_run_budget_spawned_agents")]
-    pub(crate) spawned_agents_per_window: u32,
+    pub spawned_agents_per_window: u32,
     #[serde(default = "default_run_budget_streamed_tokens")]
-    pub(crate) streamed_tokens_per_window: u64,
+    pub streamed_tokens_per_window: u64,
     #[serde(default = "default_run_budget_wall_clock_seconds")]
-    pub(crate) wall_clock_seconds_per_window: u64,
+    pub wall_clock_seconds_per_window: u64,
     #[serde(default = "default_run_budget_behaviors")]
-    pub(crate) applies_to_behaviors: Vec<String>,
+    pub applies_to_behaviors: Vec<String>,
     /// What to do when a soft budget is hit: "pause" | "summarize" | "stop"
     #[serde(default = "default_on_limit")]
-    pub(crate) on_limit: String,
+    pub on_limit: String,
     #[serde(default)]
-    pub(crate) summarization: BudgetHitSummarizationConfig,
+    pub summarization: BudgetHitSummarizationConfig,
 }
 
 impl Default for RunBudgetsConfig {
@@ -456,7 +550,7 @@ impl Default for RunBudgetsConfig {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum AuditEvidenceGrade {
+pub enum AuditEvidenceGrade {
     Inferred,
     CommandOnly,
     ConfigContent,
@@ -464,15 +558,15 @@ pub(crate) enum AuditEvidenceGrade {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub(crate) struct CoverageManifestConfig {
+pub struct CoverageManifestConfig {
     #[serde(default = "default_coverage_manifest_enabled")]
-    pub(crate) enabled: bool,
+    pub enabled: bool,
     #[serde(default = "default_coverage_manifest_require_resolution")]
-    pub(crate) require_resolution: bool,
+    pub require_resolution: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) unresolved_prompt: Option<String>,
+    pub unresolved_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) gap_section_label: Option<String>,
+    pub gap_section_label: Option<String>,
 }
 
 impl Default for CoverageManifestConfig {
@@ -487,24 +581,24 @@ impl Default for CoverageManifestConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub(crate) struct SectionRule {
-    pub(crate) section_name: String,
+pub struct SectionRule {
+    pub section_name: String,
     #[serde(default)]
-    pub(crate) require_file_reference: bool,
+    pub require_file_reference: bool,
     #[serde(default)]
-    pub(crate) disallow_template_phrases: Vec<String>,
+    pub disallow_template_phrases: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) rewrite_loop_prompt: Option<String>,
+    pub rewrite_loop_prompt: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub(crate) struct ResponseRewriteConfig {
+pub struct ResponseRewriteConfig {
     #[serde(default = "default_response_rewrite_enabled")]
-    pub(crate) enabled: bool,
+    pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) min_evidence_grade_for_severity: Option<AuditEvidenceGrade>,
+    pub min_evidence_grade_for_severity: Option<AuditEvidenceGrade>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) rewrite_prompt: Option<String>,
+    pub rewrite_prompt: Option<String>,
 }
 
 impl Default for ResponseRewriteConfig {
@@ -518,15 +612,15 @@ impl Default for ResponseRewriteConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub(crate) struct EvidenceGradingConfig {
+pub struct EvidenceGradingConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) min_grade_to_synthesize: Option<AuditEvidenceGrade>,
+    pub min_grade_to_synthesize: Option<AuditEvidenceGrade>,
     #[serde(default)]
-    pub(crate) code_signals: Vec<String>,
+    pub code_signals: Vec<String>,
     #[serde(default)]
-    pub(crate) config_signals: Vec<String>,
+    pub config_signals: Vec<String>,
     #[serde(default)]
-    pub(crate) command_signals: Vec<String>,
+    pub command_signals: Vec<String>,
 }
 
 impl Default for EvidenceGradingConfig {
@@ -541,21 +635,21 @@ impl Default for EvidenceGradingConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub(crate) struct ForceSynthesisConfig {
+pub struct ForceSynthesisConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) after_n_completed_reports: Option<usize>,
+    pub after_n_completed_reports: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) after_n_issue_reports: Option<usize>,
+    pub after_n_issue_reports: Option<usize>,
     #[serde(default = "default_force_synthesis_require_coverage_gap_signal")]
-    pub(crate) require_coverage_gap_signal: bool,
+    pub require_coverage_gap_signal: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) min_targeted_topics: Option<usize>,
+    pub min_targeted_topics: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) min_evidence_backed_topics: Option<usize>,
+    pub min_evidence_backed_topics: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) prompt: Option<String>,
+    pub prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) fallback_text: Option<String>,
+    pub fallback_text: Option<String>,
 }
 
 impl Default for ForceSynthesisConfig {
@@ -573,13 +667,13 @@ impl Default for ForceSynthesisConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub(crate) struct DelegationValidationConfig {
+pub struct DelegationValidationConfig {
     #[serde(default = "default_delegation_validation_enabled")]
-    pub(crate) enabled: bool,
+    pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) max_weak_retries: Option<usize>,
+    pub max_weak_retries: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) retry_prompt_template: Option<String>,
+    pub retry_prompt_template: Option<String>,
 }
 
 impl Default for DelegationValidationConfig {
@@ -593,60 +687,60 @@ impl Default for DelegationValidationConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
-pub(crate) struct ToolBurstReflectionConfig {
+pub struct ToolBurstReflectionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) limit: Option<usize>,
+    pub limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) prompt: Option<String>,
+    pub prompt: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
-pub(crate) struct NonProgressConfig {
+pub struct NonProgressConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) limit: Option<usize>,
+    pub limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) stall_prompt: Option<String>,
+    pub stall_prompt: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct BehaviorTriggerConfig {
-    pub(crate) behavior_id: String,
+pub struct BehaviorTriggerConfig {
+    pub behavior_id: String,
     #[serde(default = "default_true")]
-    pub(crate) enabled: bool,
+    pub enabled: bool,
     #[serde(default)]
-    pub(crate) keyword_triggers: Vec<String>,
+    pub keyword_triggers: Vec<String>,
     #[serde(default)]
-    pub(crate) embedding_trigger_phrases: Vec<String>,
+    pub embedding_trigger_phrases: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) similarity_threshold: Option<f32>,
+    pub similarity_threshold: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) system_prompt_injection: Option<String>,
+    pub system_prompt_injection: Option<String>,
     #[serde(default = "default_runtime_note_enabled")]
-    pub(crate) runtime_note_enabled: bool,
+    pub runtime_note_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) runtime_note_template: Option<String>,
+    pub runtime_note_template: Option<String>,
     #[serde(default)]
-    pub(crate) coverage_manifest: CoverageManifestConfig,
+    pub coverage_manifest: CoverageManifestConfig,
     #[serde(default)]
-    pub(crate) required_sections: Vec<String>,
+    pub required_sections: Vec<String>,
     #[serde(default)]
-    pub(crate) section_rules: Vec<SectionRule>,
+    pub section_rules: Vec<SectionRule>,
     #[serde(default)]
-    pub(crate) response_rewrite: ResponseRewriteConfig,
+    pub response_rewrite: ResponseRewriteConfig,
     #[serde(default)]
-    pub(crate) evidence_grading: EvidenceGradingConfig,
+    pub evidence_grading: EvidenceGradingConfig,
     #[serde(default)]
-    pub(crate) force_synthesis: ForceSynthesisConfig,
+    pub force_synthesis: ForceSynthesisConfig,
     #[serde(default)]
-    pub(crate) delegation_validation: DelegationValidationConfig,
+    pub delegation_validation: DelegationValidationConfig,
     #[serde(default)]
-    pub(crate) tool_burst_reflection: ToolBurstReflectionConfig,
+    pub tool_burst_reflection: ToolBurstReflectionConfig,
     #[serde(default)]
-    pub(crate) non_progress: NonProgressConfig,
+    pub non_progress: NonProgressConfig,
 }
 
 impl BehaviorTriggerConfig {
-    pub(crate) fn default_grounded_audit() -> Self {
+    pub fn default_grounded_audit() -> Self {
         Self {
             behavior_id: GROUNDED_AUDIT_BEHAVIOR_ID.to_string(),
             enabled: true,
@@ -700,7 +794,7 @@ impl BehaviorTriggerConfig {
         }
     }
 
-    pub(crate) fn has_audit_payload(&self) -> bool {
+    pub fn has_audit_payload(&self) -> bool {
         self.system_prompt_injection.is_some()
             || self.runtime_note_enabled
             || self.runtime_note_template.is_some()
@@ -717,19 +811,19 @@ impl BehaviorTriggerConfig {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ResolvedAuditBehaviorConfig {
-    pub(crate) system_prompt_injection: Option<String>,
-    pub(crate) runtime_note_enabled: bool,
-    pub(crate) runtime_note_template: Option<String>,
-    pub(crate) coverage_manifest: CoverageManifestConfig,
-    pub(crate) required_sections: Vec<String>,
-    pub(crate) section_rules: Vec<SectionRule>,
-    pub(crate) response_rewrite: ResponseRewriteConfig,
-    pub(crate) evidence_grading: EvidenceGradingConfig,
-    pub(crate) force_synthesis: ForceSynthesisConfig,
-    pub(crate) delegation_validation: DelegationValidationConfig,
-    pub(crate) tool_burst_reflection: ToolBurstReflectionConfig,
-    pub(crate) non_progress: NonProgressConfig,
+pub struct ResolvedAuditBehaviorConfig {
+    pub system_prompt_injection: Option<String>,
+    pub runtime_note_enabled: bool,
+    pub runtime_note_template: Option<String>,
+    pub coverage_manifest: CoverageManifestConfig,
+    pub required_sections: Vec<String>,
+    pub section_rules: Vec<SectionRule>,
+    pub response_rewrite: ResponseRewriteConfig,
+    pub evidence_grading: EvidenceGradingConfig,
+    pub force_synthesis: ForceSynthesisConfig,
+    pub delegation_validation: DelegationValidationConfig,
+    pub tool_burst_reflection: ToolBurstReflectionConfig,
+    pub non_progress: NonProgressConfig,
 }
 
 impl Default for ResolvedAuditBehaviorConfig {
@@ -752,7 +846,7 @@ impl Default for ResolvedAuditBehaviorConfig {
 }
 
 impl ResolvedAuditBehaviorConfig {
-    pub(crate) fn gap_section_label(&self) -> &str {
+    pub fn gap_section_label(&self) -> &str {
         self.coverage_manifest
             .gap_section_label
             .as_deref()
@@ -914,7 +1008,7 @@ fn merge_behavior_into_audit_config(
     );
 }
 
-pub(crate) fn resolve_audit_behavior_config(
+pub fn resolve_audit_behavior_config(
     active_behaviors: &HashSet<String>,
     config: &BehaviorTriggersConfig,
 ) -> Option<ResolvedAuditBehaviorConfig> {
@@ -936,15 +1030,15 @@ pub(crate) fn resolve_audit_behavior_config(
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct BehaviorTriggersConfig {
+pub struct BehaviorTriggersConfig {
     #[serde(default = "default_behavior_triggers_enabled")]
-    pub(crate) enabled: bool,
+    pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) embedding_model_key: Option<String>,
+    pub embedding_model_key: Option<String>,
     #[serde(default = "default_behavior_similarity_threshold")]
-    pub(crate) default_similarity_threshold: f32,
+    pub default_similarity_threshold: f32,
     #[serde(default = "default_behavior_trigger_entries")]
-    pub(crate) behaviors: Vec<BehaviorTriggerConfig>,
+    pub behaviors: Vec<BehaviorTriggerConfig>,
 }
 
 fn default_behavior_trigger_entries() -> Vec<BehaviorTriggerConfig> {
@@ -963,19 +1057,21 @@ impl Default for BehaviorTriggersConfig {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct AgentConfig {
+pub struct AgentConfig {
     #[serde(default = "default_theme")]
-    pub(crate) theme: String,
-    pub(crate) agents: Vec<Agent>,
-    pub(crate) connections: Vec<RoutingRule>,
+    pub theme: String,
+    pub agents: Vec<Agent>,
+    pub connections: Vec<RoutingRule>,
     #[serde(default)]
-    pub(crate) command_policy: CommandPolicy,
+    pub command_policy: CommandPolicy,
     #[serde(default)]
-    pub(crate) redundancy_detection: RedundancyDetectionConfig,
+    pub redundancy_detection: RedundancyDetectionConfig,
     #[serde(default)]
-    pub(crate) behavior_triggers: BehaviorTriggersConfig,
+    pub behavior_triggers: BehaviorTriggersConfig,
     #[serde(default)]
-    pub(crate) run_budgets: RunBudgetsConfig,
+    pub run_budgets: RunBudgetsConfig,
+    #[serde(default)]
+    pub finalizer: FinalizerConfig,
 }
 
 impl Default for AgentConfig {
@@ -1001,6 +1097,7 @@ impl Default for AgentConfig {
             redundancy_detection: RedundancyDetectionConfig::default(),
             behavior_triggers: BehaviorTriggersConfig::default(),
             run_budgets: RunBudgetsConfig::default(),
+            finalizer: FinalizerConfig::default(),
         }
     }
 }
