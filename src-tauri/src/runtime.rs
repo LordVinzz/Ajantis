@@ -188,7 +188,7 @@ impl RuntimeHandle {
             return Ok(None);
         }
         #[cfg(not(target_os = "macos"))]
-        pick_folder_blocking()
+        crate::workspace::pick_folder_blocking()
     }
 }
 
