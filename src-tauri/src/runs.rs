@@ -78,6 +78,7 @@ pub(crate) struct RunLimitHit {
 pub(crate) struct PausedRunState {
     pub(crate) agent_id: String,
     pub(crate) model_key: String,
+    #[allow(dead_code)]
     pub(crate) system_prompt: String,
     pub(crate) messages: Vec<Value>,
     pub(crate) allowed_tools: Option<Vec<String>>,
@@ -86,11 +87,13 @@ pub(crate) struct PausedRunState {
     pub(crate) context_limit: Option<u64>,
     pub(crate) glob_ready: bool,
     pub(crate) active_behaviors: HashSet<String>,
+    #[allow(dead_code)]
     pub(crate) usage: RunWindowUsage,
     pub(crate) limit_hit: RunLimitHit,
 }
 
 pub(crate) struct ActiveRunState {
+    #[allow(dead_code)]
     pub(crate) run_id: String,
     pub(crate) workspace_id: Option<String>,
     pub(crate) thread_id: Option<String>,

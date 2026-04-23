@@ -25,6 +25,7 @@ pub(crate) struct AppState {
     /// Shared with McpState so all MCP tool file/command ops are sandboxed to it.
     pub(crate) active_workspace: Arc<Mutex<PathBuf>>,
     pub(crate) mcp_tools: Vec<McpTool>,
+    #[allow(dead_code)]
     pub(crate) todo_list: Arc<Mutex<Vec<Value>>>,
     pub(crate) agent_config: Arc<Mutex<AgentConfig>>,
     pub(crate) memory_pool: Arc<Mutex<MemoryPool>>,
@@ -35,6 +36,8 @@ pub(crate) struct AppState {
     /// Shared with McpState so MCP tool handlers can emit stream events to the frontend or TUI.
     pub(crate) event_channel: Arc<Mutex<Option<SharedEventSink>>>,
     pub(crate) active_runs: ActiveRuns,
+    /// Run-scoped key-value scratchpad — cleared at run start, never written to disk.
+    pub(crate) scratchpad: Arc<Mutex<std::collections::HashMap<String, String>>>,
     pub(crate) pending_thread_snapshots:
         Arc<Mutex<std::collections::HashMap<String, ThreadSnapshot>>>,
     pub(crate) pending_thread_snapshot_versions: Arc<Mutex<std::collections::HashMap<String, u64>>>,

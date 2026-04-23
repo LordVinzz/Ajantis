@@ -11,8 +11,12 @@ use crate::config_persistence::{
 pub use crate::event_sink::{callback_event_sink, SharedEventSink};
 use crate::mcp::{load_tools_embedded, start_mcp_server, McpState};
 pub use crate::memory::{CommandExecution, CommandHistory, MemoryEntry, MemoryPool};
-pub use crate::models::{LoadConfig, LoadedModelInfo, ModelInfo};
-use crate::models::{fetch_loaded_models, fetch_models, load_model, unload_model};
+pub use crate::agent_config::BackendInstance;
+pub use crate::models::{BackendDetected, LoadConfig, LoadedModelInfo, ModelInfo};
+use crate::models::{
+    detect_backend_capabilities, discover_backend_instances, fetch_loaded_models, fetch_models,
+    load_model, unload_model,
+};
 use crate::routing::{
     cancel_route_run_for_state, continue_route_run_for_state, route_message_for_state,
 };
@@ -23,7 +27,7 @@ pub use crate::workspace::{
     WorkspaceToolCall,
 };
 use crate::workspace::{
-    load_thread_snapshot_from_disk, load_workspace_config_from_disk, pick_folder_blocking,
+    load_thread_snapshot_from_disk, load_workspace_config_from_disk,
     queue_thread_snapshot_save_for_state, save_thread_snapshot_to_disk,
     save_workspace_config_to_disk, set_active_workspace_path,
 };
@@ -126,6 +130,18 @@ impl RuntimeHandle {
         unload_model(instance_id).await
     }
 
+    pub async fn detect_backend(
+        &self,
+        base_url: String,
+        backend_type: String,
+    ) -> BackendDetected {
+        detect_backend_capabilities(&base_url, &backend_type).await
+    }
+
+    pub async fn discover_instances(&self) -> Vec<BackendInstance> {
+        discover_backend_instances().await
+    }
+
     pub async fn route_message(
         &self,
         from_agent_id: String,
@@ -154,6 +170,24 @@ impl RuntimeHandle {
     }
 
     pub fn pick_folder_blocking(&self) -> Result<Option<String>, String> {
+        // On macOS, rfd opens an NSOpenPanel in-process without a proper AppKit run loop,
+        // which leaves the OS spinning cursor stuck at the dialog's screen position after
+        // the dialog closes. osascript runs as a separate process with its own event loop
+        // so macOS cleans up cursor state properly.
+        #[cfg(target_os = "macos")]
+        {
+            let output = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg("POSIX path of (choose folder with prompt \"Choose a workspace folder\")")
+                .output()
+                .map_err(|e| format!("Failed to launch folder picker: {}", e))?;
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim_end_matches('\n').to_string();
+                return Ok(if path.is_empty() { None } else { Some(path) });
+            }
+            return Ok(None);
+        }
+        #[cfg(not(target_os = "macos"))]
         pick_folder_blocking()
     }
 }
@@ -174,6 +208,8 @@ fn build_runtime_state(workspace_root: PathBuf) -> Arc<AppState> {
     let behavior_trigger_cache_arc = Arc::new(Mutex::new(BehaviorTriggerCache::default()));
     let active_behavior_contexts_arc = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let active_runs_arc = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let scratchpad_arc: Arc<Mutex<std::collections::HashMap<String, String>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
     let pending_thread_snapshots_arc = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let pending_thread_snapshot_versions_arc =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
@@ -194,6 +230,7 @@ fn build_runtime_state(workspace_root: PathBuf) -> Arc<AppState> {
         behavior_trigger_cache: behavior_trigger_cache_arc,
         active_behavior_contexts: active_behavior_contexts_arc,
         active_runs: active_runs_arc.clone(),
+        scratchpad: scratchpad_arc.clone(),
     });
 
     Arc::new(AppState {
@@ -213,6 +250,7 @@ fn build_runtime_state(workspace_root: PathBuf) -> Arc<AppState> {
         mcp_state: mcp_state.clone(),
         event_channel: mcp_state.event_channel.clone(),
         active_runs: active_runs_arc,
+        scratchpad: scratchpad_arc,
         pending_thread_snapshots: pending_thread_snapshots_arc,
         pending_thread_snapshot_versions: pending_thread_snapshot_versions_arc,
     })

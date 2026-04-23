@@ -1,5 +1,4 @@
 {
-  
   "tools": [
     {
       "function": {
@@ -724,7 +723,11 @@
           "properties": {
             "action": {
               "description": "The action to perform: 'list' (recent entries), 'search' (find by query), or 'count' (total entries).",
-              "enum": ["list", "search", "count"],
+              "enum": [
+                "list",
+                "search",
+                "count"
+              ],
               "type": "string"
             },
             "query": {
@@ -737,11 +740,90 @@
               "type": "integer"
             }
           },
-          "required": ["action"],
+          "required": [
+            "action"
+          ],
           "type": "object"
         }
       },
       "type": "function"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "scratchpad_write",
+        "description": "Write a value to the run-scoped in-RAM scratchpad under a named key. The scratchpad is cleared at the start of each run and never written to disk. Use it to pass large outputs between agents by reference instead of inlining them in messages.",
+        "parameters": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "key",
+            "content"
+          ],
+          "properties": {
+            "key": {
+              "type": "string",
+              "description": "Identifier for this scratchpad entry (e.g. 'phase1_analysis', 'arch_proposal')."
+            },
+            "content": {
+              "type": "string",
+              "description": "The content to store."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "scratchpad_read",
+        "description": "Read a value from the run-scoped in-RAM scratchpad by key.",
+        "parameters": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "key"
+          ],
+          "properties": {
+            "key": {
+              "type": "string",
+              "description": "The key to read."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "scratchpad_list",
+        "description": "List all keys currently stored in the run-scoped in-RAM scratchpad, with their sizes.",
+        "parameters": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "scratchpad_delete",
+        "description": "Delete a key from the run-scoped in-RAM scratchpad to free memory.",
+        "parameters": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "key"
+          ],
+          "properties": {
+            "key": {
+              "type": "string",
+              "description": "The key to delete."
+            }
+          }
+        }
+      }
     },
     {
       "function": {
@@ -839,6 +921,53 @@
     },
     {
       "function": {
+        "description": "Spawn multiple agents and run them all in parallel, waiting for every one to finish before returning. Each entry in the 'agents' array defines a worker (role, system_prompt, message). Requires parallel inference to be enabled in Global Policy. The number of agents must not exceed the configured max_parallel_agents limit. The manager is blocked until all workers complete.",
+        "name": "send_parallel",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "agents": {
+              "description": "List of agents to spawn and run concurrently. Each entry must include role, system_prompt, and message.",
+              "type": "array",
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "role": {
+                    "description": "Short label for the agent's responsibility (e.g. 'analyzer', 'coder').",
+                    "type": "string"
+                  },
+                  "system_prompt": {
+                    "description": "Full system instruction defining the agent's persona and constraints.",
+                    "type": "string"
+                  },
+                  "initial_message": {
+                    "description": "Task message to send to the agent as its first user turn.",
+                    "type": "string"
+                  },
+                  "model": {
+                    "description": "Local LM Studio model key. Defaults to the caller's model if omitted.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "role",
+                  "system_prompt",
+                  "initial_message"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": [
+            "agents"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
         "description": "Read the conversation history of a specific agent, including estimated remaining context budget. Managers may inspect any agent; non-managers may inspect only themselves.",
         "name": "read_agent_messages",
         "parameters": {
@@ -851,7 +980,11 @@
             "roles": {
               "description": "Filter by message role(s). Options: 'user', 'assistant', 'tool'. Omit to return all roles.",
               "items": {
-                "enum": ["user", "assistant", "tool"],
+                "enum": [
+                  "user",
+                  "assistant",
+                  "tool"
+                ],
                 "type": "string"
               },
               "type": "array"
@@ -885,7 +1018,13 @@
             "status_filter": {
               "description": "Only return agents in these states. Options: 'running', 'idle', 'paused', 'done', 'error'. Omit for all.",
               "items": {
-                "enum": ["running", "idle", "paused", "done", "error"],
+                "enum": [
+                  "running",
+                  "idle",
+                  "paused",
+                  "done",
+                  "error"
+                ],
                 "type": "string"
               },
               "type": "array"
@@ -990,7 +1129,7 @@
         "name": "broadcast_message",
         "parameters": {
           "additionalProperties": false,
-        "properties": {
+          "properties": {
             "agent_ids": {
               "description": "List of agent IDs to receive the message. Pass ['*'] to target every active agent.",
               "items": {
@@ -1003,10 +1142,10 @@
               "description": "Text content of the message to send to all targets.",
               "type": "string"
             },
-          "await_reply": {
-            "description": "If true, wait for all agents to respond before returning. Defaults to true.",
-            "type": "boolean"
-          },
+            "await_reply": {
+              "description": "If true, wait for all agents to respond before returning. Defaults to true.",
+              "type": "boolean"
+            },
             "timeout_ms": {
               "description": "Maximum milliseconds to wait per agent when await_reply is true.",
               "minimum": 100,
@@ -1080,7 +1219,11 @@
             },
             "format": {
               "description": "Output format for the aggregated result: 'raw' (list of outputs), 'summary' (prose), or 'structured' (JSON object keyed by agent_id).",
-              "enum": ["raw", "summary", "structured"],
+              "enum": [
+                "raw",
+                "summary",
+                "structured"
+              ],
               "type": "string"
             }
           },
@@ -1117,7 +1260,10 @@
               "description": "Optional instruction to append after the content (e.g. 'Be concise.')."
             }
           },
-          "required": ["content", "to_agent_id"]
+          "required": [
+            "content",
+            "to_agent_id"
+          ]
         }
       }
     }

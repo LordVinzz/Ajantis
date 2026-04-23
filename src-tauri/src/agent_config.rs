@@ -7,11 +7,6 @@ use crate::helpers::{default_priority, default_true};
 pub const MIN_SEMANTIC_SIMILARITY_THRESHOLD: f32 = 0.85;
 pub const MAX_SEMANTIC_SIMILARITY_THRESHOLD: f32 = 0.99;
 pub const GROUNDED_AUDIT_BEHAVIOR_ID: &str = "grounded_audit";
-pub const DEFAULT_THEME: &str = "win98";
-
-fn default_theme() -> String {
-    DEFAULT_THEME.to_string()
-}
 
 fn default_redundancy_enabled() -> bool {
     true
@@ -505,6 +500,79 @@ impl Default for FinalizerConfig {
             include_run_dossier: default_finalizer_include_run_dossier(),
             max_transcript_chars: default_finalizer_max_transcript_chars(),
             prompt: None,
+        }
+    }
+}
+
+fn default_backend_type() -> String {
+    "lm_studio".to_string()
+}
+fn default_backend_url() -> String {
+    "http://localhost:1234".to_string()
+}
+
+/// A single running backend server instance (used when a backend like llama.cpp
+/// only loads one model at a time and multiple instances are needed).
+#[derive(Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct BackendInstance {
+    pub url: String,
+    /// The model loaded in this instance (display hint, not enforced).
+    pub model_hint: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackendConfig {
+    #[serde(default = "default_backend_type")]
+    pub backend_type: String,
+    #[serde(default = "default_backend_url")]
+    pub base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// Additional instances beyond the primary (for multi-model llama.cpp setups).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_instances: Vec<BackendInstance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_parallel_slots: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detected_features: Vec<String>,
+}
+
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self {
+            backend_type: default_backend_type(),
+            base_url: default_backend_url(),
+            api_key: None,
+            extra_instances: vec![],
+            detected_version: None,
+            detected_model: None,
+            detected_parallel_slots: None,
+            detected_features: vec![],
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+pub struct ParallelInferenceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_parallel_inference_max_agents")]
+    pub max_parallel_agents: u32,
+}
+
+fn default_parallel_inference_max_agents() -> u32 {
+    4
+}
+
+impl Default for ParallelInferenceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_parallel_agents: 4,
         }
     }
 }
@@ -1058,8 +1126,6 @@ impl Default for BehaviorTriggersConfig {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
-    #[serde(default = "default_theme")]
-    pub theme: String,
     pub agents: Vec<Agent>,
     pub connections: Vec<RoutingRule>,
     #[serde(default)]
@@ -1072,12 +1138,15 @@ pub struct AgentConfig {
     pub run_budgets: RunBudgetsConfig,
     #[serde(default)]
     pub finalizer: FinalizerConfig,
+    #[serde(default)]
+    pub parallel_inference: ParallelInferenceConfig,
+    #[serde(default)]
+    pub backend: BackendConfig,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         AgentConfig {
-            theme: default_theme(),
             agents: vec![Agent {
                 id: "user".to_string(),
                 name: "User".to_string(),
@@ -1098,6 +1167,8 @@ impl Default for AgentConfig {
             behavior_triggers: BehaviorTriggersConfig::default(),
             run_budgets: RunBudgetsConfig::default(),
             finalizer: FinalizerConfig::default(),
+            parallel_inference: ParallelInferenceConfig::default(),
+            backend: BackendConfig::default(),
         }
     }
 }

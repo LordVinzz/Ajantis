@@ -56,6 +56,8 @@ pub fn run() {
     let behavior_trigger_cache_arc = Arc::new(Mutex::new(BehaviorTriggerCache::default()));
     let active_behavior_contexts_arc = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let active_runs_arc = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let scratchpad_arc: Arc<Mutex<std::collections::HashMap<String, String>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
     let pending_thread_snapshots_arc = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let pending_thread_snapshot_versions_arc =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
@@ -76,6 +78,7 @@ pub fn run() {
         behavior_trigger_cache: behavior_trigger_cache_arc,
         active_behavior_contexts: active_behavior_contexts_arc,
         active_runs: active_runs_arc.clone(),
+        scratchpad: scratchpad_arc.clone(),
     });
 
     let app_state = Arc::new(AppState {
@@ -95,6 +98,7 @@ pub fn run() {
         mcp_state: mcp_state.clone(),
         event_channel: mcp_state.event_channel.clone(),
         active_runs: active_runs_arc,
+        scratchpad: scratchpad_arc,
         pending_thread_snapshots: pending_thread_snapshots_arc,
         pending_thread_snapshot_versions: pending_thread_snapshot_versions_arc,
     });

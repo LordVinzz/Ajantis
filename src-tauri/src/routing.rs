@@ -188,6 +188,9 @@ pub(crate) async fn route_message_for_state(
         Err(_) => HashMap::new(),
     };
 
+    // Clear the run-scoped scratchpad so each run starts with a blank slate.
+    state.mcp_state.scratchpad.lock().unwrap().clear();
+
     // Make the channel available to MCP tool handlers (e.g. send_message can emit sub-agent bubbles)
     *state.event_channel.lock().unwrap() = Some(on_event.clone());
     state.active_runs.lock().unwrap().insert(

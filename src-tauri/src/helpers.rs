@@ -1,23 +1,91 @@
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use serde_json::Value;
 
 use crate::agent_config::{
-    BehaviorTriggerConfig, BehaviorTriggersConfig, GROUNDED_AUDIT_BEHAVIOR_ID,
+    BackendConfig, BehaviorTriggerConfig, BehaviorTriggersConfig, GROUNDED_AUDIT_BEHAVIOR_ID,
 };
 use crate::memory::{CommandHistory, COMMAND_HISTORY_CONTEXT_LIMIT};
 use crate::models::create_embeddings;
 use crate::state::BehaviorTriggerCache;
 
-pub(crate) fn lm_base_url() -> String {
-    let url = std::env::var("LM_STUDIO_URL")
-        .unwrap_or_else(|_| "http://localhost:1234/api/v1/chat".to_string());
+// ── Global backend configuration ─────────────────────────────────────────────
+
+struct BackendGlobal {
+    base_url: String,
+    backend_type: String,
+    api_key: Option<String>,
+    /// Extra backend instances as (url, backend_type) pairs.
+    extra_instances: Vec<(String, String)>,
+}
+
+static BACKEND: OnceLock<RwLock<BackendGlobal>> = OnceLock::new();
+
+fn backend_global() -> &'static RwLock<BackendGlobal> {
+    BACKEND.get_or_init(|| {
+        RwLock::new(BackendGlobal {
+            base_url: "http://localhost:1234".to_string(),
+            backend_type: "lm_studio".to_string(),
+            api_key: None,
+            extra_instances: vec![],
+        })
+    })
+}
+
+pub(crate) fn sync_backend_global(cfg: &BackendConfig) {
+    if let Ok(mut g) = backend_global().write() {
+        g.base_url = normalize_backend_url(&cfg.base_url);
+        g.backend_type = cfg.backend_type.clone();
+        g.api_key = cfg.api_key.clone();
+        g.extra_instances = cfg
+            .extra_instances
+            .iter()
+            .filter(|inst| !inst.url.is_empty())
+            .map(|inst| (normalize_backend_url(&inst.url), cfg.backend_type.clone()))
+            .collect();
+    }
+}
+
+pub(crate) fn backend_extra_instances() -> Vec<(String, String)> {
+    if let Ok(g) = backend_global().read() {
+        return g.extra_instances.clone();
+    }
+    vec![]
+}
+
+fn normalize_backend_url(url: &str) -> String {
     url.trim_end_matches('/')
         .trim_end_matches("/chat")
         .trim_end_matches("/v1")
         .trim_end_matches("/api")
         .to_string()
+}
+
+pub(crate) fn lm_base_url() -> String {
+    if let Ok(g) = backend_global().read() {
+        if !g.base_url.is_empty() {
+            return g.base_url.clone();
+        }
+    }
+    // Env var fallback for backwards compatibility.
+    let url = std::env::var("LM_STUDIO_URL")
+        .unwrap_or_else(|_| "http://localhost:1234".to_string());
+    normalize_backend_url(&url)
+}
+
+pub(crate) fn backend_type() -> String {
+    if let Ok(g) = backend_global().read() {
+        return g.backend_type.clone();
+    }
+    "lm_studio".to_string()
+}
+
+pub(crate) fn backend_api_key() -> Option<String> {
+    if let Ok(g) = backend_global().read() {
+        return g.api_key.clone();
+    }
+    None
 }
 
 pub(crate) fn default_true() -> bool {
@@ -258,6 +326,7 @@ pub(crate) fn is_manager_only_tool(name: &str) -> bool {
             | "fork_agent"
             | "aggregate_results"
             | "pipe_message"
+            | "send_parallel"
     )
 }
 

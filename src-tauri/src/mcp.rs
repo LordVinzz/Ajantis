@@ -45,6 +45,7 @@ pub(crate) struct AjantisTask {
 pub(crate) struct McpState {
     pub(crate) tools: Vec<McpTool>,
     /// Static root used as fallback when no workspace is selected.
+    #[allow(dead_code)]
     pub(crate) workspace_root: PathBuf,
     /// Dynamically updated to the selected workspace path.
     /// All file/command operations are sandboxed to this path.
@@ -71,6 +72,8 @@ pub(crate) struct McpState {
     pub(crate) active_behavior_contexts: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     /// Active routed runs available to tool handlers for event emission and resumption.
     pub(crate) active_runs: ActiveRuns,
+    /// Run-scoped key-value scratchpad — cleared at run start, never written to disk.
+    pub(crate) scratchpad: Arc<Mutex<HashMap<String, String>>>,
 }
 
 #[derive(Deserialize)]
@@ -559,6 +562,56 @@ pub(crate) async fn handle_tool_call(
                 )),
             }
         }
+        // ── Run-scoped scratchpad ─────────────────────────────────
+        "scratchpad_write" => {
+            let key = args["key"].as_str().unwrap_or("").trim().to_string();
+            let content = args["content"].as_str().unwrap_or("").to_string();
+            if key.is_empty() {
+                return mcp_error("Error: key is required.");
+            }
+            let mut pad = state.scratchpad.lock().unwrap();
+            let overwrite = pad.contains_key(&key);
+            pad.insert(key.clone(), content.clone());
+            let char_count = content.chars().count();
+            if overwrite {
+                mcp_ok(&format!("Scratchpad key '{}' updated ({} chars).", key, char_count))
+            } else {
+                mcp_ok(&format!("Scratchpad key '{}' written ({} chars).", key, char_count))
+            }
+        }
+        "scratchpad_read" => {
+            let key = args["key"].as_str().unwrap_or("").trim();
+            if key.is_empty() {
+                return mcp_error("Error: key is required.");
+            }
+            match state.scratchpad.lock().unwrap().get(key) {
+                Some(content) => mcp_ok(content),
+                None => mcp_error(&format!("Scratchpad key '{}' not found.", key)),
+            }
+        }
+        "scratchpad_list" => {
+            let pad = state.scratchpad.lock().unwrap();
+            if pad.is_empty() {
+                return mcp_ok("Scratchpad is empty.");
+            }
+            let lines: Vec<String> = pad
+                .iter()
+                .map(|(k, v)| format!("  {} ({} chars)", k, v.chars().count()))
+                .collect();
+            mcp_ok(&format!("Scratchpad keys:\n{}", lines.join("\n")))
+        }
+        "scratchpad_delete" => {
+            let key = args["key"].as_str().unwrap_or("").trim();
+            if key.is_empty() {
+                return mcp_error("Error: key is required.");
+            }
+            let removed = state.scratchpad.lock().unwrap().remove(key).is_some();
+            if removed {
+                mcp_ok(&format!("Scratchpad key '{}' deleted.", key))
+            } else {
+                mcp_error(&format!("Scratchpad key '{}' not found.", key))
+            }
+        }
         // ── Manager tools ─────────────────────────────────────────
         "spawn_agent" => {
             let role = args["role"].as_str().unwrap_or("worker");
@@ -644,6 +697,109 @@ pub(crate) async fn handle_tool_call(
                 Ok(payload) => mcp_ok(&payload),
                 Err(err) => mcp_error(&err),
             }
+        }
+        "send_parallel" => {
+            let (enabled, max_agents) = {
+                let config = state.agent_config.lock().unwrap();
+                (
+                    config.parallel_inference.enabled,
+                    config.parallel_inference.max_parallel_agents,
+                )
+            };
+            if !enabled {
+                return mcp_error(
+                    "Error: parallel inference is disabled. Enable it in Global Policy > Parallel inference.",
+                );
+            }
+            let Some(agents_arr) = args["agents"].as_array().cloned() else {
+                return mcp_error("Error: 'agents' array is required.");
+            };
+            if agents_arr.is_empty() {
+                return mcp_error("Error: 'agents' array must not be empty.");
+            }
+            if agents_arr.len() as u32 > max_agents {
+                return mcp_error(&format!(
+                    "Error: {} agents requested but max_parallel_agents limit is {}. Adjust in Global Policy > Parallel inference.",
+                    agents_arr.len(),
+                    max_agents
+                ));
+            }
+
+            // Spawn all agent records sequentially (lightweight, no inference).
+            let mut agent_tasks: Vec<(String, String)> = Vec::new();
+            for entry in &agents_arr {
+                let role = entry["role"].as_str().unwrap_or("worker");
+                let sys_prompt = entry["system_prompt"].as_str().unwrap_or("");
+                let model = entry["model"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                let message = entry["initial_message"].as_str().unwrap_or("").to_string();
+                match spawn_agent_record(
+                    state,
+                    caller_agent_id,
+                    role,
+                    sys_prompt,
+                    model,
+                    None,
+                    None,
+                )
+                .await
+                {
+                    Ok(agent_id) => agent_tasks.push((agent_id, message)),
+                    Err(err) => return mcp_error(&err),
+                }
+            }
+
+            // Credit spawned agents to the run budget.
+            if let Some(run_id) = primary_run_id(&state.active_runs) {
+                let mut runs = state.active_runs.lock().unwrap();
+                if let Some(run) = runs.get_mut(&run_id) {
+                    run.usage.spawned_agents =
+                        run.usage.spawned_agents.saturating_add(agent_tasks.len() as u32);
+                }
+            }
+
+            // Run all agents concurrently, waiting for every one to finish.
+            let inherited_behaviors = caller_active_behaviors(caller_agent_id, state);
+            let mut join_handles = Vec::new();
+            for (agent_id, message) in agent_tasks {
+                let state_clone = state.clone();
+                let behaviors_clone = inherited_behaviors.clone();
+                let handle: tokio::task::JoinHandle<(String, Result<String, String>)> =
+                    tokio::spawn(async move {
+                        let result = run_agent_turn(
+                            &state_clone,
+                            &agent_id,
+                            &message,
+                            true,
+                            behaviors_clone,
+                        )
+                        .await;
+                        (agent_id, result)
+                    });
+                join_handles.push(handle);
+            }
+
+            let mut results = Vec::new();
+            for handle in join_handles {
+                match handle.await {
+                    Ok((agent_id, Ok(reply))) => {
+                        results.push(json!({"agent_id": agent_id, "status": "ok", "reply": reply}))
+                    }
+                    Ok((agent_id, Err(err))) => {
+                        results.push(json!({"agent_id": agent_id, "status": "error", "error": err}))
+                    }
+                    Err(err) => {
+                        results.push(json!({"status": "error", "error": format!("Task panicked: {}", err)}))
+                    }
+                }
+            }
+
+            let payload =
+                serde_json::to_string(&json!({"results": results})).unwrap_or_default();
+            mcp_ok(&payload)
         }
         "read_agent_messages" => {
             let agent_id = args["agent_id"].as_str().unwrap_or("");
@@ -2585,6 +2741,7 @@ pub(crate) fn load_tools_embedded() -> Vec<McpTool> {
         .unwrap_or_default()
 }
 
+#[allow(dead_code)]
 pub(crate) fn load_tools(tools_path: &PathBuf) -> Vec<McpTool> {
     match fs::read_to_string(tools_path) {
         Ok(content) => {

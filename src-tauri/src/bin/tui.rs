@@ -5,8 +5,9 @@ use std::time::Duration;
 use std::collections::{HashMap, HashSet};
 
 use app_lib::runtime::{
-    callback_event_sink, AgentConfig, BehaviorTriggerConfig, LoadConfig, ModelInfo, RoutingRule,
-    RunDossier, RuntimeHandle, StreamEvent, ThreadSnapshot, WorkspaceConfig,
+    BackendDetected, BackendInstance, callback_event_sink, AgentConfig, BehaviorTriggerConfig,
+    LoadConfig, ModelInfo, RoutingRule, RunDossier, RuntimeHandle, StreamEvent, ThreadSnapshot,
+    WorkspaceConfig,
     WorkspaceThreadMessage, WorkspaceToolCall,
 };
 use crossterm::{
@@ -64,7 +65,16 @@ enum EditorKind {
 
 #[derive(Clone)]
 enum FieldKey {
-    Theme,
+    BackendType,
+    BackendUrl,
+    BackendApiKey,
+    BackendDetect,
+    BackendDetectedInfo,
+    BackendInstanceUrl(usize),
+    BackendInstanceModelHint(usize),
+    BackendInstanceDelete(usize),
+    BackendInstanceAdd,
+    BackendDiscover,
     AgentName(usize),
     AgentManager(usize),
     AgentModel(usize),
@@ -81,6 +91,7 @@ enum FieldKey {
     CommandDenylist,
     CommandAllowlist,
     RedundancyEnabled,
+    RedundancyEmbeddingModel,
     RedundancyThreshold,
     RedundancyRetries,
     RunBudgetsEnabled,
@@ -104,9 +115,12 @@ enum FieldKey {
     FinalizerPromptCompletion,
     FinalizerPromptBudgetStop,
     BehaviorTriggersEnabled,
+    BehaviorTriggersEmbeddingModel,
     BehaviorTriggersDefaultThreshold,
     BehaviorKeywords(usize),
     BehaviorJson(usize),
+    ParallelInferenceEnabled,
+    ParallelInferenceMaxAgents,
     RouteEnabled(String, String),
     RoutePriority(String, String),
     RouteCondition(String, String),
@@ -175,6 +189,7 @@ struct App {
     current_run_dossier: Option<RunDossier>,
     active_run: Option<ActiveRunUi>,
     run_usage: Option<RunUsageUi>,
+    active_model: Option<String>,
 
     active_workspace_id: Option<String>,
     active_thread_id: Option<String>,
@@ -270,6 +285,7 @@ impl App {
             current_run_dossier: None,
             active_run: None,
             run_usage: None,
+            active_model: None,
             active_workspace_id: None,
             active_thread_id: None,
             ws_expanded,
@@ -638,6 +654,7 @@ impl App {
                 run_id,
                 agent_id,
                 agent_name,
+                model_key,
                 is_manager,
                 ..
             } => {
@@ -646,6 +663,9 @@ impl App {
                     waiting_confirmation: false,
                     limit_message: String::new(),
                 });
+                if is_manager || self.active_model.is_none() {
+                    self.active_model = Some(model_key);
+                }
                 self.backend_detail = format!("{} started", agent_name);
                 self.push_bubble(
                     &agent_id,
@@ -776,6 +796,7 @@ impl App {
             StreamEvent::RunCancelled { message, .. } => {
                 self.active_run = None;
                 self.run_usage = None;
+                self.active_model = None;
                 self.backend_detail = message.clone();
                 self.status = message;
             }
@@ -800,6 +821,7 @@ impl App {
             StreamEvent::Done { .. } => {
                 self.active_run = None;
                 self.run_usage = None;
+                self.active_model = None;
                 self.backend_detail = "Run complete.".to_string();
             }
             StreamEvent::AgentEnd { agent_id, .. } => {
@@ -951,15 +973,103 @@ impl App {
                 self.persist_config("Agent deleted.");
                 self.agent_sel = self.agent_sel.min(self.agent_sidebar_len().saturating_sub(1));
             }
+            FieldKey::BackendDiscover => {
+                self.status = "Scanning for running backend instances…".to_string();
+                let found = self.runtime.discover_instances().await;
+                let mut added = 0usize;
+                for inst in found {
+                    let already = self
+                        .config
+                        .backend
+                        .extra_instances
+                        .iter()
+                        .any(|e| e.url == inst.url);
+                    if !already && inst.url != self.config.backend.base_url {
+                        self.config.backend.extra_instances.push(inst);
+                        added += 1;
+                    }
+                }
+                if added > 0 {
+                    self.persist_config(&format!("Added {} new instance(s).", added));
+                } else {
+                    self.status = "No new instances found.".to_string();
+                }
+            }
+            FieldKey::BackendInstanceAdd => {
+                self.config
+                    .backend
+                    .extra_instances
+                    .push(BackendInstance::default());
+                self.persist_config("Instance added.");
+            }
+            FieldKey::BackendInstanceDelete(i) => {
+                if *i < self.config.backend.extra_instances.len() {
+                    self.config.backend.extra_instances.remove(*i);
+                    self.persist_config("Instance removed.");
+                }
+            }
+            FieldKey::BackendDetect => {
+                let base_url = self.config.backend.base_url.clone();
+                let backend_type = self.config.backend.backend_type.clone();
+                self.status = "Detecting backend capabilities…".to_string();
+                let detected: BackendDetected =
+                    self.runtime.detect_backend(base_url, backend_type).await;
+                if detected.ok {
+                    self.config.backend.detected_version = detected.version.clone();
+                    self.config.backend.detected_model = detected.model.clone();
+                    self.config.backend.detected_parallel_slots = detected.parallel_slots;
+                    self.config.backend.detected_features = detected.features.clone();
+                    let summary = if detected.features.is_empty() {
+                        "Connected.".to_string()
+                    } else {
+                        format!("Connected — {}", detected.features.join(", "))
+                    };
+                    self.persist_config(&summary);
+                } else {
+                    let err = detected.error.unwrap_or_else(|| "Unknown error".to_string());
+                    self.status = format!("Detection failed: {}", err);
+                }
+            }
             _ => {}
         }
     }
 
     fn apply_field_value(&mut self, key: &FieldKey, value: String) -> Result<String, String> {
         match key {
-            FieldKey::Theme => {
-                self.config.theme = value;
-                self.persist_config("Theme saved.");
+            FieldKey::BackendType => {
+                let url = match value.as_str() {
+                    "lm_studio" => "http://localhost:1234",
+                    "ollama" => "http://localhost:11434",
+                    "llamacpp" => "http://localhost:8080",
+                    _ => &self.config.backend.base_url,
+                };
+                self.config.backend.backend_type = value;
+                self.config.backend.base_url = url.to_string();
+                self.config.backend.detected_version = None;
+                self.config.backend.detected_parallel_slots = None;
+                self.config.backend.detected_features.clear();
+                self.persist_config("Backend saved.");
+            }
+            FieldKey::BackendUrl => {
+                self.config.backend.base_url = value;
+                self.persist_config("Backend saved.");
+            }
+            FieldKey::BackendApiKey => {
+                self.config.backend.api_key = if value.is_empty() { None } else { Some(value) };
+                self.persist_config("Backend saved.");
+            }
+            FieldKey::BackendDetectedInfo => {}
+            FieldKey::BackendInstanceUrl(i) => {
+                if let Some(inst) = self.config.backend.extra_instances.get_mut(*i) {
+                    inst.url = value;
+                    self.persist_config("Instance saved.");
+                }
+            }
+            FieldKey::BackendInstanceModelHint(i) => {
+                if let Some(inst) = self.config.backend.extra_instances.get_mut(*i) {
+                    inst.model_hint = value;
+                    self.persist_config("Instance saved.");
+                }
             }
             FieldKey::AgentName(index) => {
                 self.config.agents[*index].name = value;
@@ -1039,6 +1149,11 @@ impl App {
             }
             FieldKey::RedundancyEnabled => {
                 self.config.redundancy_detection.enabled = parse_bool(&value)?;
+                self.persist_config("Redundancy saved.");
+            }
+            FieldKey::RedundancyEmbeddingModel => {
+                self.config.redundancy_detection.embedding_model_key =
+                    if value.is_empty() { None } else { Some(value) };
                 self.persist_config("Redundancy saved.");
             }
             FieldKey::RedundancyThreshold => {
@@ -1139,6 +1254,11 @@ impl App {
                 self.config.behavior_triggers.enabled = parse_bool(&value)?;
                 self.persist_config("Behavior triggers saved.");
             }
+            FieldKey::BehaviorTriggersEmbeddingModel => {
+                self.config.behavior_triggers.embedding_model_key =
+                    if value.is_empty() { None } else { Some(value) };
+                self.persist_config("Behavior triggers saved.");
+            }
             FieldKey::BehaviorTriggersDefaultThreshold => {
                 self.config.behavior_triggers.default_similarity_threshold = parse_f32(&value)?;
                 self.persist_config("Behavior triggers saved.");
@@ -1152,6 +1272,15 @@ impl App {
                     serde_json::from_str(&value).map_err(|error| error.to_string())?;
                 self.config.behavior_triggers.behaviors[*index] = parsed;
                 self.persist_config("Behavior saved.");
+            }
+            FieldKey::ParallelInferenceEnabled => {
+                self.config.parallel_inference.enabled = parse_bool(&value)?;
+                self.persist_config("Parallel inference saved.");
+            }
+            FieldKey::ParallelInferenceMaxAgents => {
+                let v = parse_u32(&value)?;
+                self.config.parallel_inference.max_parallel_agents = v.max(1);
+                self.persist_config("Parallel inference saved.");
             }
             FieldKey::RouteEnabled(from, to) => {
                 if parse_bool(&value)? {
@@ -1179,7 +1308,12 @@ impl App {
                 };
                 self.persist_config("Routing saved.");
             }
-            FieldKey::AgentLoadNow(_) | FieldKey::AgentDelete(_) => {}
+            FieldKey::AgentLoadNow(_)
+            | FieldKey::AgentDelete(_)
+            | FieldKey::BackendDetect
+            | FieldKey::BackendDiscover
+            | FieldKey::BackendInstanceAdd
+            | FieldKey::BackendInstanceDelete(_) => {}
         }
         Ok("Saved.".to_string())
     }
@@ -1815,13 +1949,28 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &App) {
         frame.set_cursor_position((outer[1].x + 1 + app.chat_cursor as u16, outer[1].y + 1));
     }
 
+    let model_label = app.active_model.as_deref().map(|m| {
+        // Trim to last path component in case it's a file path.
+        let name = m.rsplit('/').next().unwrap_or(m);
+        // Strip common file extensions.
+        let name = name
+            .strip_suffix(".gguf")
+            .or_else(|| name.strip_suffix(".bin"))
+            .unwrap_or(name);
+        format!("model: {}", name)
+    });
     let usage = app.run_usage.as_ref().map(|usage| {
+        let tok_per_sec = if usage.wall_clock_seconds > 0 {
+            usage.streamed_tokens / usage.wall_clock_seconds
+        } else {
+            usage.streamed_tokens
+        };
         format!(
-            "llm:{} tool:{} spawn:{} tok:{} emb:{} clock:{}s",
+            "llm:{} tool:{} spawn:{}  {}/s tok  emb_hits:{}  {}s",
             usage.llm_calls,
             usage.tool_calls,
             usage.spawned_agents,
-            usage.streamed_tokens,
+            tok_per_sec,
             usage.embedding_calls,
             usage.wall_clock_seconds
         )
@@ -1829,7 +1978,7 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &App) {
     let waiting = app.active_run.as_ref().filter(|run| run.waiting_confirmation).map(|run| {
         format!("Waiting: {}", run.limit_message)
     });
-    let footer = [Some(app.status.clone()), Some(app.backend_detail.clone()), usage, waiting]
+    let footer = [Some(app.status.clone()), Some(app.backend_detail.clone()), model_label, usage, waiting]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
@@ -2197,6 +2346,16 @@ fn build_agent_rows(app: &App) -> Vec<EditorRow> {
                     FieldKey::RedundancyEnabled,
                     bool_options(),
                 ),
+                picker_row(
+                    "Embedding model",
+                    app.config
+                        .redundancy_detection
+                        .embedding_model_key
+                        .clone()
+                        .unwrap_or_default(),
+                    FieldKey::RedundancyEmbeddingModel,
+                    model_options(&app.available_models, true),
+                ),
                 number_row(
                     "Similarity threshold",
                     format!("{:.2}", app.config.redundancy_detection.semantic_similarity_threshold),
@@ -2330,12 +2489,34 @@ fn build_agent_rows(app: &App) -> Vec<EditorRow> {
                     FieldKey::FinalizerPromptBudgetStop,
                     true,
                 ),
+                section_row("Parallel inference"),
+                picker_row(
+                    "Enabled",
+                    bool_raw(app.config.parallel_inference.enabled),
+                    FieldKey::ParallelInferenceEnabled,
+                    bool_options(),
+                ),
+                number_row(
+                    "Max parallel agents",
+                    app.config.parallel_inference.max_parallel_agents.to_string(),
+                    FieldKey::ParallelInferenceMaxAgents,
+                ),
                 section_row("Behavior triggers"),
                 picker_row(
                     "Enabled",
                     bool_raw(app.config.behavior_triggers.enabled),
                     FieldKey::BehaviorTriggersEnabled,
                     bool_options(),
+                ),
+                picker_row(
+                    "Embedding model",
+                    app.config
+                        .behavior_triggers
+                        .embedding_model_key
+                        .clone()
+                        .unwrap_or_default(),
+                    FieldKey::BehaviorTriggersEmbeddingModel,
+                    model_options(&app.available_models, true),
                 ),
                 number_row(
                     "Default threshold",
@@ -2390,22 +2571,84 @@ fn build_routing_rows(app: &App) -> Vec<EditorRow> {
 }
 
 fn build_settings_rows(app: &App) -> Vec<EditorRow> {
-    vec![
-        section_row("Appearance"),
+    let b = &app.config.backend;
+
+    // Build detected info display string.
+    let detected_text = {
+        let mut parts = Vec::new();
+        if let Some(ref v) = b.detected_version {
+            parts.push(format!("version: {}", v));
+        }
+        if let Some(ref m) = b.detected_model {
+            parts.push(format!("model: {}", m));
+        }
+        if let Some(slots) = b.detected_parallel_slots {
+            parts.push(format!("parallel slots: {}", slots));
+        }
+        parts.extend_from_slice(&b.detected_features);
+        if parts.is_empty() {
+            "(not yet detected)".to_string()
+        } else {
+            parts.join("  |  ")
+        }
+    };
+
+    let mut rows = vec![
+        section_row("Backend connection"),
         picker_row(
-            "Theme",
-            app.config.theme.clone(),
-            FieldKey::Theme,
+            "Backend",
+            b.backend_type.clone(),
+            FieldKey::BackendType,
             vec![
-                "win98".to_string(),
-                "ubuntu".to_string(),
-                "macos".to_string(),
-                "classic".to_string(),
-                "high-contrast-dark".to_string(),
-                "high-contrast-light".to_string(),
+                "lm_studio".to_string(),
+                "ollama".to_string(),
+                "llamacpp".to_string(),
+                "custom".to_string(),
             ],
         ),
-    ]
+        text_row("Base URL", b.base_url.clone(), FieldKey::BackendUrl, false),
+        text_row(
+            "API key",
+            b.api_key.clone().unwrap_or_default(),
+            FieldKey::BackendApiKey,
+            false,
+        ),
+        action_row("Detect capabilities", FieldKey::BackendDetect),
+        text_row(
+            "Detected",
+            detected_text,
+            FieldKey::BackendDetectedInfo,
+            false,
+        ),
+    ];
+
+    // Extra instances (for backends like llama.cpp that serve one model per process).
+    rows.push(section_row("Extra instances"));
+    if b.backend_type == "llamacpp" {
+        rows.push(action_row(
+            "Discover running servers",
+            FieldKey::BackendDiscover,
+        ));
+    }
+    rows.push(action_row("Add instance", FieldKey::BackendInstanceAdd));
+    for (i, inst) in b.extra_instances.iter().enumerate() {
+        rows.push(section_row(&format!("Instance {}", i + 1)));
+        rows.push(text_row(
+            "URL",
+            inst.url.clone(),
+            FieldKey::BackendInstanceUrl(i),
+            false,
+        ));
+        rows.push(text_row(
+            "Model",
+            inst.model_hint.clone(),
+            FieldKey::BackendInstanceModelHint(i),
+            false,
+        ));
+        rows.push(action_row("Remove", FieldKey::BackendInstanceDelete(i)));
+    }
+
+    rows
 }
 
 fn routing_matrix_text(app: &App) -> String {

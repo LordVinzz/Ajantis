@@ -533,7 +533,8 @@ fn check_run_budget_for_tool_call(
     run.active_behaviors = active_behaviors.clone();
     // Always count.
     run.usage.tool_calls += 1;
-    if tool_name == "spawn_agent" {
+    let is_spawn = matches!(tool_name, "spawn_agent" | "Agent" | "send_parallel");
+    if is_spawn {
         run.usage.spawned_agents += 1;
     }
     // Only enforce when budget applies.
@@ -555,7 +556,7 @@ fn check_run_budget_for_tool_call(
             observed: u64::from(run.usage.tool_calls),
         });
     }
-    if tool_name == "spawn_agent"
+    if is_spawn
         && u64::from(run.usage.spawned_agents) > u64::from(run.budgets.spawned_agents_per_window)
     {
         return Err(RunLimitHit {
@@ -1065,7 +1066,7 @@ pub(crate) async fn call_chat_with_tools(
 
     // Separate clients: LLM calls can take minutes, MCP tool calls should be fast.
     let llm_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap_or_default();
     let mut delegated = false;
@@ -1913,7 +1914,12 @@ fn visible_tools_for_agent(
 fn is_delegation_tool(name: &str) -> bool {
     matches!(
         name,
-        "spawn_agent" | "send_message" | "broadcast_message" | "fork_agent" | "pipe_message"
+        "spawn_agent"
+            | "send_message"
+            | "broadcast_message"
+            | "fork_agent"
+            | "pipe_message"
+            | "send_parallel"
     )
 }
 
@@ -3652,7 +3658,7 @@ pub(crate) async fn run_finalizer(
 
     let url = format!("{}/v1/chat/completions", lm_base_url());
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap_or_default();
 
