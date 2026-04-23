@@ -200,7 +200,43 @@ pub async fn fetch_models() -> Result<Vec<ModelInfo>, String> {
 #[tauri::command]
 pub async fn fetch_loaded_models() -> Result<Vec<LoadedModelInfo>, String> {
     let base = lm_base_url();
+    let btype = backend_type();
     let client = reqwest::Client::new();
+
+    if btype == "llamacpp" {
+        // llama.cpp loads a single model at startup; use OpenAI-compatible /v1/models
+        let resp = auth_header(client.get(format!("{}/v1/models", base)))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch models: {}", e))?;
+        if !resp.status().is_success() {
+            return Err(format!("Failed to fetch models: {}", resp.status()));
+        }
+        let data: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Invalid response: {}", e))?;
+        let models = data
+            .get("data")
+            .and_then(|v| v.as_array())
+            .ok_or("Invalid models response")?;
+        return Ok(models
+            .iter()
+            .map(|m| {
+                let id = m["id"].as_str().unwrap_or("").to_string();
+                LoadedModelInfo {
+                    key: id.clone(),
+                    display_name: id.clone(),
+                    instances: vec![LoadedInstance {
+                        instance_id: id,
+                        context_length: None,
+                        flash_attention: None,
+                    }],
+                }
+            })
+            .collect());
+    }
+
     let resp = client
         .get(format!("{}/api/v1/models", base))
         .send()
