@@ -541,6 +541,8 @@ pub struct BackendDetected {
     pub version: Option<String>,
     pub model: Option<String>,
     pub parallel_slots: Option<u32>,
+    pub tool_use_mode: String,
+    pub tool_use_notes: Vec<String>,
     pub features: Vec<String>,
     pub error: Option<String>,
 }
@@ -551,6 +553,45 @@ fn strip_base_url(url: &str) -> String {
         .trim_end_matches("/v1")
         .trim_end_matches("/api")
         .to_string()
+}
+
+fn props_has_non_empty_value(props: &Value, key: &str) -> bool {
+    match props.get(key) {
+        Some(Value::Null) | None => false,
+        Some(Value::String(text)) => !text.trim().is_empty(),
+        Some(Value::Array(items)) => !items.is_empty(),
+        Some(Value::Object(map)) => !map.is_empty(),
+        Some(Value::Bool(value)) => *value,
+        Some(_) => true,
+    }
+}
+
+fn detect_llamacpp_tool_use_support(props: &Value) -> (String, Vec<String>) {
+    let has_chat_template = props_has_non_empty_value(props, "chat_template");
+    let has_tool_use_template = props_has_non_empty_value(props, "chat_template_tool_use");
+    let mut notes = Vec::new();
+
+    if has_chat_template {
+        notes.push("chat_template present".to_string());
+    } else {
+        notes.push("chat_template missing".to_string());
+    }
+
+    if has_tool_use_template {
+        notes.push("chat_template_tool_use present".to_string());
+    } else {
+        notes.push("chat_template_tool_use missing".to_string());
+    }
+
+    let mode = if has_tool_use_template {
+        "native"
+    } else if has_chat_template {
+        "degraded"
+    } else {
+        "broken"
+    };
+
+    (mode.to_string(), notes)
 }
 
 async fn detect_lmstudio(client: &reqwest::Client, base: &str) -> BackendDetected {
@@ -564,6 +605,8 @@ async fn detect_lmstudio(client: &reqwest::Client, base: &str) -> BackendDetecte
             version: None,
             model: None,
             parallel_slots: None,
+            tool_use_mode: "broken".to_string(),
+            tool_use_notes: vec![],
             features: vec![],
             error: Some(format!("Connection failed: {}", e)),
         },
@@ -575,6 +618,8 @@ async fn detect_lmstudio(client: &reqwest::Client, base: &str) -> BackendDetecte
                     version: None,
                     model: None,
                     parallel_slots: None,
+                    tool_use_mode: "broken".to_string(),
+                    tool_use_notes: vec![],
                     features: vec![],
                     error: Some(format!("Server returned {}", status)),
                 };
@@ -590,6 +635,8 @@ async fn detect_lmstudio(client: &reqwest::Client, base: &str) -> BackendDetecte
                 version: None,
                 model: None,
                 parallel_slots: None,
+                tool_use_mode: "native".to_string(),
+                tool_use_notes: vec!["LM Studio OpenAI-compatible tool use".to_string()],
                 features: vec![format!("{} model(s) available", model_count)],
                 error: None,
             }
@@ -604,6 +651,8 @@ async fn detect_ollama(client: &reqwest::Client, base: &str) -> BackendDetected 
             version: None,
             model: None,
             parallel_slots: None,
+            tool_use_mode: "broken".to_string(),
+            tool_use_notes: vec![],
             features: vec![],
             error: Some(format!("Connection failed: {}", e)),
         },
@@ -615,6 +664,8 @@ async fn detect_ollama(client: &reqwest::Client, base: &str) -> BackendDetected 
                     version: None,
                     model: None,
                     parallel_slots: None,
+                    tool_use_mode: "broken".to_string(),
+                    tool_use_notes: vec![],
                     features: vec![],
                     error: Some(format!("Server returned {}", status)),
                 };
@@ -626,6 +677,8 @@ async fn detect_ollama(client: &reqwest::Client, base: &str) -> BackendDetected 
                 version,
                 model: None,
                 parallel_slots: None,
+                tool_use_mode: "native".to_string(),
+                tool_use_notes: vec!["Ollama OpenAI-compatible tool use".to_string()],
                 features: vec!["OpenAI-compatible endpoints".to_string()],
                 error: None,
             }
@@ -647,6 +700,8 @@ async fn detect_llamacpp(client: &reqwest::Client, base: &str) -> BackendDetecte
             version: None,
             model: None,
             parallel_slots: None,
+            tool_use_mode: "broken".to_string(),
+            tool_use_notes: vec![],
             features: vec![],
             error: Some("Connection failed (/health unreachable)".to_string()),
         };
@@ -664,6 +719,7 @@ async fn detect_llamacpp(client: &reqwest::Client, base: &str) -> BackendDetecte
         .as_str()
         .unwrap_or("")
         .to_string();
+    let (tool_use_mode, tool_use_notes) = detect_llamacpp_tool_use_support(&props);
 
     let mut features = vec!["OpenAI-compatible endpoints".to_string()];
 
@@ -711,6 +767,8 @@ async fn detect_llamacpp(client: &reqwest::Client, base: &str) -> BackendDetecte
         version: None,
         model,
         parallel_slots,
+        tool_use_mode,
+        tool_use_notes,
         features,
         error: None,
     }
@@ -840,4 +898,55 @@ pub async fn discover_backend_instances() -> Vec<BackendInstance> {
     }
 
     instances
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_llamacpp_tool_use_support_reports_native_when_tool_template_exists() {
+        let props = json!({
+            "chat_template": "{{ messages }}",
+            "chat_template_tool_use": "{{ tools }}"
+        });
+
+        let (mode, notes) = detect_llamacpp_tool_use_support(&props);
+        assert_eq!(mode, "native");
+        assert!(notes.iter().any(|note| note.contains("chat_template present")));
+        assert!(
+            notes.iter()
+                .any(|note| note.contains("chat_template_tool_use present"))
+        );
+    }
+
+    #[test]
+    fn detect_llamacpp_tool_use_support_reports_degraded_when_only_chat_template_exists() {
+        let props = json!({
+            "chat_template": "{{ messages }}"
+        });
+
+        let (mode, notes) = detect_llamacpp_tool_use_support(&props);
+        assert_eq!(mode, "degraded");
+        assert!(notes.iter().any(|note| note.contains("chat_template present")));
+        assert!(
+            notes.iter()
+                .any(|note| note.contains("chat_template_tool_use missing"))
+        );
+    }
+
+    #[test]
+    fn detect_llamacpp_tool_use_support_reports_broken_without_templates() {
+        let props = json!({
+            "chat_template_caps": {}
+        });
+
+        let (mode, notes) = detect_llamacpp_tool_use_support(&props);
+        assert_eq!(mode, "broken");
+        assert!(notes.iter().any(|note| note.contains("chat_template missing")));
+        assert!(
+            notes.iter()
+                .any(|note| note.contains("chat_template_tool_use missing"))
+        );
+    }
 }

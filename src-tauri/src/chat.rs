@@ -18,8 +18,8 @@ use crate::helpers::{
 use crate::mcp::{handle_tool_call, McpState};
 use crate::models::create_embeddings;
 use crate::runs::{
-    emit_run_event, run_budget_applies, PausedRunState, RunDossier, RunDossierWorkerOutcome,
-    RunLimitHit, RunWindowUsage,
+    append_journal_entry, emit_run_event, run_budget_applies, PausedRunState, RunDossier,
+    RunDossierWorkerOutcome, RunLimitHit, RunWindowUsage,
 };
 use crate::state::{AppState, McpTool};
 
@@ -123,6 +123,63 @@ struct ToolCallDelta {
     function_arguments: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolUseSupportMode {
+    Native,
+    Degraded,
+    Broken,
+}
+
+impl ToolUseSupportMode {
+    fn from_config(mode: &str) -> Self {
+        match mode {
+            "native" => Self::Native,
+            "broken" => Self::Broken,
+            _ => Self::Degraded,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Degraded => "degraded",
+            Self::Broken => "broken",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ToolCallCompatibilityProfile {
+    backend_type: String,
+    tool_use_mode: ToolUseSupportMode,
+    suppress_streaming_text: bool,
+    enable_local_recovery: bool,
+    allow_repair_retry: bool,
+    simplify_tool_schemas: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecoveredToolCall {
+    id: Option<String>,
+    name: String,
+    arguments: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ToolCallRecoveryResult {
+    None,
+    Recovered {
+        tool_calls: Vec<Value>,
+        detail: String,
+    },
+    Incomplete {
+        detail: String,
+    },
+    Invalid {
+        detail: String,
+    },
+}
+
 struct StreamedAssistantTurn {
     assistant_message: Value,
     content: String,
@@ -204,6 +261,7 @@ async fn stream_chat_completion_turn(
     run_id: &str,
     agent_id: &str,
     on_event: &SharedEventSink,
+    stream_text_tokens: bool,
 ) -> Result<StreamedAssistantTurn, String> {
     let mut resp = client
         .post(url)
@@ -336,19 +394,21 @@ async fn stream_chat_completion_turn(
                         }
                     }
                     full_content.push_str(content);
-                    let _ = on_event.send(StreamEvent::Token {
-                        run_id: run_id.to_string(),
-                        agent_id: agent_id.to_string(),
-                        content: content.to_string(),
-                    });
-                    emit_generation_metrics(
-                        on_event,
-                        run_id,
-                        agent_id,
-                        "streaming",
-                        &usage,
-                        estimated_stream_output_tokens(&full_content),
-                    );
+                    if stream_text_tokens {
+                        let _ = on_event.send(StreamEvent::Token {
+                            run_id: run_id.to_string(),
+                            agent_id: agent_id.to_string(),
+                            content: content.to_string(),
+                        });
+                        emit_generation_metrics(
+                            on_event,
+                            run_id,
+                            agent_id,
+                            "streaming",
+                            &usage,
+                            estimated_stream_output_tokens(&full_content),
+                        );
+                    }
                 }
             }
 
@@ -384,6 +444,49 @@ async fn stream_chat_completion_turn(
     }
 
     Err("Stream ended before completion.".to_string())
+}
+
+fn response_message_to_turn(data: &Value) -> StreamedAssistantTurn {
+    let assistant_message = data
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .cloned()
+        .unwrap_or_else(|| json!({"role": "assistant", "content": ""}));
+    let content = assistant_message["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    StreamedAssistantTurn {
+        assistant_message,
+        content,
+        usage: parse_stream_usage(data),
+    }
+}
+
+async fn call_chat_completion_turn_nonstreaming(
+    client: &reqwest::Client,
+    url: &str,
+    body: &Value,
+) -> Result<StreamedAssistantTurn, String> {
+    let resp = client
+        .post(url)
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "LLM error: {}",
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Parse error: {}", e))?;
+    Ok(response_message_to_turn(&data))
 }
 
 /// Non-streaming single-turn call. Used by manager MCP tools.
@@ -428,6 +531,340 @@ pub(crate) async fn call_chat_blocking(
         .as_str()
         .unwrap_or("")
         .to_string())
+}
+
+fn is_qwen_coder_like_model(model_key: &str) -> bool {
+    let lower = model_key.to_lowercase();
+    lower.contains("qwen")
+        && (lower.contains("coder")
+            || lower.contains("qwen-next")
+            || lower.contains("coder-next")
+            || lower.contains("qwen3-next"))
+}
+
+fn build_tool_call_compatibility_profile(
+    tool_state: &McpState,
+    model_key: &str,
+) -> ToolCallCompatibilityProfile {
+    let backend = tool_state.agent_config.lock().unwrap().backend.clone();
+    let tool_use_mode = ToolUseSupportMode::from_config(&backend.detected_tool_use_mode);
+    let is_llamacpp = backend.backend_type == "llamacpp";
+    let qwen_like = is_qwen_coder_like_model(model_key)
+        || backend
+            .detected_model
+            .as_deref()
+            .map(is_qwen_coder_like_model)
+            .unwrap_or(false);
+
+    ToolCallCompatibilityProfile {
+        backend_type: backend.backend_type,
+        tool_use_mode,
+        suppress_streaming_text: is_llamacpp && (qwen_like || tool_use_mode != ToolUseSupportMode::Native),
+        enable_local_recovery: is_llamacpp || tool_use_mode != ToolUseSupportMode::Native,
+        allow_repair_retry: is_llamacpp,
+        simplify_tool_schemas: tool_use_mode == ToolUseSupportMode::Degraded,
+    }
+}
+
+fn tool_choice_value(require_delegation: bool, delegated: bool) -> Value {
+    if require_delegation && !delegated {
+        json!("required")
+    } else {
+        json!("auto")
+    }
+}
+
+fn normalize_tool_arguments(value: &Value) -> Result<Value, String> {
+    match value {
+        Value::String(text) => serde_json::from_str::<Value>(text.trim())
+            .map_err(|_| "tool arguments string was not valid JSON".to_string()),
+        other => Ok(other.clone()),
+    }
+}
+
+fn normalize_single_recovered_tool_call(value: &Value) -> Result<RecoveredToolCall, String> {
+    if let Some(function) = value.get("function") {
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "function payload was missing a string name".to_string())?;
+        let arguments = function
+            .get("arguments")
+            .ok_or_else(|| "function payload was missing arguments".to_string())?;
+        return Ok(RecoveredToolCall {
+            id: value.get("id").and_then(Value::as_str).map(ToString::to_string),
+            name: name.to_string(),
+            arguments: normalize_tool_arguments(arguments)?,
+        });
+    }
+
+    if let Some(name) = value.get("name").and_then(Value::as_str) {
+        let arguments = value
+            .get("arguments")
+            .ok_or_else(|| "tool payload was missing arguments".to_string())?;
+        return Ok(RecoveredToolCall {
+            id: value.get("id").and_then(Value::as_str).map(ToString::to_string),
+            name: name.to_string(),
+            arguments: normalize_tool_arguments(arguments)?,
+        });
+    }
+
+    let Some(obj) = value.as_object() else {
+        return Err("payload did not match a supported tool call shape".to_string());
+    };
+    if obj.len() != 1 {
+        return Err("payload did not match a supported tool call shape".to_string());
+    }
+    let (name, arguments) = obj
+        .iter()
+        .next()
+        .expect("single-entry tool payload already validated");
+    Ok(RecoveredToolCall {
+        id: None,
+        name: name.to_string(),
+        arguments: arguments.clone(),
+    })
+}
+
+fn normalize_recovered_tool_payload(value: &Value) -> Result<Vec<RecoveredToolCall>, String> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .map(normalize_single_recovered_tool_call)
+            .collect(),
+        Value::Object(_) => Ok(vec![normalize_single_recovered_tool_call(value)?]),
+        _ => Err("payload did not match a supported tool call shape".to_string()),
+    }
+}
+
+fn parse_tagged_parameter_value(raw: &str) -> Value {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        Value::String(String::new())
+    } else if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+        parsed
+    } else {
+        Value::String(trimmed.to_string())
+    }
+}
+
+fn parse_tagged_tool_call_block(payload: &str) -> Result<RecoveredToolCall, String> {
+    let trimmed = payload.trim();
+    let function_start = trimmed
+        .find("<function=")
+        .ok_or_else(|| "tagged tool call was missing <function=...>".to_string())?;
+    let name_start = function_start + "<function=".len();
+    let name_end = trimmed[name_start..]
+        .find('>')
+        .ok_or_else(|| "unterminated <function=...> tag".to_string())?;
+    let name = trimmed[name_start..name_start + name_end]
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'');
+    if name.is_empty() {
+        return Err("tagged tool call had an empty function name".to_string());
+    }
+
+    let mut args = serde_json::Map::new();
+    let mut cursor = &trimmed[name_start + name_end + 1..];
+    while let Some(param_start) = cursor.find("<parameter=") {
+        cursor = &cursor[param_start + "<parameter=".len()..];
+        let param_name_end = cursor
+            .find('>')
+            .ok_or_else(|| "unterminated <parameter=...> tag".to_string())?;
+        let param_name = cursor[..param_name_end]
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'');
+        cursor = &cursor[param_name_end + 1..];
+        let value_end = cursor
+            .find("</parameter>")
+            .ok_or_else(|| "unterminated </parameter> tag".to_string())?;
+        let raw_value = &cursor[..value_end];
+        args.insert(param_name.to_string(), parse_tagged_parameter_value(raw_value));
+        cursor = &cursor[value_end + "</parameter>".len()..];
+    }
+
+    Ok(RecoveredToolCall {
+        id: None,
+        name: name.to_string(),
+        arguments: Value::Object(args),
+    })
+}
+
+fn recovered_tool_calls_to_json(tool_calls: &[RecoveredToolCall]) -> Vec<Value> {
+    tool_calls
+        .iter()
+        .enumerate()
+        .map(|(index, tool_call)| {
+            json!({
+                "id": tool_call.id.clone().unwrap_or_else(|| format!("recovered-tool-call-{}", index)),
+                "type": "function",
+                "function": {
+                    "name": tool_call.name,
+                    "arguments": serde_json::to_string(&tool_call.arguments).unwrap_or_else(|_| "{}".to_string()),
+                }
+            })
+        })
+        .collect()
+}
+
+fn parse_tool_call_payload(payload: &str) -> ToolCallRecoveryResult {
+    let trimmed = payload.trim();
+    if trimmed.is_empty() {
+        return ToolCallRecoveryResult::Invalid {
+            detail: "tool payload was empty".to_string(),
+        };
+    }
+
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(value) => match normalize_recovered_tool_payload(&value) {
+            Ok(tool_calls) => ToolCallRecoveryResult::Recovered {
+                tool_calls: recovered_tool_calls_to_json(&tool_calls),
+                detail: "Recovered tool call(s) from JSON payload.".to_string(),
+            },
+            Err(err) => ToolCallRecoveryResult::Invalid { detail: err },
+        },
+        Err(err) if err.is_eof() => ToolCallRecoveryResult::Incomplete {
+            detail: "tool payload looked truncated before valid JSON completed".to_string(),
+        },
+        Err(_) if trimmed.contains("<function=") => match parse_tagged_tool_call_block(trimmed) {
+            Ok(tool_call) => ToolCallRecoveryResult::Recovered {
+                tool_calls: recovered_tool_calls_to_json(&[tool_call]),
+                detail: "Recovered tool call from tagged payload.".to_string(),
+            },
+            Err(detail) if detail.contains("unterminated") => {
+                ToolCallRecoveryResult::Incomplete { detail }
+            }
+            Err(detail) => ToolCallRecoveryResult::Invalid { detail },
+        },
+        Err(err) => ToolCallRecoveryResult::Invalid {
+            detail: format!("tool payload JSON was invalid: {}", err),
+        },
+    }
+}
+
+fn looks_like_tool_call_preamble(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("tool")
+        || lower.contains("function")
+        || lower.contains("<tool_call")
+        || (lower.contains("\"name\"") && lower.contains("\"arguments\""))
+}
+
+fn recover_tool_calls_from_text(content: &str) -> ToolCallRecoveryResult {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return ToolCallRecoveryResult::None;
+    }
+
+    if trimmed.contains("<tool_call>") {
+        if !trimmed.contains("</tool_call>") {
+            return ToolCallRecoveryResult::Incomplete {
+                detail: "tool_call block started but never closed".to_string(),
+            };
+        }
+        let mut recovered = Vec::new();
+        let mut cursor = trimmed;
+        while let Some(start) = cursor.find("<tool_call>") {
+            cursor = &cursor[start + "<tool_call>".len()..];
+            let Some(end) = cursor.find("</tool_call>") else {
+                return ToolCallRecoveryResult::Incomplete {
+                    detail: "tool_call block started but never closed".to_string(),
+                };
+            };
+            let block = &cursor[..end];
+            match parse_tool_call_payload(block) {
+                ToolCallRecoveryResult::Recovered { tool_calls, .. } => recovered.extend(tool_calls),
+                ToolCallRecoveryResult::Incomplete { detail } => {
+                    return ToolCallRecoveryResult::Incomplete { detail }
+                }
+                ToolCallRecoveryResult::Invalid { detail } => {
+                    return ToolCallRecoveryResult::Invalid { detail }
+                }
+                ToolCallRecoveryResult::None => {
+                    return ToolCallRecoveryResult::Invalid {
+                        detail: "tool_call block did not contain a supported payload".to_string(),
+                    }
+                }
+            }
+            cursor = &cursor[end + "</tool_call>".len()..];
+        }
+        if !recovered.is_empty() {
+            return ToolCallRecoveryResult::Recovered {
+                tool_calls: recovered,
+                detail: "Recovered tool call(s) from <tool_call> block(s).".to_string(),
+            };
+        }
+    }
+
+    if trimmed.ends_with(':') && looks_like_tool_call_preamble(trimmed) {
+        return ToolCallRecoveryResult::Incomplete {
+            detail: "response ended on a tool-call preamble".to_string(),
+        };
+    }
+
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return parse_tool_call_payload(trimmed);
+    }
+
+    if trimmed.contains("\"name\"") && trimmed.contains("\"arguments\"") {
+        let start = trimmed.find(|ch| ch == '{' || ch == '[').unwrap_or(0);
+        if let Some(end) = trimmed.rfind(|ch| ch == '}' || ch == ']') {
+            if end >= start {
+                return match parse_tool_call_payload(&trimmed[start..=end]) {
+                    ToolCallRecoveryResult::Recovered { tool_calls, .. } => {
+                        ToolCallRecoveryResult::Recovered {
+                            tool_calls,
+                            detail: "Recovered tool call(s) from JSON substring.".to_string(),
+                        }
+                    }
+                    other => other,
+                };
+            }
+        } else {
+            return ToolCallRecoveryResult::Incomplete {
+                detail: "tool-call JSON substring looked truncated".to_string(),
+            };
+        }
+    }
+
+    ToolCallRecoveryResult::None
+}
+
+fn record_tool_call_compatibility_issue(
+    tool_state: &McpState,
+    run_id: &str,
+    summary: &str,
+    raw_content: &str,
+) {
+    let excerpt = truncate_for_summary(raw_content, 240);
+    let raw_note = format!("Raw tool-call output excerpt: {}", excerpt);
+    let mut runs = tool_state.active_runs.lock().unwrap();
+    let Some(run) = runs.get_mut(run_id) else {
+        return;
+    };
+    let journal_path = run.journal_path.clone();
+    if !run.dossier.caution_flags.iter().any(|flag| flag == summary) {
+        run.dossier.caution_flags.push(summary.to_string());
+    }
+    if !raw_note.trim().is_empty() && !run.dossier.coverage_gaps.iter().any(|gap| gap == &raw_note)
+    {
+        run.dossier.coverage_gaps.push(raw_note);
+    }
+    refresh_dossier_caution_flags(&mut run.dossier);
+    drop(runs);
+
+    let _ = append_journal_entry(
+        &journal_path,
+        &json!({
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "event": "tool_call_compatibility_issue",
+            "run_id": run_id,
+            "summary": summary,
+            "raw_content": raw_content,
+        }),
+    );
 }
 
 struct ActiveBehaviorContextGuard<'a> {
@@ -978,6 +1415,7 @@ pub(crate) async fn call_chat_with_tools(
 ) -> Result<String, String> {
     let url = format!("{}/v1/chat/completions", lm_base_url());
     let mut messages = vec![];
+    let compatibility_profile = build_tool_call_compatibility_profile(tool_state, model_key);
     let (redundancy_config, behavior_triggers) = {
         let config = tool_state.agent_config.lock().unwrap();
         (
@@ -1013,7 +1451,8 @@ pub(crate) async fn call_chat_with_tools(
         .map(|t| {
             // Compress parameter schemas: keep name/type/required but strip verbose descriptions
             // and nested details. This cuts token usage ~10x while keeping full tool coverage.
-            let compressed_params = compress_schema(&t.input_schema);
+            let compressed_params =
+                compress_schema(&t.name, &t.input_schema, compatibility_profile.simplify_tool_schemas);
             // Truncate description to first sentence (≤120 chars) to save tokens.
             let short_desc = t
                 .description
@@ -1092,6 +1531,19 @@ pub(crate) async fn call_chat_with_tools(
         .and_then(|config| config.non_progress.limit)
         .unwrap_or(4);
 
+    if allow_manager_tools && compatibility_profile.tool_use_mode != ToolUseSupportMode::Native {
+        let _ = on_event.send(StreamEvent::AgentStatus {
+            run_id: run_id.to_string(),
+            agent_id: agent_id.to_string(),
+            stage: "compatibility".to_string(),
+            detail: format!(
+                "Backend tool use mode is {} on {}. Local recovery for malformed tool calls is enabled.",
+                compatibility_profile.tool_use_mode.as_str(),
+                compatibility_profile.backend_type
+            ),
+        });
+    }
+
     for _ in 0u8..64 {
         // Keep manager context snapshot fresh so budget-hit summarization always has
         // the latest tool results, regardless of which agent triggers the limit.
@@ -1121,7 +1573,8 @@ pub(crate) async fn call_chat_with_tools(
         let tool_defs: Vec<Value> = visible_tools
             .iter()
             .map(|t| {
-                let compressed_params = compress_schema(&t.input_schema);
+                let compressed_params =
+                    compress_schema(&t.name, &t.input_schema, compatibility_profile.simplify_tool_schemas);
                 let short_desc = t
                     .description
                     .split(['.', '\n'])
@@ -1184,17 +1637,26 @@ pub(crate) async fn call_chat_with_tools(
             "model": model_key,
             "messages": request_messages,
             "tools": tool_defs,
+            "tool_choice": tool_choice_value(require_delegation, delegated),
             "stream": true,
             "stream_options": { "include_usage": true },
         });
 
         let streamed_turn =
-            stream_chat_completion_turn(&llm_client, &url, &body, run_id, agent_id, on_event)
+            stream_chat_completion_turn(
+                &llm_client,
+                &url,
+                &body,
+                run_id,
+                agent_id,
+                on_event,
+                !compatibility_profile.suppress_streaming_text,
+            )
                 .await?;
         if run_cancel_requested(tool_state, run_id) {
             return Err(RUN_CANCELLED_ERROR.to_string());
         }
-        let assistant_msg = streamed_turn.assistant_message.clone();
+        let mut assistant_msg = streamed_turn.assistant_message.clone();
 
         emit_generation_metrics(
             on_event,
@@ -1242,6 +1704,133 @@ pub(crate) async fn call_chat_with_tools(
         }
 
         emit_usage_update(tool_state, run_id, on_event);
+
+        if compatibility_profile.enable_local_recovery
+            && assistant_msg["tool_calls"]
+                .as_array()
+                .map(|calls| calls.is_empty())
+                .unwrap_or(true)
+        {
+            match recover_tool_calls_from_text(&streamed_turn.content) {
+                ToolCallRecoveryResult::Recovered { tool_calls, detail } => {
+                    let _ = on_event.send(StreamEvent::AgentStatus {
+                        run_id: run_id.to_string(),
+                        agent_id: agent_id.to_string(),
+                        stage: "tool_recovery".to_string(),
+                        detail,
+                    });
+                    assistant_msg = json!({
+                        "role": assistant_msg["role"].as_str().unwrap_or("assistant"),
+                        "content": Value::Null,
+                        "tool_calls": tool_calls,
+                    });
+                }
+                ToolCallRecoveryResult::Incomplete { detail }
+                | ToolCallRecoveryResult::Invalid { detail } => {
+                    let summary = format!("Tool-call compatibility issue: {}", detail);
+                    record_tool_call_compatibility_issue(
+                        tool_state,
+                        run_id,
+                        &summary,
+                        &streamed_turn.content,
+                    );
+                    emit_run_dossier_update(tool_state, run_id, on_event);
+                    let _ = on_event.send(StreamEvent::AgentStatus {
+                        run_id: run_id.to_string(),
+                        agent_id: agent_id.to_string(),
+                        stage: "tool_recovery".to_string(),
+                        detail: format!(
+                            "{} Retrying once with a repair prompt.",
+                            summary
+                        ),
+                    });
+
+                    if compatibility_profile.allow_repair_retry {
+                        let mut repair_messages = request_messages.clone();
+                        repair_messages.push(json!({
+                            "role": "system",
+                            "content": "Return exactly one valid tool call or a normal final answer. No prose before the tool call."
+                        }));
+                        let repair_body = json!({
+                            "model": model_key,
+                            "messages": repair_messages,
+                            "tools": tool_defs,
+                            "tool_choice": tool_choice_value(require_delegation, delegated),
+                            "stream": false,
+                        });
+                        let repaired_turn = call_chat_completion_turn_nonstreaming(
+                            &llm_client,
+                            &url,
+                            &repair_body,
+                        )
+                        .await?;
+                        emit_generation_metrics(
+                            on_event,
+                            run_id,
+                            agent_id,
+                            "repair_generated",
+                            &repaired_turn.usage,
+                            estimated_stream_output_tokens(&repaired_turn.content),
+                        );
+                        assistant_msg = repaired_turn.assistant_message.clone();
+                        if assistant_msg["tool_calls"]
+                            .as_array()
+                            .map(|calls| calls.is_empty())
+                            .unwrap_or(true)
+                        {
+                            match recover_tool_calls_from_text(&repaired_turn.content) {
+                                ToolCallRecoveryResult::Recovered { tool_calls, detail } => {
+                                    let _ = on_event.send(StreamEvent::AgentStatus {
+                                        run_id: run_id.to_string(),
+                                        agent_id: agent_id.to_string(),
+                                        stage: "tool_recovery".to_string(),
+                                        detail,
+                                    });
+                                    assistant_msg = json!({
+                                        "role": assistant_msg["role"].as_str().unwrap_or("assistant"),
+                                        "content": Value::Null,
+                                        "tool_calls": tool_calls,
+                                    });
+                                }
+                                ToolCallRecoveryResult::Incomplete { detail }
+                                | ToolCallRecoveryResult::Invalid { detail } => {
+                                    let fatal_summary = format!(
+                                        "Tool-call compatibility issue after repair: {}",
+                                        detail
+                                    );
+                                    record_tool_call_compatibility_issue(
+                                        tool_state,
+                                        run_id,
+                                        &fatal_summary,
+                                        &repaired_turn.content,
+                                    );
+                                    emit_run_dossier_update(tool_state, run_id, on_event);
+                                    let _ = on_event.send(StreamEvent::AgentStatus {
+                                        run_id: run_id.to_string(),
+                                        agent_id: agent_id.to_string(),
+                                        stage: "tool_recovery".to_string(),
+                                        detail: "Stopping: backend returned incompatible tool-call output twice.".to_string(),
+                                    });
+                                    return Err(format!(
+                                        "Tool-calling compatibility error: {} backend returned malformed or incomplete tool-call output twice for model '{}'.",
+                                        compatibility_profile.backend_type,
+                                        model_key
+                                    ));
+                                }
+                                ToolCallRecoveryResult::None => {}
+                            }
+                        }
+                    } else {
+                        return Err(format!(
+                            "Tool-calling compatibility error: {} backend returned malformed or incomplete tool-call output for model '{}'.",
+                            compatibility_profile.backend_type,
+                            model_key
+                        ));
+                    }
+                }
+                ToolCallRecoveryResult::None => {}
+            }
+        }
 
         // Only treat as tool call if the array is non-empty ([] means no calls)
         let tool_calls_arr = assistant_msg["tool_calls"]
@@ -1837,13 +2426,40 @@ pub enum StreamEvent {
 
 /// Strip verbose descriptions from a JSON Schema while keeping the structure
 /// the LLM needs to call the function: property names, types, and required list.
-fn compress_schema(schema: &Value) -> Value {
+fn degraded_optional_tool_fields(tool_name: &str) -> &'static [&'static str] {
+    match tool_name {
+        "bash" => &["timeout"],
+        "read_file" => &["scope", "limit", "offset"],
+        "edit_file" => &["replace_all"],
+        "glob_search" => &["path"],
+        "grep_search" => &["path", "glob", "head_limit"],
+        "spawn_agent" => &["model", "initial_message", "await_reply"],
+        "send_message" => &["await_reply"],
+        "read_agent_messages" => &["roles", "limit", "offset"],
+        _ => &[],
+    }
+}
+
+fn compress_schema(tool_name: &str, schema: &Value, simplify_optional_fields: bool) -> Value {
     let obj = match schema.as_object() {
         Some(o) => o,
         None => return json!({"type": "object", "properties": {}}),
     };
 
     let schema_type = obj.get("type").cloned().unwrap_or(json!("object"));
+    let required_fields = obj
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items.iter()
+                .filter_map(Value::as_str)
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let optional_allowlist = degraded_optional_tool_fields(tool_name)
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
 
     let compressed_props: serde_json::Map<String, Value> = obj
         .get("properties")
@@ -1851,6 +2467,11 @@ fn compress_schema(schema: &Value) -> Value {
         .map(|props| {
             props
                 .iter()
+                .filter(|(key, _)| {
+                    !simplify_optional_fields
+                        || required_fields.contains(key.as_str())
+                        || optional_allowlist.contains(key.as_str())
+                })
                 .map(|(k, v)| {
                     let prop_type = v.get("type").cloned().unwrap_or(json!("string"));
                     // Keep enum values — they're load-bearing for the LLM.
@@ -4175,7 +4796,7 @@ pub(crate) async fn send_chat_completion_streaming(
         detail: "Generating response".to_string(),
     });
     let streamed_turn =
-        stream_chat_completion_turn(&client, &url, &body, run_id, agent_id, on_event)
+        stream_chat_completion_turn(&client, &url, &body, run_id, agent_id, on_event, true)
             .await
             .map_err(|e| format!("Chat failed: {}", e))?;
     emit_generation_metrics(
@@ -4439,5 +5060,92 @@ mod tests {
 
         let reason = detect_redundant_audit_topic(&candidate, &[existing], &config);
         assert!(reason.is_some());
+    }
+
+    #[test]
+    fn recover_tool_calls_from_xml_blocks() {
+        let content = r#"
+            <tool_call>{"name":"read_file","arguments":{"path":"src/main.rs"}}</tool_call>
+            <tool_call>{"function":{"name":"bash","arguments":{"command":"pwd"}}}</tool_call>
+        "#;
+
+        let ToolCallRecoveryResult::Recovered { tool_calls, .. } =
+            recover_tool_calls_from_text(content)
+        else {
+            panic!("expected recovered tool calls");
+        };
+
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0]["function"]["name"], "read_file");
+        assert_eq!(tool_calls[0]["function"]["arguments"], r#"{"path":"src/main.rs"}"#);
+        assert_eq!(tool_calls[1]["function"]["name"], "bash");
+        assert_eq!(tool_calls[1]["function"]["arguments"], r#"{"command":"pwd"}"#);
+    }
+
+    #[test]
+    fn recover_tool_calls_from_raw_json_and_openai_like_payloads() {
+        let ToolCallRecoveryResult::Recovered { tool_calls, .. } =
+            recover_tool_calls_from_text(r#"{"name":"read_file","arguments":{"path":"Cargo.toml"}}"#)
+        else {
+            panic!("expected recovered tool call from flat JSON");
+        };
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["function"]["name"], "read_file");
+
+        let ToolCallRecoveryResult::Recovered { tool_calls, .. } = recover_tool_calls_from_text(
+            r#"{"function":{"name":"read_file","arguments":{"path":"src/lib.rs"}}}"#,
+        ) else {
+            panic!("expected recovered tool call from nested JSON");
+        };
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["function"]["name"], "read_file");
+        assert_eq!(tool_calls[0]["function"]["arguments"], r#"{"path":"src/lib.rs"}"#);
+    }
+
+    #[test]
+    fn recover_tool_calls_classifies_incomplete_and_invalid_payloads() {
+        let ToolCallRecoveryResult::Incomplete { detail } =
+            recover_tool_calls_from_text(r#"<tool_call>{"name":"read_file""#)
+        else {
+            panic!("expected incomplete result for truncated tool_call block");
+        };
+        assert!(detail.contains("never closed"));
+
+        let ToolCallRecoveryResult::Incomplete { detail } =
+            recover_tool_calls_from_text("Function call:")
+        else {
+            panic!("expected incomplete result for tool-call preamble");
+        };
+        assert!(detail.contains("preamble"));
+
+        let ToolCallRecoveryResult::Invalid { detail } = recover_tool_calls_from_text(
+            r#"{"name":"read_file","arguments":"definitely not json"}"#,
+        ) else {
+            panic!("expected invalid result for malformed tool arguments");
+        };
+        assert!(detail.contains("not valid JSON"));
+    }
+
+    #[test]
+    fn degraded_schema_keeps_required_and_allowlisted_optional_fields() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "scope": {"type": "string"},
+                "limit": {"type": "integer"},
+                "offset": {"type": "integer"},
+                "encoding": {"type": "string"}
+            },
+            "required": ["path"]
+        });
+
+        let compressed = compress_schema("read_file", &schema, true);
+        let props = compressed["properties"].as_object().unwrap();
+        assert!(props.contains_key("path"));
+        assert!(props.contains_key("scope"));
+        assert!(props.contains_key("limit"));
+        assert!(props.contains_key("offset"));
+        assert!(!props.contains_key("encoding"));
     }
 }

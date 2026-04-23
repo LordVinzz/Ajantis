@@ -510,6 +510,9 @@ fn default_backend_type() -> String {
 fn default_backend_url() -> String {
     "http://localhost:1234".to_string()
 }
+fn default_detected_tool_use_mode() -> String {
+    "degraded".to_string()
+}
 
 /// A single running backend server instance (used when a backend like llama.cpp
 /// only loads one model at a time and multiple instances are needed).
@@ -537,6 +540,10 @@ pub struct BackendConfig {
     pub detected_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detected_parallel_slots: Option<u32>,
+    #[serde(default = "default_detected_tool_use_mode")]
+    pub detected_tool_use_mode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detected_tool_use_notes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub detected_features: Vec<String>,
 }
@@ -551,6 +558,8 @@ impl Default for BackendConfig {
             detected_version: None,
             detected_model: None,
             detected_parallel_slots: None,
+            detected_tool_use_mode: default_detected_tool_use_mode(),
+            detected_tool_use_notes: vec![],
             detected_features: vec![],
         }
     }

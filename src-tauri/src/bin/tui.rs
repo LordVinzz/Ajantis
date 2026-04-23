@@ -1018,11 +1018,29 @@ impl App {
                     self.config.backend.detected_version = detected.version.clone();
                     self.config.backend.detected_model = detected.model.clone();
                     self.config.backend.detected_parallel_slots = detected.parallel_slots;
+                    self.config.backend.detected_tool_use_mode = detected.tool_use_mode.clone();
+                    self.config.backend.detected_tool_use_notes = detected.tool_use_notes.clone();
                     self.config.backend.detected_features = detected.features.clone();
-                    let summary = if detected.features.is_empty() {
+                    let manager_warning = self.config.agents.iter().any(|agent| agent.is_manager)
+                        && detected.tool_use_mode != "native";
+                    let summary = if detected.features.is_empty() && detected.tool_use_notes.is_empty() {
                         "Connected.".to_string()
                     } else {
-                        format!("Connected — {}", detected.features.join(", "))
+                        let mut parts = Vec::new();
+                        if !detected.features.is_empty() {
+                            parts.push(detected.features.join(", "));
+                        }
+                        parts.push(format!("tool use: {}", detected.tool_use_mode));
+                        if !detected.tool_use_notes.is_empty() {
+                            parts.push(detected.tool_use_notes.join(", "));
+                        }
+                        if manager_warning {
+                            parts.push(
+                                "warning: manager agents may stall or require recovery on this backend"
+                                    .to_string(),
+                            );
+                        }
+                        format!("Connected — {}", parts.join(" | "))
                     };
                     self.persist_config(&summary);
                 } else {
@@ -2585,7 +2603,19 @@ fn build_settings_rows(app: &App) -> Vec<EditorRow> {
         if let Some(slots) = b.detected_parallel_slots {
             parts.push(format!("parallel slots: {}", slots));
         }
+        if !b.detected_tool_use_mode.is_empty() {
+            parts.push(format!("tool use: {}", b.detected_tool_use_mode));
+        }
+        parts.extend_from_slice(&b.detected_tool_use_notes);
         parts.extend_from_slice(&b.detected_features);
+        if b.detected_tool_use_mode != "native"
+            && app.config.agents.iter().any(|agent| agent.is_manager)
+        {
+            parts.push(
+                "warning: manager agents may need compatibility recovery on this backend"
+                    .to_string(),
+            );
+        }
         if parts.is_empty() {
             "(not yet detected)".to_string()
         } else {
